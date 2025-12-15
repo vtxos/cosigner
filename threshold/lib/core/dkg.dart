@@ -372,7 +372,7 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
     r2Secret.minSigners,
   );
 
-  return (keyPackage, publicKeyPackage);
+  return (keyPackage.intoEvenY(), publicKeyPackage.intoEvenY());
 }
 
 PublicKeyPackage pkpFromDkgCommitments(

@@ -18,6 +18,8 @@ class SignatureShare {
 
 // Sign implements [sign] from the spec.
 // Returns a signature share.
+// Sign implements [sign] from the spec.
+// Returns a signature share.
 SignatureShare sign(
   SigningPackage signingPackage,
   SigningNonce signingNonce,
@@ -37,8 +39,6 @@ SignatureShare sign(
   }
 
   // Check if nonce matches commitment.
-  // In our Dart implementation, we might not have '==' on objects easily unless overridden.
-  // We check byte equivalence of points.
   if (!pointsEqual(signingNonce.commitments.binding, commitment.binding) ||
       !pointsEqual(signingNonce.commitments.hiding, commitment.hiding)) {
     throw errInvalidCommitment;
@@ -47,10 +47,16 @@ SignatureShare sign(
   final bfl = computeBindingFactorList(signingPackage, keyPackage.verifyingKey);
   final groupCommitment = computeGroupCommitment(signingPackage, bfl);
 
+  // BIP-340: If R has odd Y, we must negate the nonces (d and e)
+  // effectively signing for -R (which is even).
+  final isROdd = groupCommitment.elem.y!.toBigInteger()!.isOdd;
+
   final lambdaI = deriveInterpolatingValue(
     keyPackage.identifier,
     signingPackage,
   );
+
+  // Compute challenge using R (computeChallenge handles x-only serialization)
   final challenge = computeChallenge(
     groupCommitment.elem,
     keyPackage.verifyingKey,
@@ -68,6 +74,7 @@ SignatureShare sign(
     lambdaI,
     keyPackage,
     challenge,
+    negateNonce: isROdd,
   );
 }
 
@@ -82,27 +89,18 @@ SignatureShare computeSignatureShare(
   BigInt rhoI,
   BigInt lambdaI,
   KeyPackage keyPackage,
-  BigInt challenge,
-) {
-  // z_i = d_i + (e_i * rho_i) + lambda_i * s_i * c
-  // Note: In `signing.go`: ComputeSignatureShare seems to be missing in the file provided?
-  // Wait, line 118 calls `ComputeSignatureShare`.
-  // It was likely in another file or implicitly defined?
-  // Ah, the view of `signing.go` line 118 calls it. But `signing.go` does not DEFINE it.
-  // It must be in `share.go` or somewhere else within `threshold_signing`.
-  // I need to implement what FROST spec says.
+  BigInt challenge, {
+  bool negateNonce = false,
+}) {
+  var d = nonce.hiding;
+  var e = nonce.binding;
 
-  // d_i = hiding nonce scalar
-  // e_i = binding nonce scalar
-  // rho_i = binding factor
-  // lambda_i = lagrange coeff
-  // s_i = long term secret share
-  // c = challenge
+  if (negateNonce) {
+    final n = secp256k1Curve.n;
+    d = (n - d) % n;
+    e = (n - e) % n;
+  }
 
-  // z = d + (e * rho) + lambda * s * c  (mod q)
-
-  final d = nonce.hiding;
-  final e = nonce.binding;
   final s = keyPackage.secretShare;
   final c = challenge;
 
@@ -141,19 +139,45 @@ Signature aggregate(
   final bfl = computeBindingFactorList(signingPackage, pubkeys.verifyingKey);
   final groupCommitment = computeGroupCommitment(signingPackage, bfl);
 
+  final isROdd = groupCommitment.elem.y!.toBigInteger()!.isOdd;
+
   // Aggregate z = sum(z_i)
   var z = BigInt.zero;
   final modulus = secp256k1Curve.n;
 
-  for (final share in signatureShares.values) {
+  for (final entry in signatureShares.entries) {
+    final id = entry.key;
+    final share = entry.value;
+
+    // Verify share (optional but recommended)
+    verifySignatureShare(
+      id,
+      pubkeys.verifyingShares[id]!,
+      share,
+      signingPackage,
+      pubkeys.verifyingKey,
+      negateR: isROdd,
+    );
+
     z = (z + share.s) % modulus;
   }
 
-  final sig = Signature(groupCommitment.elem, z);
+  // If R was odd, the aggregated z is for -R (which is even).
+  // We return R as the point used for verification (implicit even in BIP340).
+  // Ideally we return the Even version of R.
+
+  ECPoint effectiveR = groupCommitment.elem;
+  if (isROdd) {
+    // Negate R logic (multiply by n-1)
+    final n = secp256k1Curve.n;
+    effectiveR = (effectiveR * (n - BigInt.one))!;
+  }
+
+  final sig = Signature(effectiveR, z);
 
   // Verify final signature
   final challenge = computeChallenge(
-    groupCommitment.elem,
+    effectiveR, // Use Even R
     pubkeys.verifyingKey,
     signingPackage.message,
   );
@@ -162,7 +186,7 @@ Signature aggregate(
   final zG = (secp256k1Curve.G * z)!;
 
   final cY = (pubkeys.verifyingKey.E * challenge)!;
-  final R_plus_cY = (groupCommitment.elem + cY)!;
+  final R_plus_cY = (effectiveR + cY)!;
 
   if (pointsEqual(zG, R_plus_cY)) {
     return sig;
@@ -178,11 +202,25 @@ void verifySignatureShare(
   ECPoint verifyingShare,
   SignatureShare signatureShare,
   SigningPackage signingPackage,
-  VerifyingKey verifyingKey,
-) {
+  VerifyingKey verifyingKey, {
+  bool negateR = false,
+}) {
   // Binding factors and group commitment
   final bfl = computeBindingFactorList(signingPackage, verifyingKey);
+
+  // R_share check needs global challenge?
+  // challenge depends on GLOBAL R.
+  // We need to compute global R to get challenge.
+
+  // Optimization: pass challenge in? For now recompute.
   final groupCommitment = computeGroupCommitment(signingPackage, bfl);
+  // effectiveR needed for challenge
+  ECPoint effectiveR = groupCommitment.elem;
+  if (effectiveR.y!.toBigInteger()!.isOdd) {
+    // Must match negating logic.
+    // If we are calling verifySignatureShare inside aggregate, we assume parity check matched.
+  }
+  // Bip340 challenge always uses x-only R. So parity doesn't matter for challenge hash.
 
   final challenge = computeChallenge(
     groupCommitment.elem,
@@ -191,10 +229,10 @@ void verifySignatureShare(
   );
 
   // Verify:
-  // z_i * G == R_i + c * lambda_i * Y_i
-  // Where R_i = D_i + rho_i * E_i (Wait, check commitment definition)
-  // commitment.go: toGroupCommitmentShare: sum = Hiding + bindingScalar * Binding
-  // So R_i = H_i + rho_i * B_i
+  // z_i * G == R_share + c * lambda_i * Y_i
+  // If negateR is true, LHS z_i is negated nonces.
+  // So z_i corresponds to -R_share.
+  // So z_i * G == -R_share + ...
 
   final comm = signingPackage.commitments[identifier];
   if (comm == null) throw errUnknownIdentifier;
@@ -202,7 +240,12 @@ void verifySignatureShare(
   final bf = bfl.get(identifier);
   if (bf == null) throw errUnknownIdentifier;
 
-  final R_share = comm.toGroupCommitmentShare(bf.scalar).elem; // H + rho*B
+  var R_share = comm.toGroupCommitmentShare(bf.scalar).elem; // H + rho*B
+
+  if (negateR) {
+    final n = secp256k1Curve.n;
+    R_share = (R_share * (n - BigInt.one))!;
+  }
 
   final lambdaI = deriveInterpolatingValue(identifier, signingPackage);
 
@@ -211,7 +254,9 @@ void verifySignatureShare(
 
   // RHS: R_share + c * lambda_i * Y_i
   final c_lambda = (challenge * lambdaI) % secp256k1Curve.n;
-  final term2 = (verifyingShare * c_lambda)!;
+  final term2 =
+      (verifyingShare *
+      c_lambda)!; // verifyingShare should be EvenY? passed in pubkeys are EvenY
 
   final RHS = (R_share + term2)!;
 
