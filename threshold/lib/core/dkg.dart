@@ -166,6 +166,33 @@ class KeyPackage {
     }
     return this;
   }
+
+  KeyPackage tweak(List<int>? merkleRoot) {
+    // 1. Ensure even Y
+    final keyPackage = intoEvenY();
+
+    // 2. Compute tweak t
+    final t = computeTweak(keyPackage.verifyingKey.E, merkleRoot);
+    final tp = elemBaseMul(t);
+
+    // 3. Update verification key Q = P + t*G
+    final newVerifyingKeyPoint = elemAdd(keyPackage.verifyingKey.E, tp);
+
+    // 4. Update secret share s' = s + t
+    final n = secp256k1Curve.n;
+    final newSecretShare = (keyPackage.secretShare + t) % n;
+
+    // 5. Update verifying share vs' = vs + t*G
+    final newVerifyingShare = elemAdd(keyPackage.verifyingShare, tp);
+
+    return KeyPackage(
+      keyPackage.identifier,
+      newSecretShare,
+      newVerifyingShare,
+      VerifyingKey(E: newVerifyingKeyPoint),
+      keyPackage.minSigners,
+    );
+  }
 }
 
 class PublicKeyPackage {
@@ -228,6 +255,29 @@ class PublicKeyPackage {
       );
     }
     return this;
+  }
+
+  PublicKeyPackage tweak(List<int>? merkleRoot) {
+    // 1. Ensure even Y
+    final pubKeyPackage = intoEvenY();
+
+    // 2. Compute tweak t
+    final t = computeTweak(pubKeyPackage.verifyingKey.E, merkleRoot);
+    final tp = elemBaseMul(t);
+
+    // 3. Update verification key Q = P + t*G
+    final newVerifyingKeyPoint = elemAdd(pubKeyPackage.verifyingKey.E, tp);
+
+    // 4. Update verifying shares vs_i' = vs_i + t*G
+    final newVerifyingShares = pubKeyPackage.verifyingShares.map((id, vs) {
+      final newShare = elemAdd(vs, tp);
+      return MapEntry(id, newShare);
+    });
+
+    return PublicKeyPackage(
+      newVerifyingShares,
+      VerifyingKey(E: newVerifyingKeyPoint),
+    );
   }
 }
 

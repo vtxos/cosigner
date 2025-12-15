@@ -63,8 +63,10 @@ void main() {
         signatureShares[id] = share;
       }
 
-      final signature = aggregate(signingPackage, signatureShares, pkp);
-      final isTrue = signature.verify(pkp.verifyingKey, message);
+      final tweakedPkp = pkp.tweak(null);
+
+      final signature = aggregate(signingPackage, signatureShares, tweakedPkp);
+      final isTrue = signature.verify(tweakedPkp.verifyingKey, message);
 
       expect(isTrue, true, reason: "Signature verification failed");
     });

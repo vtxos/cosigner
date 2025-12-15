@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
@@ -6,6 +7,28 @@ import 'package:threshold/core/dkg.dart';
 import 'package:threshold/core/errors.dart';
 import 'package:threshold/core/identifier.dart';
 import 'package:threshold/core/share.dart';
+
+BigInt taggedHash(String tag, Uint8List msg) {
+  final tagHash = sha256.convert(utf8.encode(tag)).bytes;
+  final builder = BytesBuilder();
+  builder.add(tagHash);
+  builder.add(tagHash);
+  builder.add(msg);
+
+  final hash = sha256.convert(builder.toBytes()).bytes;
+  return bytesToBigInt(Uint8List.fromList(hash)) % secp256k1Curve.n;
+}
+
+BigInt computeTweak(ECPoint P, List<int>? merkleRoot) {
+  // P is x-only (32 bytes)
+  final pBytes = elemSerializeCompressed(P).sublist(1);
+  final builder = BytesBuilder();
+  builder.add(pBytes);
+  if (merkleRoot != null) {
+    builder.add(merkleRoot);
+  }
+  return taggedHash("TapTweak", builder.toBytes());
+}
 
 final secp256k1Curve = ECDomainParameters('secp256k1');
 

@@ -30,7 +30,7 @@ SignatureShare sign(
   }
 
   // ensure keyPackage Public key is even
-  keyPackage = keyPackage.intoEvenY();
+  keyPackage = keyPackage.tweak(null);
 
   final commitment = signingPackage.commitments[keyPackage.identifier];
   if (commitment == null) {

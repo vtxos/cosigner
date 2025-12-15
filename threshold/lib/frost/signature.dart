@@ -5,8 +5,6 @@ import 'package:convert/convert.dart';
 import 'package:threshold/frost/hasher.dart';
 import 'package:threshold/frost/utils.dart';
 import 'dart:typed_data';
-import 'dart:convert';
-import 'package:crypto/crypto.dart';
 
 class Signature {
   final ECPoint R;
@@ -92,15 +90,4 @@ BigInt computeChallenge(ECPoint R, VerifyingKey vk, Uint8List message) {
   builder.add(message);
 
   return taggedHash("BIP0340/challenge", builder.toBytes());
-}
-
-BigInt taggedHash(String tag, Uint8List msg) {
-  final tagHash = sha256.convert(utf8.encode(tag)).bytes;
-  final builder = BytesBuilder();
-  builder.add(tagHash);
-  builder.add(tagHash);
-  builder.add(msg);
-
-  final hash = sha256.convert(builder.toBytes()).bytes;
-  return bytesToBigInt(Uint8List.fromList(hash)) % secp256k1Curve.n;
 }
