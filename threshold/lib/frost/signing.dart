@@ -31,6 +31,8 @@ SignatureShare sign(
 
   // ensure keyPackage Public key is even
   keyPackage = keyPackage.tweak(null);
+  // Ensure the tweaked key is even (BIP-340)
+  keyPackage = keyPackage.intoEvenY();
 
   final commitment = signingPackage.commitments[keyPackage.identifier];
   if (commitment == null) {

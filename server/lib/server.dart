@@ -357,8 +357,8 @@ class MPCWalletService extends MPCWalletServiceBase {
       sharesMap[id] = frost.SignatureShare(val);
     });
 
-    final signature =
-        frost.aggregate(signingPkg, sharesMap, session.groupPublicKey!);
+    final signature = frost.aggregate(
+        signingPkg, sharesMap, session.groupPublicKey!.tweak(null));
     print('[${request.deviceId}] SignStep2: Aggregated.');
 
     return SignStep2Response()
