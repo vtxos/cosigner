@@ -7,7 +7,7 @@
     "hash": "SHA-256"
   },
   "inputs": {
-    "verifying_key": "03849089de77b56bd35fcbfc70bf38e73448131090acc75d538a5cea63cc3dcefe",
+    "verifying_key": "024a48daffc43b47b42695611942c481aecffb9137686ad0b3e0ab8e1f1dab0293",
     "1": {
       "identifier": 1,
       "secret_key": "68e3f6904c6043973515a36bf7801a71597da35733f21305d75a5234f06e4529",

@@ -6,7 +6,6 @@ import 'package:convert/convert.dart';
 import 'package:threshold/threshold.dart';
 import 'package:test/test.dart';
 
-
 import 'test_helper.dart';
 
 class Participant {
@@ -18,7 +17,10 @@ class Participant {
 }
 
 (List<KeyPackage>, PublicKeyPackage) dealerDKG(
-    int min, int max, List<Participant> participants) {
+  int min,
+  int max,
+  List<Participant> participants,
+) {
   validateNumOfSigners(min, max);
 
   final ids = participants.map((p) => p.identifier).toList();
@@ -31,8 +33,13 @@ class Participant {
   final r1Pkgs = <Identifier, Round1Package>{};
 
   for (final participant in participants) {
-    final (sec, pkg) = dkgPart1(participant.identifier, max, min,
-        participant.secretKey, participant.coefficients);
+    final (sec, pkg) = dkgPart1(
+      participant.identifier,
+      max,
+      min,
+      participant.secretKey,
+      participant.coefficients,
+    );
     r1Secrets[participant.identifier] = sec;
     r1Pkgs[participant.identifier] = pkg;
   }
@@ -70,8 +77,7 @@ class Participant {
 
     final pRound1Secret = r1Secrets[id]!;
     final pRound2Secret = r2Secrets[id]!;
-    final (kp, pk) =
-        dkgPart3(pRound1Secret, pRound2Secret, r1view, r2View);
+    final (kp, pk) = dkgPart3(pRound1Secret, pRound2Secret, r1view, r2View);
     keys.add(kp);
     pkp ??= pk;
   }
@@ -93,27 +99,32 @@ void main() {
         final secret = modNRandom();
         final coefficients = generateCoefficients(minParticipants - 1);
 
-        participants.add(Participant(
-          ids[i],
-          SecretKey(secret),
-          coefficients,
-        ));
+        participants.add(Participant(ids[i], SecretKey(secret), coefficients));
       }
 
-      final (keypackage, _) =
-          dealerDKG(minParticipants, maxParticipants, participants);
+      final (keypackage, _) = dealerDKG(
+        minParticipants,
+        maxParticipants,
+        participants,
+      );
 
       final paticipantsShares = <Identifier, SecretShare>{};
       for (final p in keypackage) {
         paticipantsShares[p.identifier] = p.secretShare;
       }
 
-      final reconstructedKey =
-          reconstruct(minParticipants, paticipantsShares);
+      final reconstructedKey = reconstruct(minParticipants, paticipantsShares);
 
       var calculatedKeys = modNZero();
       for (final p in participants) {
-        calculatedKeys = (calculatedKeys + p.secretKey.scalar) % secp256k1Curve.n;
+        calculatedKeys =
+            (calculatedKeys + p.secretKey.scalar) % secp256k1Curve.n;
+      }
+
+      final n = secp256k1Curve.n;
+      final point = (secp256k1Curve.G * calculatedKeys)!;
+      if (!point.y!.toBigInteger()!.isEven) {
+        calculatedKeys = n - calculatedKeys;
       }
 
       expect(reconstructedKey.scalar, equals(calculatedKeys));
@@ -133,32 +144,46 @@ void main() {
       final participants = <Participant>[];
       for (var i = 1; i <= maxParticipants; i++) {
         final p = inputs[i.toString()];
-        participants.add(Participant(
-          identifierFromUint16(p['identifier']),
-          SecretKey(bytesToBigInt(Uint8List.fromList(hex.decode(p['secret_key'])))),
-          [bytesToBigInt(Uint8List.fromList(hex.decode(p['coefficient'])))]
-        ));
+        participants.add(
+          Participant(
+            identifierFromUint16(p['identifier']),
+            SecretKey(
+              bytesToBigInt(Uint8List.fromList(hex.decode(p['secret_key']))),
+            ),
+            [bytesToBigInt(Uint8List.fromList(hex.decode(p['coefficient'])))],
+          ),
+        );
       }
 
-      final (keypackage, pkp) = dealerDKG(minParticipants, maxParticipants, participants);
-      
+      final (keypackage, pkp) = dealerDKG(
+        minParticipants,
+        maxParticipants,
+        participants,
+      );
+
       final paticipantsShares = <Identifier, SecretShare>{};
       for (final p in keypackage) {
         paticipantsShares[p.identifier] = p.secretShare;
       }
 
-       final reconstructedKey =
-          reconstruct(minParticipants, paticipantsShares);
+      final reconstructedKey = reconstruct(minParticipants, paticipantsShares);
 
       var calculatedKeys = modNZero();
       for (final p in participants) {
-        calculatedKeys = (calculatedKeys + p.secretKey.scalar) % secp256k1Curve.n;
+        calculatedKeys =
+            (calculatedKeys + p.secretKey.scalar) % secp256k1Curve.n;
+      }
+      final n = secp256k1Curve.n;
+      final point = (secp256k1Curve.G * calculatedKeys)!;
+      if (!point.y!.toBigInteger()!.isEven) {
+        calculatedKeys = n - calculatedKeys;
       }
       expect(reconstructedKey.scalar, equals(calculatedKeys));
 
-      final groupVerifyingKeyHex = hex.encode(elemSerializeCompressed(pkp.verifyingKey.E));
+      final groupVerifyingKeyHex = hex.encode(
+        elemSerializeCompressed(pkp.verifyingKey.E),
+      );
       expect(groupVerifyingKeyHex, equals(inputs['verifying_key']));
-
     });
   });
 }
