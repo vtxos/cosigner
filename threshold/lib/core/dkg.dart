@@ -451,12 +451,13 @@ PublicKeyPackage pkpFromCommitment(
 (Round1SecretPackage, Round1Package) dkgRefreshPart1(
   Identifier identifier,
   int maxSigners,
-  int minSigners,
-) {
+  int minSigners, {
+  List<int>? seed,
+}) {
   validateNumOfSigners(minSigners, maxSigners);
 
   final refreshingKey = modNZero();
-  final coeffOnly = generateCoefficients(minSigners - 1);
+  final coeffOnly = generateCoefficients(minSigners - 1, seed: seed);
 
   final (coeffs, commitment) = generateSecretPolynomial(
     refreshingKey,

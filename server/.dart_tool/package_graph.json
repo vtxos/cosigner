@@ -7,6 +7,8 @@
       "name": "server",
       "version": "1.0.0",
       "dependencies": [
+        "bitcoin_base",
+        "blockchain_utils",
         "grpc",
         "hive",
         "protobuf",
@@ -46,6 +48,18 @@
         "web_socket_channel",
         "webkit_inspection_protocol",
         "yaml"
+      ]
+    },
+    {
+      "name": "blockchain_utils",
+      "version": "5.4.0",
+      "dependencies": []
+    },
+    {
+      "name": "bitcoin_base",
+      "version": "7.0.0",
+      "dependencies": [
+        "blockchain_utils"
       ]
     },
     {

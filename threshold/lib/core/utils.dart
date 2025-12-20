@@ -144,7 +144,33 @@ BigInt modNRandom() {
   return s;
 }
 
-List<BigInt> generateCoefficients(int size) {
+BigInt modNRandomSeeded(List<int> seed, int counter) {
+  final seedHash = sha256.convert(seed).bytes;
+
+  // Deterministic generation: Hash(seed || counter)
+  // We need to loop until we get a non-zero value < n
+  var currentCounter = counter;
+  BigInt s;
+  do {
+    final builder = BytesBuilder();
+    builder.add(seedHash);
+
+    // Add counter as 4 bytes BE
+    final counterBytes = Uint8List(4);
+    final view = ByteData.view(counterBytes.buffer);
+    view.setUint32(0, currentCounter++);
+    builder.add(counterBytes);
+
+    final hash = sha256.convert(builder.toBytes()).bytes;
+    s = bytesToBigInt(Uint8List.fromList(hash)) % secp256k1Curve.n;
+  } while (s == BigInt.zero);
+  return s;
+}
+
+List<BigInt> generateCoefficients(int size, {List<int>? seed}) {
+  if (seed != null) {
+    return List<BigInt>.generate(size, (i) => modNRandomSeeded(seed, i));
+  }
   return List<BigInt>.generate(size, (i) => modNRandom());
 }
 

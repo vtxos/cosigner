@@ -11,6 +11,15 @@ service MPCWallet {
   // Signing
   rpc SignStep1 (SignStep1Request) returns (SignStep1Response);
   rpc SignStep2 (SignStep2Request) returns (SignStep2Response);
+
+  // Refresh
+  rpc RefreshStep1 (RefreshStep1Request) returns (RefreshStep1Response);
+  rpc RefreshStep2 (RefreshStep2Request) returns (RefreshStep2Response);
+  rpc RefreshStep3 (RefreshStep3Request) returns (RefreshStep3Response);
+
+  // Policy
+  rpc CreateSpendingPolicy (CreateSpendingPolicyRequest) returns (CreateSpendingPolicyResponse);
+  rpc GetPolicyId (GetPolicyIdRequest) returns (GetPolicyIdResponse);
 }
 
 // DKG Messages
@@ -53,6 +62,16 @@ message SignStep1Request {
   bytes hiding_commitment = 3;
   bytes binding_commitment = 4;
   bytes message_to_sign = 5; 
+
+  // New: Transaction Context for Policy Enforcement
+  bytes full_transaction = 6; // Serialized Transaction (e.g. Raw Tx bytes)
+  repeated UtxoInfo input_utxos = 7; // Details of inputs being spent (amounts)
+}
+
+message UtxoInfo {
+    string tx_hash = 1;
+    int32 vout = 2;
+    int64 amount = 3; // satoshis
 }
 
 message SignStep1Response {
@@ -62,6 +81,7 @@ message SignStep1Response {
    }
    map<string, Commitment> commitments = 1;
    bytes message_to_sign = 2; 
+   int32 used_key_index = 3; // The key index the server selected for this signing session
 }
 
 message SignStep2Request {
@@ -76,3 +96,64 @@ message SignStep2Response {
    bytes r_point = 1;
    bytes z_scalar = 2;
 }
+
+// Refresh Messages
+
+message RefreshStep1Request {
+  string device_id = 1;
+  bytes identifier = 2;
+  string round1_package = 3; // JSON
+  int64 threshold_amount = 4;
+  int64 interval = 5;
+}
+
+message RefreshStep1Response {
+  map<string, string> round1_packages = 1;
+  string policy_id = 2;
+  int64 start_time = 3;
+}
+
+message RefreshStep2Request {
+  string device_id = 1;
+  bytes identifier = 2;
+  // In DKG Step 2 we sent round1_package again, but strict state management 
+  // might not need it if session is locked. We will mirror DKG for consistency.
+  string round1_package = 3; 
+}
+
+message RefreshStep2Response {
+   map<string, string> all_round1_packages = 1;
+}
+
+message RefreshStep3Request {
+   string device_id = 1;
+   bytes identifier = 2;
+   map<string, string> round2_packages_for_others = 3;
+}
+
+message RefreshStep3Response {
+    map<string, string> round2_packages_for_me = 1;
+}
+
+message CreateSpendingPolicyRequest {
+    string device_id = 1;
+    int64 threshold_sats = 2;
+    int64 start_time = 3; // timestamp seconds
+    int64 interval_seconds = 4; // duration in seconds
+}
+
+message CreateSpendingPolicyResponse {
+    string policy_id = 1;
+    int32 allocated_key_index = 2; // The index of the new key generated for this policy
+}
+
+message GetPolicyIdRequest {
+    string device_id = 1;
+    bytes tx_message = 2; // Transaction bytes
+}
+
+message GetPolicyIdResponse {
+    string policy_id = 1;
+}
+
+
