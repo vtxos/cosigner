@@ -20,6 +20,9 @@ service MPCWallet {
   // Policy
   rpc CreateSpendingPolicy (CreateSpendingPolicyRequest) returns (CreateSpendingPolicyResponse);
   rpc GetPolicyId (GetPolicyIdRequest) returns (GetPolicyIdResponse);
+
+  // Broadcast
+  rpc BroadcastTransaction (BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }
 
 // DKG Messages
@@ -154,6 +157,15 @@ message GetPolicyIdRequest {
 
 message GetPolicyIdResponse {
     string policy_id = 1;
+}
+
+message BroadcastTransactionRequest {
+    string device_id = 1;
+    string tx_hex = 2;
+}
+
+message BroadcastTransactionResponse {
+    string tx_id = 1;
 }
 
 

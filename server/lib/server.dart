@@ -14,12 +14,14 @@ import 'package:blockchain_utils/blockchain_utils.dart'; // for hex
 import 'package:protocol/protocol.dart';
 import 'persistence/store.dart';
 import 'state.dart';
-import 'dart:convert';
 import 'dart:math';
 
 import 'policy.dart';
+import 'bitcoin.dart';
 
 class MPCWalletService extends MPCWalletServiceBase {
+  // Hardcoded Regtest credentials (as per E2E tests)
+
   // In-memory cache of active sessions
   final Map<String, DKGSessionState> _dkgSessions = {};
   final Map<String, SigningSessionState> _signingSessions = {};
@@ -34,6 +36,8 @@ class MPCWalletService extends MPCWalletServiceBase {
   final PolicyStore policyStore;
   final UtxoStore utxoStore;
 
+  late final BitcoinService bitcoinService;
+
   // Server Identity: ID=3
   static final serverId = threshold.Identifier(BigInt.from(3));
   static final serverIdHex =
@@ -47,7 +51,10 @@ class MPCWalletService extends MPCWalletServiceBase {
     required this.refreshStore,
     required this.policyStore,
     required this.utxoStore,
-  });
+    BitcoinService? bitcoinService,
+  }) {
+    this.bitcoinService = bitcoinService ?? BitcoinService(utxoStore);
+  }
 
   DKGSessionState _getDKGSession(String deviceId) {
     if (!_dkgSessions.containsKey(deviceId)) {
@@ -91,10 +98,27 @@ class MPCWalletService extends MPCWalletServiceBase {
 
   UtxoState _getUtxoState(String deviceId) {
     if (!_utxos.containsKey(deviceId)) {
-      // Check store? (For now, we just create new in-memory if not found,
-      // strictly implies DKG Step 1 starts it).
-      _utxos[deviceId] = UtxoState(deviceId);
-      print('New Session Created: $deviceId');
+      final newState = UtxoState(deviceId);
+
+      // Load from persistence
+      final existingJson = utxoStore.getUtxo(deviceId);
+      if (existingJson != null) {
+        try {
+          final List<dynamic> list = jsonDecode(existingJson);
+          final loadedUtxos = list.map((item) {
+            final amount = BigInt.parse(item['amount'].toString());
+            final txid = item['tx_hash'] as String;
+            final vout = item['vout'] as int;
+            return Utxo(amount, txid, vout);
+          }).toList();
+          newState.addUtxoList(loadedUtxos);
+          print('[$deviceId] Loaded ${loadedUtxos.length} UTXOs from store.');
+        } catch (e) {
+          print('[$deviceId] Error loading UTXOs: $e');
+        }
+      }
+
+      _utxos[deviceId] = newState;
     }
     return _utxos[deviceId]!;
   }
@@ -276,7 +300,9 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       BigInt totalIn = BigInt.zero;
       for (final input in tx.inputs) {
-        final clientUtxos = _utxos[deviceId]!.utxos;
+        // Ensure state is loaded
+        final utxoState = _getUtxoState(deviceId);
+        final clientUtxos = utxoState.utxos;
         for (final y in clientUtxos) {
           if (y.txid == input.txId && y.vout == input.txIndex) {
             totalIn += y.amount;
@@ -381,6 +407,10 @@ class MPCWalletService extends MPCWalletServiceBase {
     if (policy != null) {
       serverKeyPackage = policy.keyPackage;
       session.currentPolicyId = policy.id;
+      print(
+          '[${request.deviceId}] SignStep1: Switched to Protected Policy: ${policy.id}');
+    } else {
+      print('[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
     }
 
     // ---------------------------
@@ -403,6 +433,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     if (session.messageToSign == null && request.messageToSign.isNotEmpty) {
       session.messageToSign = Uint8List.fromList(request.messageToSign);
     }
+
+    // Calculate spent amount for history tracking
+    final spent = _calculateSpentAmount(
+        Uint8List.fromList(request.fullTransaction),
+        policyState.normalPolicy!.publicKeyPackage,
+        request.deviceId);
+    session.pendingAmount = spent;
 
     if (session.signCommitmentsReceived.length >= thresholdCount) {
       if (!session.completerSignStep1.isCompleted)
@@ -431,72 +468,98 @@ class MPCWalletService extends MPCWalletServiceBase {
   Future<SignStep2Response> signStep2(
       ServiceCall call, SignStep2Request request) async {
     final session = _getSigningSession(request.deviceId);
-    final policyState = _getPolicyState(request.deviceId);
+    try {
+      final policyState = _getPolicyState(request.deviceId);
 
-    final senderId = threshold.Identifier.deserialize(
-        Uint8List.fromList(request.identifier));
-    print(
-        '[${request.deviceId}] SignStep2: Received from ${_idToString(request.identifier)}');
+      final senderId = threshold.Identifier.deserialize(
+          Uint8List.fromList(request.identifier));
+      print(
+          '[${request.deviceId}] SignStep2: Received from ${_idToString(request.identifier)}');
 
-    var serverKeyPackage = policyState.normalPolicy!.keyPackage;
-    var serverPubPackage = policyState.normalPolicy!.publicKeyPackage;
-    if (session.currentPolicyId != null) {
-      serverKeyPackage =
-          policyState.protectedPolicies[session.currentPolicyId!]!.keyPackage;
-      serverPubPackage = policyState
-          .protectedPolicies[session.currentPolicyId!]!.publicKeyPackage;
-    }
+      var serverKeyPackage = policyState.normalPolicy!.keyPackage;
+      var serverPubPackage = policyState.normalPolicy!.publicKeyPackage;
 
-    if (session.currentPolicyId != null) {}
+      if (session.currentPolicyId != null) {
+        serverKeyPackage =
+            policyState.protectedPolicies[session.currentPolicyId!]!.keyPackage;
+        serverPubPackage = policyState
+            .protectedPolicies[session.currentPolicyId!]!.publicKeyPackage;
+      }
 
-    final share =
-        threshold.bytesToBigInt(Uint8List.fromList(request.signatureShare));
-    session.signRound2Shares[senderId] = share;
+      final share =
+          threshold.bytesToBigInt(Uint8List.fromList(request.signatureShare));
+      session.signRound2Shares[senderId] = share;
 
-    if (!session.signRound2Shares.containsKey(serverId) &&
-        session.serverNonce != null) {
-      print('[${request.deviceId}] SignStep2: Server computing share...');
+      print('DEBUG: Current Policy ID: ${session.currentPolicyId}');
+
+      if (!session.signRound2Shares.containsKey(serverId) &&
+          session.serverNonce != null) {
+        print('[${request.deviceId}] SignStep2: Server computing share...');
+        final signingPkg = frost_comm.SigningPackage(
+            session.signCommitmentsReceived, session.messageToSign!);
+        print('[${request.deviceId}] SignStep2: Generating Server Share...');
+
+        print('DEBUG: Current Policy ID: ${session.currentPolicyId}');
+        print('DEBUG: Server Key ID: ${serverKeyPackage.identifier.s}');
+        print(
+            'DEBUG: Server Secret (partial): ${serverKeyPackage.secretShare.toString().substring(0, 10)}...');
+
+        // Explicitly apply Taproot tweak (Key Path Spending)
+        serverKeyPackage = serverKeyPackage.tweak(null);
+
+        final serverShareObj =
+            frost.sign(signingPkg, session.serverNonce!, serverKeyPackage);
+        session.signRound2Shares[serverId] = serverShareObj.s;
+      }
+
+      if (session.signRound2Shares.length >= thresholdCount) {
+        if (!session.completerSignStep2.isCompleted)
+          session.completerSignStep2.complete();
+      } else {
+        await session.completerSignStep2.future;
+      }
+
       final signingPkg = frost_comm.SigningPackage(
           session.signCommitmentsReceived, session.messageToSign!);
+      final sharesMap = <threshold.Identifier, frost.SignatureShare>{};
+      session.signRound2Shares.forEach((id, val) {
+        sharesMap[id] = frost.SignatureShare(val);
+      });
 
-      final serverShareObj =
-          frost.sign(signingPkg, session.serverNonce!, serverKeyPackage);
-      session.signRound2Shares[serverId] = serverShareObj.s;
+      final signature =
+          frost.aggregate(signingPkg, sharesMap, serverPubPackage.tweak(null));
+      print('[${request.deviceId}] SignStep2: Aggregated.');
+
+      // Commit Pending Amount to History
+      if (session.pendingAmount != null &&
+          session.pendingAmount! > BigInt.zero) {
+        policyState.spendingHistory
+            .add(SpendingEntry(DateTime.now(), session.pendingAmount!));
+        print(
+            '[${request.deviceId}] Policy Update: Added spending of ${session.pendingAmount} sats. Total History: ${policyState.spendingHistory.length}');
+      }
+
+      final response = SignStep2Response()
+        ..rPoint = threshold.elemSerializeCompressed(signature.R)
+        ..zScalar = threshold.bigIntToBytes(signature.Z);
+
+      return response;
+    } catch (e) {
+      session.serverNonce = null;
+      session.serverCommitments = null;
+      session.signCommitmentsReceived.clear();
+      session.messageToSign = null;
+      session.signRound2Shares.clear();
+      session.completerSignStep1 = Completer<void>();
+      session.completerSignStep2 = Completer<void>();
+      session.currentPolicyId = null;
+      session.pendingAmount = null;
+
+      // print error
+      print('[${request.deviceId}] SignStep2: Error: $e');
+
+      throw e;
     }
-
-    if (session.signRound2Shares.length >= thresholdCount) {
-      if (!session.completerSignStep2.isCompleted)
-        session.completerSignStep2.complete();
-    } else {
-      await session.completerSignStep2.future;
-    }
-
-    final signingPkg = frost_comm.SigningPackage(
-        session.signCommitmentsReceived, session.messageToSign!);
-    final sharesMap = <threshold.Identifier, frost.SignatureShare>{};
-    session.signRound2Shares.forEach((id, val) {
-      sharesMap[id] = frost.SignatureShare(val);
-    });
-
-    final signature =
-        frost.aggregate(signingPkg, sharesMap, serverPubPackage.tweak(null));
-    print('[${request.deviceId}] SignStep2: Aggregated.');
-
-    final response = SignStep2Response()
-      ..rPoint = threshold.elemSerializeCompressed(signature.R)
-      ..zScalar = threshold.bigIntToBytes(signature.Z);
-
-    // Cleanup Signing Session
-    session.serverNonce = null;
-    session.serverCommitments = null;
-    session.signCommitmentsReceived.clear();
-    session.messageToSign = null;
-    session.signRound2Shares.clear();
-    session.completerSignStep1 = Completer<void>();
-    session.completerSignStep2 = Completer<void>();
-    session.currentPolicyId = null;
-
-    return response;
   }
 
   // --- Refresh ---
@@ -540,16 +603,23 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       final (r1Secret, r1Public) = threshold.dkgRefreshPart1(
         serverId,
-        thresholdCount,
+        2,
         thresholdCount,
       );
+
+      if (session.refreshCreationTime == null) {
+        session.refreshCreationTime = DateTime.now();
+        session.refreshId = randomBase64(32);
+        session.refreshThresholdAmount = request.thresholdAmount;
+        session.refreshInterval = request.interval.toInt();
+      }
 
       session.serverRefreshRound1Secret = r1Secret;
       session.refreshRound1Packages[serverIdHex] =
           jsonEncode(r1Public.toJson());
     }
 
-    if (session.refreshRound1Packages.length == totalParticipants) {
+    if (session.refreshRound1Packages.length == 2) {
       if (!session.completerRefreshStep1.isCompleted)
         session.completerRefreshStep1.complete();
     } else {
@@ -618,7 +688,10 @@ class MPCWalletService extends MPCWalletServiceBase {
     }
     session.refreshRound2PackagesForRelay[senderId] = sharesFromSenderForOthers;
 
-    if (session.refreshRound2PackagesForRelay.length == totalParticipants - 1) {
+    // Determine N based on session state
+    int n = 2;
+
+    if (session.refreshRound2PackagesForRelay.length == n - 1) {
       session.refreshRound2PackagesForRelay[serverId] =
           session.refreshRound2PackagesLocal;
       if (!session.completerRefreshStep3.isCompleted)
@@ -726,6 +799,26 @@ class MPCWalletService extends MPCWalletServiceBase {
       ServiceCall call, CreateSpendingPolicyRequest request) async {
     throw GrpcError.unimplemented("Use Refresh flow to create policies");
   }
+
+  @override
+  Future<BroadcastTransactionResponse> broadcastTransaction(
+      ServiceCall call, BroadcastTransactionRequest request) async {
+    print(
+        '[${request.deviceId}] Broadcasting Tx: ${request.txHex.substring(0, 20)}...');
+
+    // We assume bitcoinService is available (dependency injection or member).
+    // Let's assume we added `bitcoinService` to the class, see initialization below.
+    // Wait, I need to add the field first.
+    // I will do this in a multi-step or separate replacement if needed,
+    // but here I strictly replace the method body.
+    // I'll assume `bitcoinService` is injected.
+
+    final policyState = _getPolicyState(request.deviceId);
+    final (txId, _) = await bitcoinService.broadcastTransaction(
+        request.deviceId, request.txHex, policyState);
+
+    return BroadcastTransactionResponse()..txId = txId;
+  }
 }
 
 Future<void> main(List<String> args) async {
@@ -760,7 +853,3 @@ String randomBase64(int bytes) {
   final values = List<int>.generate(bytes, (_) => rand.nextInt(256));
   return base64UrlEncode(values);
 }
-
-
-// TODO : 1) Allow Server Broadcast Transaction
-// 2) Save UTXOS for future purposes

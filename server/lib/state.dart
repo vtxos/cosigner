@@ -105,6 +105,7 @@ class SigningSessionState {
 
   // current session PolicyID
   String? currentPolicyId;
+  BigInt? pendingAmount;
 
   SigningSessionState(this.deviceId);
 }
@@ -117,8 +118,13 @@ class SpendingEntry {
 
 class UtxoState {
   final String deviceId;
-  final List<Utxo> utxos;
-  UtxoState(this.deviceId, this.utxos);
+  List<Utxo> utxos;
+
+  UtxoState(this.deviceId) : utxos = [];
+
+  void addUtxoList(List<Utxo> utxos) {
+    this.utxos.addAll(utxos);
+  }
 }
 
 class Utxo {

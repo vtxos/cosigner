@@ -2,6 +2,12 @@ import 'package:threshold/threshold.dart';
 import 'package:test/test.dart';
 
 import 'dkg_test.dart' show dealerDKG, Participant;
+import 'package:threshold/frost/signing.dart' as frost;
+import 'package:threshold/frost/commitment.dart' as frost_comm;
+import 'package:threshold/frost/signature.dart' as frost_sig;
+import 'package:pointycastle/ecc/api.dart' show ECPoint;
+import 'dart:convert';
+import 'dart:typed_data';
 import 'test_helper.dart';
 
 void main() {
@@ -258,6 +264,154 @@ void main() {
       expect(
         mixedReconstructed.scalar,
         isNot(equals(initialReconstructed.scalar)),
+      );
+    });
+
+    test('Test Key Refresh (2-of-2 subset from 3)', () {
+      final minParticipants = 2; // Threshold t
+      final dkgParticipants = 3; // Initial Group N
+      final refreshParticipants = 2; // Refresh Group size
+
+      final ids = defaultIdentifiers(dkgParticipants);
+      final participants = <Participant>[];
+      for (var i = 0; i < dkgParticipants; i++) {
+        final secret = modNRandom();
+        final coefficients = generateCoefficients(minParticipants - 1);
+        participants.add(Participant(ids[i], SecretKey(secret), coefficients));
+      }
+
+      // 1. Initial DKG (2-of-3)
+      final (initialKeys, initialPkp) = dealerDKG(
+        minParticipants,
+        dkgParticipants,
+        participants,
+      );
+
+      // Define Subset (First 2 participants)
+      final subset = initialKeys.sublist(0, refreshParticipants);
+
+      // Verify initial reconstruction
+      final initialShares = <Identifier, SecretShare>{};
+      for (final p in initialKeys) {
+        initialShares[p.identifier] = p.secretShare;
+      }
+      final initialReconstructed = reconstruct(minParticipants, initialShares);
+
+      // 2. Refresh Protocol (2 participants)
+      final r1Secrets = <Identifier, Round1SecretPackage>{};
+      final r1Pkgs = <Identifier, Round1Package>{};
+
+      for (final p in subset) {
+        final (sec, pkg) = dkgRefreshPart1(
+          p.identifier,
+          refreshParticipants,
+          minParticipants,
+        );
+        r1Secrets[p.identifier] = sec;
+        r1Pkgs[p.identifier] = pkg;
+      }
+
+      // Part 2
+      final r2Secrets = <Identifier, Round2SecretPackage>{};
+      final r2Outgoing = <Identifier, Map<Identifier, Round2Package>>{};
+
+      for (final p in subset) {
+        final id = p.identifier;
+        final others = <Identifier, Round1Package>{};
+        for (final other in subset) {
+          if (other.identifier == id) continue;
+          others[other.identifier] = r1Pkgs[other.identifier]!;
+        }
+
+        final (r2s, out) = dkgRefreshPart2(r1Secrets[id]!, others);
+        r2Secrets[id] = r2s;
+        r2Outgoing[id] = out;
+      }
+
+      // Part 3
+      final newKeys = <KeyPackage>[];
+      PublicKeyPackage? newPkp;
+
+      for (final p in subset) {
+        final id = p.identifier;
+        final r2View = <Identifier, Round2Package>{};
+        final r1View = <Identifier, Round1Package>{};
+
+        for (final other in subset) {
+          if (other.identifier == id) continue;
+          final otherId = other.identifier;
+          r2View[otherId] = r2Outgoing[otherId]![id]!;
+          r1View[otherId] = r1Pkgs[otherId]!;
+        }
+
+        final (kp, pk) = dkgRefreshPart3(
+          r2Secrets[id]!,
+          r1View,
+          r2View,
+          initialPkp,
+          p,
+        );
+        newKeys.add(kp);
+        newPkp = pk;
+      }
+
+      // 3. Verification
+      // Group PK unchanged
+      expect(
+        newPkp!.verifyingKey.E.getEncoded(true),
+        equals(initialPkp.verifyingKey.E.getEncoded(true)),
+      );
+
+      // Shares changed
+      expect(newKeys[0].secretShare, isNot(equals(initialKeys[0].secretShare)));
+
+      // Reconstruction matches
+      final newReconstructed = reconstruct(minParticipants, {
+        for (var k in newKeys) k.identifier: k.secretShare,
+      });
+      expect(newReconstructed.scalar, equals(initialReconstructed.scalar));
+
+      // 4. Verify Signing Capability (FROST)
+      // Mirroring the app flow: Use the refreshed keys to sign a message
+
+      final message = utf8.encode("test message");
+      final signingParticipants =
+          subset; // Use the 2 participants who refreshed
+
+      // A. Nonces & Commitments
+      final nonces = <Identifier, frost_comm.SigningNonce>{};
+      final commitmentsMap = <Identifier, frost_comm.SigningCommitments>{};
+
+      for (final p in signingParticipants) {
+        // Find the matching Refreshed KeyPackage
+        final kp = newKeys.firstWhere((k) => k.identifier == p.identifier);
+        final nonce = frost_comm.newNonce(kp.secretShare);
+        nonces[p.identifier] = nonce;
+        commitmentsMap[p.identifier] = nonce.commitments;
+      }
+
+      // B. Signing
+      final sharesMap = <Identifier, frost.SignatureShare>{};
+      final signingPkg = frost_comm.SigningPackage(commitmentsMap, message);
+
+      for (final p in signingParticipants) {
+        final kp = newKeys.firstWhere((k) => k.identifier == p.identifier);
+        final nonce = nonces[p.identifier]!;
+
+        final share = frost.sign(signingPkg, nonce, kp);
+        sharesMap[p.identifier] = share;
+      }
+
+      // C. Aggregation
+      // Use the Refreshed Public Key Package
+      final signature = frost.aggregate(signingPkg, sharesMap, newPkp);
+
+      // D. Verify
+      final isValid = signature.verify(newPkp.verifyingKey, message);
+      expect(
+        isValid,
+        isTrue,
+        reason: "Signature verification failed with refreshed keys",
       );
     });
   });

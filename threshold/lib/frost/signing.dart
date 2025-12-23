@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:pointycastle/ecc/api.dart';
+import 'package:convert/convert.dart';
 import 'package:threshold/core/dkg.dart'; // For KeyPackage, PublicKeyPackage, Signature
 import 'package:threshold/core/identifier.dart';
 import 'package:threshold/core/share.dart';
@@ -30,7 +31,7 @@ SignatureShare sign(
   }
 
   // ensure keyPackage Public key is even
-  keyPackage = keyPackage.tweak(null);
+  // keyPackage = keyPackage.tweak(null); // Removed forced tweak
   // Ensure the tweaked key is even (BIP-340)
   keyPackage = keyPackage.intoEvenY();
 
@@ -256,9 +257,7 @@ void verifySignatureShare(
 
   // RHS: R_share + c * lambda_i * Y_i
   final c_lambda = (challenge * lambdaI) % secp256k1Curve.n;
-  final term2 =
-      (verifyingShare *
-      c_lambda)!; // verifyingShare should be EvenY? passed in pubkeys are EvenY
+  final term2 = (verifyingShare * c_lambda)!;
 
   final RHS = (R_share + term2)!;
 

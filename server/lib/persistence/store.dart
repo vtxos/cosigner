@@ -6,8 +6,7 @@ class DKGSessionStore {
   late Box _box;
 
   Future<void> init() async {
-    // Initialize Hive in the current directory (for now)
-    Hive.init('hive_db');
+    // Hive.init should be called by the application entry point
     _box = await Hive.openBox(_sessionBoxName);
   }
 
@@ -30,8 +29,6 @@ class SigningSessionStore {
   late Box _box;
 
   Future<void> init() async {
-    // Initialize Hive in the current directory (for now)
-    Hive.init('hive_db');
     _box = await Hive.openBox(_sessionBoxName);
   }
 
@@ -54,8 +51,6 @@ class RefreshSessionStore {
   late Box _box;
 
   Future<void> init() async {
-    // Initialize Hive in the current directory (for now)
-    Hive.init('hive_db');
     _box = await Hive.openBox(_sessionBoxName);
   }
 
@@ -78,8 +73,6 @@ class PolicyStore {
   late Box _box;
 
   Future<void> init() async {
-    // Initialize Hive in the current directory (for now)
-    Hive.init('hive_db');
     _box = await Hive.openBox(_policyBoxName);
   }
 
@@ -102,8 +95,6 @@ class UtxoStore {
   late Box _box;
 
   Future<void> init() async {
-    // Initialize Hive in the current directory (for now)
-    Hive.init('hive_db');
     _box = await Hive.openBox(_utxoBoxName);
   }
 
