@@ -31,7 +31,6 @@ SignatureShare sign(
   }
 
   // ensure keyPackage Public key is even
-  // keyPackage = keyPackage.tweak(null); // Removed forced tweak
   // Ensure the tweaked key is even (BIP-340)
   keyPackage = keyPackage.intoEvenY();
 
@@ -192,7 +191,7 @@ Signature aggregate(
   final R_plus_cY = (effectiveR + cY)!;
 
   if (pointsEqual(zG, R_plus_cY)) {
-    return sig;
+    return sig.intoEvenY();
   }
 
   // Cheater detection would go here (verifySignatureShare)

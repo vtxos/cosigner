@@ -326,14 +326,6 @@ class MPCWalletService extends MPCWalletServiceBase {
         print(
             '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
 
-        policyState.normalPolicy = NormalPolicy(
-          id: "normal policies",
-          keyPackage: keyPkg,
-          publicKeyPackage: pubKeyPkg,
-        );
-        print(
-            '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
-
         // Persistence
         try {
           await policyStore.savePolicy(
@@ -579,6 +571,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
         // Explicitly apply Taproot tweak (Key Path Spending)
         serverKeyPackage = serverKeyPackage.tweak(null);
+        serverPubPackage = serverPubPackage.tweak(null);
 
         final serverShareObj =
             frost.sign(signingPkg, session.serverNonce!, serverKeyPackage);
@@ -600,7 +593,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       });
 
       final signature =
-          frost.aggregate(signingPkg, sharesMap, serverPubPackage.tweak(null));
+          frost.aggregate(signingPkg, sharesMap, serverPubPackage);
       print('[${request.deviceId}] SignStep2: Aggregated.');
 
       // Commit Pending Amount to History

@@ -407,12 +407,9 @@ void main() {
       final signature = frost.aggregate(signingPkg, sharesMap, newPkp);
 
       // D. Verify
-      final isValid = signature.verify(newPkp.verifyingKey, message);
-      expect(
-        isValid,
-        isTrue,
-        reason: "Signature verification failed with refreshed keys",
-      );
+      signature.verify(newPkp.verifyingKey, message);
+
+      expect(signature.hasEvenY, isTrue);
     });
   });
 }

@@ -59,7 +59,7 @@ class Signature {
   }
 
   // Verify signature against public key P and message m
-  bool verify(VerifyingKey pk, Uint8List message) {
+  Signature verify(VerifyingKey pk, Uint8List message) {
     final pkEvenY = pk.intoEvenY();
     final sigEvenY = intoEvenY();
 
@@ -73,7 +73,11 @@ class Signature {
     final eP = (P * challenge)!;
     final R_plus_eP = (sigEvenY.R + eP)!;
 
-    return pointsEqual(sG, R_plus_eP);
+    if (!pointsEqual(sG, R_plus_eP)) {
+      throw Exception("Invalid signature");
+    }
+
+    return sigEvenY;
   }
 }
 
