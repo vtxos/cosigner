@@ -136,156 +136,168 @@ class MPCWalletService extends MPCWalletServiceBase {
   Future<DKGStep1Response> dKGStep1(
       ServiceCall call, DKGStep1Request request) async {
     final session = _getDKGSession(request.deviceId);
-    final clientIdHex = _idToString(request.identifier);
-    print(
-        '[${request.deviceId}] DKGStep1: Received PubPackage from $clientIdHex');
+    try {
+      final clientIdHex = _idToString(request.identifier);
+      print(
+          '[${request.deviceId}] DKGStep1: Received PubPackage from $clientIdHex');
 
-    session.round1Packages[clientIdHex] = request.round1Package;
+      session.round1Packages[clientIdHex] = request.round1Package;
 
-    // Server Init for this session
-    if (session.serverRound1SecretPackage == null) {
-      print('[${request.deviceId}] Server: Generating DKG secrets...');
-      final secret = threshold.SecretKey(threshold.modNRandom());
-      final coeffs = threshold.generateCoefficients(thresholdCount - 1);
-      final (r1Secret, r1Public) = threshold.dkgPart1(
-          serverId, totalParticipants, thresholdCount, secret, coeffs);
+      // Server Init for this session
+      if (session.serverRound1SecretPackage == null) {
+        print('[${request.deviceId}] Server: Generating DKG secrets...');
+        final secret = threshold.SecretKey(threshold.modNRandom());
+        final coeffs = threshold.generateCoefficients(thresholdCount - 1);
+        final (r1Secret, r1Public) = threshold.dkgPart1(
+            serverId, totalParticipants, thresholdCount, secret, coeffs);
 
-      session.serverInternalSecret = secret;
-      session.serverRound1SecretPackage = r1Secret;
-      session.round1Packages[serverIdHex] = jsonEncode(r1Public.toJson());
+        session.serverInternalSecret = secret;
+        session.serverRound1SecretPackage = r1Secret;
+        session.round1Packages[serverIdHex] = jsonEncode(r1Public.toJson());
+      }
+
+      if (session.round1Packages.length == totalParticipants) {
+        if (!session.completerStep1.isCompleted)
+          session.completerStep1.complete();
+      } else {
+        await session.completerStep1.future;
+      }
+
+      return DKGStep1Response()..round1Packages.addAll(session.round1Packages);
+    } catch (e) {
+      print('[${request.deviceId}] DKGStep1 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    if (session.round1Packages.length == totalParticipants) {
-      if (!session.completerStep1.isCompleted)
-        session.completerStep1.complete();
-    } else {
-      await session.completerStep1.future;
-    }
-
-    return DKGStep1Response()..round1Packages.addAll(session.round1Packages);
   }
 
   @override
   Future<DKGStep2Response> dKGStep2(
       ServiceCall call, DKGStep2Request request) async {
     final session = _getDKGSession(request.deviceId);
-    await session.completerStep1.future;
+    try {
+      await session.completerStep1.future;
 
-    if (session.dkgRound2PackagesLocal.isEmpty) {
-      print('[${request.deviceId}] DKGStep2: Server computing shares...');
-      final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
-      session.round1Packages.forEach((k, v) {
-        final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-        if (id != serverId) {
-          round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+      if (session.dkgRound2PackagesLocal.isEmpty) {
+        print('[${request.deviceId}] DKGStep2: Server computing shares...');
+        final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
+        session.round1Packages.forEach((k, v) {
+          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
+          if (id != serverId) {
+            round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          }
+        });
+
+        if (session.serverRound1SecretPackage == null) {
+          throw StateError(
+              'Server secrets missing for session ${request.deviceId}');
         }
-      });
 
-      if (session.serverRound1SecretPackage == null) {
-        throw StateError(
-            'Server secrets missing for session ${request.deviceId}');
+        final (serverRound2Secret, serverRound2Pkgs) =
+            threshold.dkgPart2(session.serverRound1SecretPackage!, round1Pkgs);
+
+        session.serverRound2Secret = serverRound2Secret;
+        session.dkgRound2PackagesLocal.addAll(serverRound2Pkgs);
       }
 
-      final (serverRound2Secret, serverRound2Pkgs) =
-          threshold.dkgPart2(session.serverRound1SecretPackage!, round1Pkgs);
+      if (!session.completerStep2.isCompleted)
+        session.completerStep2.complete();
 
-      session.serverRound2Secret = serverRound2Secret;
-      session.dkgRound2PackagesLocal.addAll(serverRound2Pkgs);
+      return DKGStep2Response()
+        ..allRound1Packages.addAll(session.round1Packages);
+    } catch (e) {
+      print('[${request.deviceId}] DKGStep2 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    if (!session.completerStep2.isCompleted) session.completerStep2.complete();
-
-    return DKGStep2Response()..allRound1Packages.addAll(session.round1Packages);
   }
 
   @override
   Future<DKGStep3Response> dKGStep3(
       ServiceCall call, DKGStep3Request request) async {
     final session = _getDKGSession(request.deviceId);
-    final senderId = threshold.Identifier.deserialize(
-        Uint8List.fromList(request.identifier));
-    print(
-        '[${request.deviceId}] DKGStep3: Received Shares from ${_idToString(request.identifier)}');
-
-    await session.completerStep2.future;
-
-    final sharesFromSenderForOthers =
-        <threshold.Identifier, threshold.Round2Package>{};
-    for (final entry in request.round2PackagesForOthers.entries) {
-      final recipientId = _stringToId(entry.key);
-      final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
-      sharesFromSenderForOthers[recipientId] = pkg;
-
-      if (recipientId == serverId) {
-        session.dkgRound2PackagesReceived[senderId] = pkg;
-      }
-    }
-    session.dkgRound2PackagesForRelay[senderId] = sharesFromSenderForOthers;
-
-    if (session.dkgRound2PackagesForRelay.length == totalParticipants - 1) {
-      session.dkgRound2PackagesForRelay[serverId] =
-          session.dkgRound2PackagesLocal;
-      if (!session.completerStep3.isCompleted)
-        session.completerStep3.complete();
-    } else {
-      await session.completerStep3.future;
-    }
-
-    final packagesForRequester = <String, String>{};
-    for (final participantId in session.dkgRound2PackagesForRelay.keys) {
-      final participantShares =
-          session.dkgRound2PackagesForRelay[participantId]!;
-      if (participantShares.containsKey(senderId)) {
-        packagesForRequester[_idToString(
-                threshold.bigIntToBytes(participantId.toScalar()))] =
-            jsonEncode(participantShares[senderId]!.toJson());
-      }
-    }
-
-    final policyState = _getPolicyState(request.deviceId);
-
-    if (policyState.normalPolicy == null &&
-        session.completerStep3.isCompleted) {
-      print('[${request.deviceId}] DKGStep3: Server computing KeyPackage...');
-      final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
-      session.round1Packages.forEach((k, v) {
-        final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-        if (id != serverId) {
-          allRound1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
-        }
-      });
-
-      final allReceivedSharesPoints =
-          <threshold.Identifier, threshold.Round2Package>{};
-      allReceivedSharesPoints.addAll(session.dkgRound2PackagesReceived);
-
-      final (keyPkg, pubKeyPkg) = threshold.dkgPart3(
-          session.serverRound1SecretPackage!,
-          session.serverRound2Secret!,
-          allRound1Pkgs,
-          allReceivedSharesPoints);
-
-      policyState.normalPolicy = NormalPolicy(
-        id: "normal policies",
-        keyPackage: keyPkg,
-        publicKeyPackage: pubKeyPkg,
-      );
+    try {
+      final senderId = threshold.Identifier.deserialize(
+          Uint8List.fromList(request.identifier));
       print(
-          '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
+          '[${request.deviceId}] DKGStep3: Received Shares from ${_idToString(request.identifier)}');
 
-      // TODO: (Joshua) Fix Persistence
-      // For now, we just save a simple string to prove persistence works
-      // In production, we'd serialize `keyPkg` and `pubKeyPkg`.
-      // await _store.saveSession(
-      //     request.deviceId,
-      //     jsonEncode({
-      //       "status": "COMPLETED",
-      //       "pk_x": pubKeyPkg.verifyingKey.E.x.toString(),
-      //       "pk_y": pubKeyPkg.verifyingKey.E.y.toString(),
-      //     }));
+      await session.completerStep2.future;
+
+      final sharesFromSenderForOthers =
+          <threshold.Identifier, threshold.Round2Package>{};
+      for (final entry in request.round2PackagesForOthers.entries) {
+        final recipientId = _stringToId(entry.key);
+        final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
+        sharesFromSenderForOthers[recipientId] = pkg;
+
+        if (recipientId == serverId) {
+          session.dkgRound2PackagesReceived[senderId] = pkg;
+        }
+      }
+      session.dkgRound2PackagesForRelay[senderId] = sharesFromSenderForOthers;
+
+      if (session.dkgRound2PackagesForRelay.length == totalParticipants - 1) {
+        session.dkgRound2PackagesForRelay[serverId] =
+            session.dkgRound2PackagesLocal;
+        if (!session.completerStep3.isCompleted)
+          session.completerStep3.complete();
+      } else {
+        await session.completerStep3.future;
+      }
+
+      final packagesForRequester = <String, String>{};
+      for (final participantId in session.dkgRound2PackagesForRelay.keys) {
+        final participantShares =
+            session.dkgRound2PackagesForRelay[participantId]!;
+        if (participantShares.containsKey(senderId)) {
+          packagesForRequester[_idToString(
+                  threshold.bigIntToBytes(participantId.toScalar()))] =
+              jsonEncode(participantShares[senderId]!.toJson());
+        }
+      }
+
+      final policyState = _getPolicyState(request.deviceId);
+
+      if (policyState.normalPolicy == null &&
+          session.completerStep3.isCompleted) {
+        print('[${request.deviceId}] DKGStep3: Server computing KeyPackage...');
+        final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
+        session.round1Packages.forEach((k, v) {
+          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
+          if (id != serverId) {
+            allRound1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          }
+        });
+
+        final allReceivedSharesPoints =
+            <threshold.Identifier, threshold.Round2Package>{};
+        allReceivedSharesPoints.addAll(session.dkgRound2PackagesReceived);
+
+        final (keyPkg, pubKeyPkg) = threshold.dkgPart3(
+            session.serverRound1SecretPackage!,
+            session.serverRound2Secret!,
+            allRound1Pkgs,
+            allReceivedSharesPoints);
+
+        policyState.normalPolicy = NormalPolicy(
+          id: "normal policies",
+          keyPackage: keyPkg,
+          publicKeyPackage: pubKeyPkg,
+        );
+        print(
+            '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
+
+        // TODO: (Joshua) Fix Persistence
+      }
+
+      return DKGStep3Response()
+        ..round2PackagesForMe.addAll(packagesForRequester);
+    } catch (e) {
+      print('[${request.deviceId}] DKGStep3 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    return DKGStep3Response()..round2PackagesForMe.addAll(packagesForRequester);
   }
 
   // --- Signing ---
@@ -384,84 +396,90 @@ class MPCWalletService extends MPCWalletServiceBase {
   Future<SignStep1Response> signStep1(
       ServiceCall call, SignStep1Request request) async {
     final session = _getSigningSession(request.deviceId);
-    final policyState = _getPolicyState(request.deviceId);
-    final senderId = threshold.Identifier.deserialize(
-        Uint8List.fromList(request.identifier));
-    print(
-        '[${request.deviceId}] SignStep1: Received from ${_idToString(request.identifier)}');
-
-    // Ensure we have a key for this session
-    if (policyState.normalPolicy == null) {
-      throw GrpcError.failedPrecondition(
-          "DKG not completed for device ${request.deviceId}");
-    }
-
-    var serverKeyPackage = policyState.normalPolicy!.keyPackage;
-
-    final policy = _getPolicy(
-      request.fullTransaction,
-      policyState.normalPolicy!.publicKeyPackage,
-      request.deviceId,
-    );
-
-    if (policy != null) {
-      serverKeyPackage = policy.keyPackage;
-      session.currentPolicyId = policy.id;
+    try {
+      final policyState = _getPolicyState(request.deviceId);
+      final senderId = threshold.Identifier.deserialize(
+          Uint8List.fromList(request.identifier));
       print(
-          '[${request.deviceId}] SignStep1: Switched to Protected Policy: ${policy.id}');
-    } else {
-      print('[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
-    }
+          '[${request.deviceId}] SignStep1: Received from ${_idToString(request.identifier)}');
 
-    // ---------------------------
+      // Ensure we have a key for this session
+      if (policyState.normalPolicy == null) {
+        throw GrpcError.failedPrecondition(
+            "DKG not completed for device ${request.deviceId}");
+      }
 
-    final hidingP = threshold.elemDeserializeCompressed(
-        Uint8List.fromList(request.hidingCommitment));
-    final bindingP = threshold.elemDeserializeCompressed(
-        Uint8List.fromList(request.bindingCommitment));
-    session.signCommitmentsReceived[senderId] =
-        frost_comm.SigningCommitments(bindingP, hidingP);
+      var serverKeyPackage = policyState.normalPolicy!.keyPackage;
 
-    if (session.serverNonce == null) {
-      print(
-          '[${request.deviceId}] SignStep1: Server generating commitments...');
-      session.serverNonce = frost_comm.newNonce(serverKeyPackage.secretShare);
-      session.serverCommitments = session.serverNonce!.commitments;
-      session.signCommitmentsReceived[serverId] = session.serverCommitments!;
-    }
-
-    if (session.messageToSign == null && request.messageToSign.isNotEmpty) {
-      session.messageToSign = Uint8List.fromList(request.messageToSign);
-    }
-
-    // Calculate spent amount for history tracking
-    final spent = _calculateSpentAmount(
-        Uint8List.fromList(request.fullTransaction),
+      final policy = _getPolicy(
+        request.fullTransaction,
         policyState.normalPolicy!.publicKeyPackage,
-        request.deviceId);
-    session.pendingAmount = spent;
-
-    if (session.signCommitmentsReceived.length >= thresholdCount) {
-      if (!session.completerSignStep1.isCompleted)
-        session.completerSignStep1.complete();
-    } else {
-      await session.completerSignStep1.future;
-    }
-
-    final responseCommitments = <String, SignStep1Response_Commitment>{};
-    for (final entry in session.signCommitmentsReceived.entries) {
-      final comm = entry.value;
-      responseCommitments[
-              _idToString(threshold.bigIntToBytes(entry.key.toScalar()))] =
-          SignStep1Response_Commitment(
-        hiding: threshold.elemSerializeCompressed(comm.hiding),
-        binding: threshold.elemSerializeCompressed(comm.binding),
+        request.deviceId,
       );
-    }
 
-    return SignStep1Response()
-      ..commitments.addAll(responseCommitments)
-      ..messageToSign = session.messageToSign!;
+      if (policy != null) {
+        serverKeyPackage = policy.keyPackage;
+        session.currentPolicyId = policy.id;
+        print(
+            '[${request.deviceId}] SignStep1: Switched to Protected Policy: ${policy.id}');
+      } else {
+        print('[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
+      }
+
+      // ---------------------------
+
+      final hidingP = threshold.elemDeserializeCompressed(
+          Uint8List.fromList(request.hidingCommitment));
+      final bindingP = threshold.elemDeserializeCompressed(
+          Uint8List.fromList(request.bindingCommitment));
+      session.signCommitmentsReceived[senderId] =
+          frost_comm.SigningCommitments(bindingP, hidingP);
+
+      if (session.serverNonce == null) {
+        print(
+            '[${request.deviceId}] SignStep1: Server generating commitments...');
+        session.serverNonce = frost_comm.newNonce(serverKeyPackage.secretShare);
+        session.serverCommitments = session.serverNonce!.commitments;
+        session.signCommitmentsReceived[serverId] = session.serverCommitments!;
+      }
+
+      if (session.messageToSign == null && request.messageToSign.isNotEmpty) {
+        session.messageToSign = Uint8List.fromList(request.messageToSign);
+      }
+
+      // Calculate spent amount for history tracking
+      final spent = _calculateSpentAmount(
+          Uint8List.fromList(request.fullTransaction),
+          policyState.normalPolicy!.publicKeyPackage,
+          request.deviceId);
+      session.pendingAmount = spent;
+
+      if (session.signCommitmentsReceived.length >= thresholdCount) {
+        if (!session.completerSignStep1.isCompleted)
+          session.completerSignStep1.complete();
+      } else {
+        await session.completerSignStep1.future;
+      }
+
+      final responseCommitments = <String, SignStep1Response_Commitment>{};
+      for (final entry in session.signCommitmentsReceived.entries) {
+        final comm = entry.value;
+        responseCommitments[
+                _idToString(threshold.bigIntToBytes(entry.key.toScalar()))] =
+            SignStep1Response_Commitment(
+          hiding: threshold.elemSerializeCompressed(comm.hiding),
+          binding: threshold.elemSerializeCompressed(comm.binding),
+        );
+      }
+
+      return SignStep1Response()
+        ..commitments.addAll(responseCommitments)
+        ..messageToSign = session.messageToSign!;
+    } catch (e) {
+      print('[${request.deviceId}] SignStep1 Error: $e');
+      session.reset();
+      rethrow;
+    }
   }
 
   @override
@@ -545,20 +563,9 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       return response;
     } catch (e) {
-      session.serverNonce = null;
-      session.serverCommitments = null;
-      session.signCommitmentsReceived.clear();
-      session.messageToSign = null;
-      session.signRound2Shares.clear();
-      session.completerSignStep1 = Completer<void>();
-      session.completerSignStep2 = Completer<void>();
-      session.currentPolicyId = null;
-      session.pendingAmount = null;
-
-      // print error
-      print('[${request.deviceId}] SignStep2: Error: $e');
-
-      throw e;
+      print('[${request.deviceId}] SignStep2 Error: $e');
+      session.reset();
+      rethrow;
     }
   }
 
@@ -568,210 +575,220 @@ class MPCWalletService extends MPCWalletServiceBase {
   Future<RefreshStep1Response> refreshStep1(
       ServiceCall call, RefreshStep1Request request) async {
     final session = _getRefreshSession(request.deviceId);
-    final policyState = _getPolicyState(request.deviceId);
-    final clientIdHex = _idToString(request.identifier);
-    print(
-        '[${request.deviceId}] RefreshStep1: Received PubPackage from $clientIdHex');
-
-    // Auto-Reset if previous session finished
-    if (session.completerRefreshStep3.isCompleted) {
+    try {
+      final policyState = _getPolicyState(request.deviceId);
+      final clientIdHex = _idToString(request.identifier);
       print(
-          '[${request.deviceId}] RefreshStep1: Resetting previous refresh session...');
-      session.refreshRound1Packages.clear();
-      session.serverRefreshRound1Secret = null;
-      session.serverRefreshRound2Secret = null;
-      session.refreshRound2PackagesReceived.clear();
-      session.refreshRound2PackagesLocal.clear();
-      session.refreshRound2PackagesForRelay.clear();
-      session.completerRefreshStep1 = Completer<void>();
-      session.completerRefreshStep2 = Completer<void>();
-      session.completerRefreshStep3 = Completer<void>();
-      session.refreshCreationTime = DateTime.now();
-      session.refreshId = randomBase64(32);
-      session.refreshThresholdAmount = request.thresholdAmount;
-      session.refreshInterval = request.interval.toInt();
-    }
+          '[${request.deviceId}] RefreshStep1: Received PubPackage from $clientIdHex');
 
-    session.refreshRound1Packages[clientIdHex] = request.round1Package;
-
-    // Server Init for this refresh session
-    if (session.serverRefreshRound1Secret == null) {
-      print('[${request.deviceId}] Server: Generating Refresh secrets...');
-      if (policyState.normalPolicy == null) {
-        throw GrpcError.failedPrecondition("No key to refresh");
+      // Auto-Reset if previous session finished
+      if (session.completerRefreshStep3.isCompleted) {
+        print(
+            '[${request.deviceId}] RefreshStep1: Resetting previous refresh session...');
+        session.reset();
+        // Since reset() clears everything including refreshCreationTime, we need to re-initialize below
       }
 
-      final (r1Secret, r1Public) = threshold.dkgRefreshPart1(
-        serverId,
-        2,
-        thresholdCount,
-      );
+      session.refreshRound1Packages[clientIdHex] = request.round1Package;
 
-      if (session.refreshCreationTime == null) {
-        session.refreshCreationTime = DateTime.now();
-        session.refreshId = randomBase64(32);
-        session.refreshThresholdAmount = request.thresholdAmount;
-        session.refreshInterval = request.interval.toInt();
+      // Server Init for this refresh session
+      if (session.serverRefreshRound1Secret == null) {
+        print('[${request.deviceId}] Server: Generating Refresh secrets...');
+        if (policyState.normalPolicy == null) {
+          throw GrpcError.failedPrecondition("No key to refresh");
+        }
+
+        final (r1Secret, r1Public) = threshold.dkgRefreshPart1(
+          serverId,
+          2,
+          thresholdCount,
+        );
+
+        if (session.refreshCreationTime == null) {
+          session.refreshCreationTime = DateTime.now();
+          session.refreshId = randomBase64(32);
+          session.refreshThresholdAmount = request.thresholdAmount;
+          session.refreshInterval = request.interval.toInt();
+        }
+
+        session.serverRefreshRound1Secret = r1Secret;
+        session.refreshRound1Packages[serverIdHex] =
+            jsonEncode(r1Public.toJson());
       }
 
-      session.serverRefreshRound1Secret = r1Secret;
-      session.refreshRound1Packages[serverIdHex] =
-          jsonEncode(r1Public.toJson());
-    }
+      if (session.refreshRound1Packages.length == 2) {
+        if (!session.completerRefreshStep1.isCompleted)
+          session.completerRefreshStep1.complete();
+      } else {
+        await session.completerRefreshStep1.future;
+      }
 
-    if (session.refreshRound1Packages.length == 2) {
-      if (!session.completerRefreshStep1.isCompleted)
-        session.completerRefreshStep1.complete();
-    } else {
-      await session.completerRefreshStep1.future;
+      return RefreshStep1Response()
+        ..round1Packages.addAll(session.refreshRound1Packages)
+        ..startTime = Int64(session.refreshCreationTime!.millisecondsSinceEpoch)
+        ..policyId = session.refreshId!;
+    } catch (e) {
+      print('[${request.deviceId}] RefreshStep1 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    return RefreshStep1Response()
-      ..round1Packages.addAll(session.refreshRound1Packages)
-      ..startTime = Int64(session.refreshCreationTime!.millisecondsSinceEpoch)
-      ..policyId = session.refreshId!;
   }
 
   @override
   Future<RefreshStep2Response> refreshStep2(
       ServiceCall call, RefreshStep2Request request) async {
     final session = _getRefreshSession(request.deviceId);
-    await session.completerRefreshStep1.future;
+    try {
+      await session.completerRefreshStep1.future;
 
-    if (session.refreshRound2PackagesLocal.isEmpty) {
-      print('[${request.deviceId}] RefreshStep2: Server computing shares...');
-      final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
-      session.refreshRound1Packages.forEach((k, v) {
-        final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-        if (id != serverId) {
-          round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
-        }
-      });
+      if (session.refreshRound2PackagesLocal.isEmpty) {
+        print('[${request.deviceId}] RefreshStep2: Server computing shares...');
+        final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
+        session.refreshRound1Packages.forEach((k, v) {
+          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
+          if (id != serverId) {
+            round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          }
+        });
 
-      final (serverRound2Secret, serverRound2Pkgs) = threshold.dkgRefreshPart2(
-          session.serverRefreshRound1Secret!, round1Pkgs);
+        final (serverRound2Secret, serverRound2Pkgs) = threshold
+            .dkgRefreshPart2(session.serverRefreshRound1Secret!, round1Pkgs);
 
-      session.serverRefreshRound2Secret = serverRound2Secret;
-      session.refreshRound2PackagesLocal.addAll(serverRound2Pkgs);
+        session.serverRefreshRound2Secret = serverRound2Secret;
+        session.refreshRound2PackagesLocal.addAll(serverRound2Pkgs);
+      }
+
+      if (!session.completerRefreshStep2.isCompleted)
+        session.completerRefreshStep2.complete();
+
+      return RefreshStep2Response()
+        ..allRound1Packages.addAll(session.refreshRound1Packages);
+    } catch (e) {
+      print('[${request.deviceId}] RefreshStep2 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    if (!session.completerRefreshStep2.isCompleted)
-      session.completerRefreshStep2.complete();
-
-    return RefreshStep2Response()
-      ..allRound1Packages.addAll(session.refreshRound1Packages);
   }
 
   @override
   Future<RefreshStep3Response> refreshStep3(
       ServiceCall call, RefreshStep3Request request) async {
     final session = _getRefreshSession(request.deviceId);
-    final policyState = _getPolicyState(request.deviceId);
+    try {
+      final policyState = _getPolicyState(request.deviceId);
 
-    final senderId = threshold.Identifier.deserialize(
-        Uint8List.fromList(request.identifier));
-    print(
-        '[${request.deviceId}] RefreshStep3: Received Shares from ${_idToString(request.identifier)}');
+      final senderId = threshold.Identifier.deserialize(
+          Uint8List.fromList(request.identifier));
+      print(
+          '[${request.deviceId}] RefreshStep3: Received Shares from ${_idToString(request.identifier)}');
 
-    await session.completerRefreshStep2.future;
+      await session.completerRefreshStep2.future;
 
-    final sharesFromSenderForOthers =
-        <threshold.Identifier, threshold.Round2Package>{};
-    for (final entry in request.round2PackagesForOthers.entries) {
-      final recipientId = _stringToId(entry.key);
-      final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
-      sharesFromSenderForOthers[recipientId] = pkg;
+      final sharesFromSenderForOthers =
+          <threshold.Identifier, threshold.Round2Package>{};
+      for (final entry in request.round2PackagesForOthers.entries) {
+        final recipientId = _stringToId(entry.key);
+        final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
+        sharesFromSenderForOthers[recipientId] = pkg;
 
-      if (recipientId == serverId) {
-        session.refreshRound2PackagesReceived[senderId] = pkg;
-      }
-    }
-    session.refreshRound2PackagesForRelay[senderId] = sharesFromSenderForOthers;
-
-    // Determine N based on session state
-    int n = 2;
-
-    if (session.refreshRound2PackagesForRelay.length == n - 1) {
-      session.refreshRound2PackagesForRelay[serverId] =
-          session.refreshRound2PackagesLocal;
-      if (!session.completerRefreshStep3.isCompleted)
-        session.completerRefreshStep3.complete();
-    } else {
-      await session.completerRefreshStep3.future;
-    }
-
-    final packagesForRequester = <String, String>{};
-    for (final participantId in session.refreshRound2PackagesForRelay.keys) {
-      final participantShares =
-          session.refreshRound2PackagesForRelay[participantId]!;
-      if (participantShares.containsKey(senderId)) {
-        packagesForRequester[_idToString(
-                threshold.bigIntToBytes(participantId.toScalar()))] =
-            jsonEncode(participantShares[senderId]!.toJson());
-      }
-    }
-
-    if (session.completerRefreshStep3.isCompleted) {
-      if (session.serverRefreshRound2Secret != null) {
-        // Compute logical "server" share receipt (handled in loop above).
-        // Already added to relay map.
-
-        print(
-            '[${request.deviceId}] RefreshStep3: Server computing New Key...');
-
-        final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
-        session.refreshRound1Packages.forEach((k, v) {
-          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-          if (id != serverId) {
-            allRound1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
-          }
-        });
-
-        final allReceivedSharesPoints =
-            <threshold.Identifier, threshold.Round2Package>{};
-        allReceivedSharesPoints.addAll(session.refreshRound2PackagesReceived);
-
-        final normalKey = policyState.normalPolicy!.keyPackage;
-        final normalPub = policyState.normalPolicy!.publicKeyPackage;
-
-        final (keyPkg, pubKeyPkg) = threshold.dkgRefreshPart3(
-            session.serverRefreshRound2Secret!,
-            allRound1Pkgs,
-            allReceivedSharesPoints,
-            normalPub,
-            normalKey);
-
-        final newPolicy = ProtectedPolicy(
-          id: session.refreshId!,
-          thresholdSats: BigInt.from(session.refreshThresholdAmount!.toInt()),
-          startTime: session.refreshCreationTime!,
-          interval: Duration(seconds: session.refreshInterval!),
-          keyPackage: keyPkg,
-          publicKeyPackage: pubKeyPkg,
-        );
-
-        policyState.protectedPolicies[newPolicy.id] = newPolicy;
-
-        // Prevent re-computation
-        session.serverRefreshRound2Secret = null;
-
-        // Verify invariant
-        if (normalPub.verifyingKey.E.getEncoded(true).toString() !=
-            pubKeyPkg.verifyingKey.E.getEncoded(true).toString()) {
-          print(
-              "WARNING: Group key changed during refresh! This indicates a protocol failure or attack.");
+        if (recipientId == serverId) {
+          session.refreshRound2PackagesReceived[senderId] = pkg;
         }
+      }
+      session.refreshRound2PackagesForRelay[senderId] =
+          sharesFromSenderForOthers;
 
+      // Determine N based on session state
+      int n = 2;
+
+      if (session.refreshRound2PackagesForRelay.length == n - 1) {
+        session.refreshRound2PackagesForRelay[serverId] =
+            session.refreshRound2PackagesLocal;
         if (!session.completerRefreshStep3.isCompleted)
           session.completerRefreshStep3.complete();
+      } else {
+        await session.completerRefreshStep3.future;
       }
+
+      final packagesForRequester = <String, String>{};
+      for (final participantId in session.refreshRound2PackagesForRelay.keys) {
+        final participantShares =
+            session.refreshRound2PackagesForRelay[participantId]!;
+        if (participantShares.containsKey(senderId)) {
+          packagesForRequester[_idToString(
+                  threshold.bigIntToBytes(participantId.toScalar()))] =
+              jsonEncode(participantShares[senderId]!.toJson());
+        }
+      }
+
+      if (session.completerRefreshStep3.isCompleted) {
+        if (session.serverRefreshRound2Secret != null) {
+          // Compute logical "server" share receipt (handled in loop above).
+          // Already added to relay map.
+
+          print(
+              '[${request.deviceId}] RefreshStep3: Server computing New Key...');
+
+          final allRound1Pkgs =
+              <threshold.Identifier, threshold.Round1Package>{};
+          session.refreshRound1Packages.forEach((k, v) {
+            final id = threshold.Identifier(BigInt.parse(k, radix: 16));
+            if (id != serverId) {
+              allRound1Pkgs[id] =
+                  threshold.Round1Package.fromJson(jsonDecode(v));
+            }
+          });
+
+          final allReceivedSharesPoints =
+              <threshold.Identifier, threshold.Round2Package>{};
+          allReceivedSharesPoints.addAll(session.refreshRound2PackagesReceived);
+
+          final normalKey = policyState.normalPolicy!.keyPackage;
+          final normalPub = policyState.normalPolicy!.publicKeyPackage;
+
+          final (keyPkg, pubKeyPkg) = threshold.dkgRefreshPart3(
+              session.serverRefreshRound2Secret!,
+              allRound1Pkgs,
+              allReceivedSharesPoints,
+              normalPub,
+              normalKey);
+
+          final newPolicy = ProtectedPolicy(
+            id: session.refreshId!,
+            thresholdSats: BigInt.from(session.refreshThresholdAmount!.toInt()),
+            startTime: session.refreshCreationTime!,
+            interval: Duration(seconds: session.refreshInterval!),
+            keyPackage: keyPkg,
+            publicKeyPackage: pubKeyPkg,
+          );
+
+          policyState.protectedPolicies[newPolicy.id] = newPolicy;
+
+          // Prevent re-computation
+          session.serverRefreshRound2Secret = null;
+
+          // Verify invariant
+          if (normalPub.verifyingKey.E.getEncoded(true).toString() !=
+              pubKeyPkg.verifyingKey.E.getEncoded(true).toString()) {
+            print(
+                "WARNING: Group key changed during refresh! This indicates a protocol failure or attack.");
+          }
+
+          if (!session.completerRefreshStep3.isCompleted)
+            session.completerRefreshStep3.complete();
+        }
+      }
+
+      // Wait for completion if we weren't the trigger
+      await session.completerRefreshStep3.future;
+
+      return RefreshStep3Response()
+        ..round2PackagesForMe.addAll(packagesForRequester);
+    } catch (e) {
+      print('[${request.deviceId}] RefreshStep3 Error: $e');
+      session.reset();
+      rethrow;
     }
-
-    // Wait for completion if we weren't the trigger
-    await session.completerRefreshStep3.future;
-
-    return RefreshStep3Response()
-      ..round2PackagesForMe.addAll(packagesForRequester);
   }
 
   @override

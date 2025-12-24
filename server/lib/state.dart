@@ -45,6 +45,19 @@ class DKGSessionState {
       Map<threshold.Identifier, threshold.Round2Package>>{};
 
   DKGSessionState(this.deviceId);
+
+  void reset() {
+    completerStep1 = Completer<void>();
+    completerStep2 = Completer<void>();
+    completerStep3 = Completer<void>();
+    round1Packages.clear();
+    serverInternalSecret = null;
+    serverRound1SecretPackage = null;
+    serverRound2Secret = null;
+    dkgRound2PackagesReceived.clear();
+    dkgRound2PackagesLocal.clear();
+    dkgRound2PackagesForRelay.clear();
+  }
 }
 
 class PolicyState {
@@ -85,6 +98,22 @@ class RefreshSessionState {
   Completer<void> completerRefreshStep3 = Completer<void>();
 
   RefreshSessionState(this.deviceId);
+
+  void reset() {
+    refreshRound1Packages.clear();
+    serverRefreshRound1Secret = null;
+    serverRefreshRound2Secret = null;
+    refreshRound2PackagesReceived.clear();
+    refreshRound2PackagesLocal.clear();
+    refreshRound2PackagesForRelay.clear();
+    refreshCreationTime = null;
+    refreshId = null;
+    refreshThresholdAmount = null;
+    refreshInterval = null;
+    completerRefreshStep1 = Completer<void>();
+    completerRefreshStep2 = Completer<void>();
+    completerRefreshStep3 = Completer<void>();
+  }
 }
 
 class SigningSessionState {
@@ -108,6 +137,18 @@ class SigningSessionState {
   BigInt? pendingAmount;
 
   SigningSessionState(this.deviceId);
+
+  void reset() {
+    completerSignStep1 = Completer<void>();
+    completerSignStep2 = Completer<void>();
+    serverNonce = null;
+    serverCommitments = null;
+    signCommitmentsReceived.clear();
+    messageToSign = null;
+    signRound2Shares.clear();
+    currentPolicyId = null;
+    pendingAmount = null;
+  }
 }
 
 class SpendingEntry {
