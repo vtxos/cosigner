@@ -23,6 +23,10 @@ service MPCWallet {
 
   // Broadcast
   rpc BroadcastTransaction (BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
+
+  // Sync / History
+  rpc FetchHistory (FetchHistoryRequest) returns (FetchHistoryResponse);
+  rpc SubscribeToHistory (SubscribeToHistoryRequest) returns (stream TransactionNotification);
 }
 
 // DKG Messages
@@ -168,4 +172,27 @@ message BroadcastTransactionResponse {
     string tx_id = 1;
 }
 
+
+message FetchHistoryRequest {
+    string device_id = 1;
+}
+
+message FetchHistoryResponse {
+    repeated UtxoInfo utxos = 1; 
+    // Could add list of past transaction IDs if needed for UI history
+}
+
+message SubscribeToHistoryRequest {
+    string device_id = 1;
+}
+
+message TransactionNotification {
+    string tx_hash = 1;
+    int32 height = 2;
+    // Using a simple notification that "something changed" or sending the full update?
+    // User said "rely on server for maintaining state and updating it with latest transactions"
+    // Sending the relevant UTXOs involved (newly created ones owned by wallet)
+    repeated UtxoInfo added_utxos = 3;
+    repeated UtxoInfo spent_utxos = 4; // Inputs that consumed our UTXOs
+}
 

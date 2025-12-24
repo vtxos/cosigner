@@ -21,6 +21,7 @@ import 'dart:math';
 
 import 'policy.dart';
 import 'bitcoin.dart';
+import 'bitcoin_service.dart';
 
 class MPCWalletService extends MPCWalletServiceBase {
   // Hardcoded Regtest credentials (as per E2E tests)
@@ -39,7 +40,8 @@ class MPCWalletService extends MPCWalletServiceBase {
   final PolicyStore policyStore;
   final UtxoStore utxoStore;
 
-  late final BitcoinService bitcoinService;
+  final BitcoinService bitcoinService;
+  final BitcoinHistoryService historyService;
 
   // Server Identity: ID=3
   static final serverId = threshold.Identifier(BigInt.from(3));
@@ -54,10 +56,9 @@ class MPCWalletService extends MPCWalletServiceBase {
     required this.refreshStore,
     required this.policyStore,
     required this.utxoStore,
-    BitcoinService? bitcoinService,
-  }) {
-    this.bitcoinService = bitcoinService ?? BitcoinService(utxoStore);
-  }
+    required this.bitcoinService,
+    required this.historyService,
+  });
 
   DKGSessionState _getDKGSession(String deviceId) {
     if (!_dkgSessions.containsKey(deviceId)) {
@@ -909,7 +910,25 @@ class MPCWalletService extends MPCWalletServiceBase {
 
     return BroadcastTransactionResponse()..txId = txId;
   }
-}
+
+  @override
+  Future<FetchHistoryResponse> fetchHistory(
+      ServiceCall call, FetchHistoryRequest request) async {
+    final policyState = _getPolicyState(request.deviceId);
+
+    // Fetch from BitcoinHistoryService
+    final utxos = await historyService.getUtxos(request.deviceId, policyState);
+
+    return FetchHistoryResponse()..utxos.addAll(utxos);
+  }
+
+  @override
+  Stream<TransactionNotification> subscribeToHistory(
+      ServiceCall call, SubscribeToHistoryRequest request) {
+    final policyState = _getPolicyState(request.deviceId);
+    return historyService.subscribe(request.deviceId, policyState);
+  }
+} // End of MPCWalletService
 
 Future<void> main(List<String> args) async {
   // Persistence Init
@@ -932,7 +951,21 @@ Future<void> main(List<String> args) async {
   await policyStore.init();
   await refreshStore.init();
   await signingStore.init();
+  await utxoStore.init();
   print('Store initialized.');
+
+  // Bitcoin Services Init
+  final bitcoinService = BitcoinService(utxoStore); // Legacy/RPC/Broadcast
+
+  final electrumUrl =
+      Platform.environment['ELECTRUM_URL'] ?? 'electrum.blockstream.info';
+  final electrumPort =
+      int.tryParse(Platform.environment['ELECTRUM_PORT'] ?? '60002') ?? 60002;
+  print("Connecting to Electrum at $electrumUrl:$electrumPort");
+
+  final historyService = BitcoinHistoryService(
+      electrumUrl: electrumUrl, electrumPort: electrumPort); // Electrum/History
+  await historyService.init();
 
   final server = Server.create(
     services: [
@@ -941,7 +974,9 @@ Future<void> main(List<String> args) async {
           signingStore: signingStore,
           refreshStore: refreshStore,
           policyStore: policyStore,
-          utxoStore: utxoStore)
+          utxoStore: utxoStore,
+          bitcoinService: bitcoinService,
+          historyService: historyService)
     ],
   );
   await server.serve(port: 50051);
