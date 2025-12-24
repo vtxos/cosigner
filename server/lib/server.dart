@@ -960,6 +960,8 @@ Future<void> main(List<String> args) async {
       electrumUrl: electrumUrl, electrumPort: electrumPort); // Electrum/History
   await historyService.init();
 
+  final serverPort =
+      int.tryParse(Platform.environment['PORT'] ?? '') ?? 50051;
   final server = Server.create(
     services: [
       MPCWalletService(
@@ -972,7 +974,7 @@ Future<void> main(List<String> args) async {
           historyService: historyService)
     ],
   );
-  await server.serve(port: 50051);
+  await server.serve(port: serverPort);
   print('Server listening on port ${server.port}...');
 }
 
