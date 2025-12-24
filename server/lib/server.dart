@@ -8,6 +8,9 @@ import 'package:threshold/frost/signing.dart' as frost;
 import 'package:threshold/frost/commitment.dart' as frost_comm;
 import 'package:fixnum/fixnum.dart';
 
+import 'dart:io';
+import 'package:path/path.dart' as p;
+import 'package:hive/hive.dart';
 import 'package:bitcoin_base/bitcoin_base.dart';
 import 'package:blockchain_utils/blockchain_utils.dart'; // for hex
 
@@ -58,20 +61,44 @@ class MPCWalletService extends MPCWalletServiceBase {
 
   DKGSessionState _getDKGSession(String deviceId) {
     if (!_dkgSessions.containsKey(deviceId)) {
-      // Check store? (For now, we just create new in-memory if not found,
-      // strictly implies DKG Step 1 starts it).
-      _dkgSessions[deviceId] = DKGSessionState(deviceId);
-      print('New Session Created: $deviceId');
+      // Try load
+      final jsonStr = dkgStore.getSession(deviceId);
+      if (jsonStr != null) {
+        try {
+          _dkgSessions[deviceId] =
+              DKGSessionState.fromJson(jsonDecode(jsonStr));
+          print('[$deviceId] Loaded DKG session from store.');
+        } catch (e) {
+          print('[$deviceId] Error loading DKG session: $e');
+        }
+      }
+
+      if (!_dkgSessions.containsKey(deviceId)) {
+        _dkgSessions[deviceId] = DKGSessionState(deviceId);
+        print('New Session Created: $deviceId');
+      }
     }
     return _dkgSessions[deviceId]!;
   }
 
   RefreshSessionState _getRefreshSession(String deviceId) {
     if (!_refreshSessions.containsKey(deviceId)) {
-      // Check store? (For now, we just create new in-memory if not found,
-      // strictly implies DKG Step 1 starts it).
-      _refreshSessions[deviceId] = RefreshSessionState(deviceId);
-      print('New Session Created: $deviceId');
+      // Try load
+      final jsonStr = refreshStore.getSession(deviceId);
+      if (jsonStr != null) {
+        try {
+          _refreshSessions[deviceId] =
+              RefreshSessionState.fromJson(jsonDecode(jsonStr));
+          print('[$deviceId] Loaded Refresh session from store.');
+        } catch (e) {
+          print('[$deviceId] Error loading Refresh session: $e');
+        }
+      }
+
+      if (!_refreshSessions.containsKey(deviceId)) {
+        _refreshSessions[deviceId] = RefreshSessionState(deviceId);
+        print('New Session Created: $deviceId');
+      }
     }
     return _refreshSessions[deviceId]!;
   }
@@ -88,10 +115,20 @@ class MPCWalletService extends MPCWalletServiceBase {
 
   PolicyState _getPolicyState(String deviceId) {
     if (!_policies.containsKey(deviceId)) {
-      // Check store? (For now, we just create new in-memory if not found,
-      // strictly implies DKG Step 1 starts it).
-      _policies[deviceId] = PolicyState(deviceId);
-      print('New Session Created: $deviceId');
+      // Try load
+      final jsonStr = policyStore.getPolicy(deviceId);
+      if (jsonStr != null) {
+        try {
+          _policies[deviceId] = PolicyState.fromJson(jsonDecode(jsonStr));
+          print('[$deviceId] Loaded Policy state from store.');
+        } catch (e) {
+          print('[$deviceId] Error loading Policy state: $e');
+        }
+      }
+      if (!_policies.containsKey(deviceId)) {
+        _policies[deviceId] = PolicyState(deviceId);
+        print('New Session Created: $deviceId');
+      }
     }
     return _policies[deviceId]!;
   }
@@ -288,7 +325,24 @@ class MPCWalletService extends MPCWalletServiceBase {
         print(
             '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
 
-        // TODO: (Joshua) Fix Persistence
+        policyState.normalPolicy = NormalPolicy(
+          id: "normal policies",
+          keyPackage: keyPkg,
+          publicKeyPackage: pubKeyPkg,
+        );
+        print(
+            '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
+
+        // Persistence
+        try {
+          await policyStore.savePolicy(
+              request.deviceId, jsonEncode(policyState.toJson()));
+          await dkgStore.saveSession(
+              request.deviceId, jsonEncode(session.toJson()));
+          print('[${request.deviceId}] Saved DKG completion state.');
+        } catch (e) {
+          print('[${request.deviceId}] Error saving DKG complete state: $e');
+        }
       }
 
       return DKGStep3Response()
@@ -555,6 +609,15 @@ class MPCWalletService extends MPCWalletServiceBase {
             .add(SpendingEntry(DateTime.now(), session.pendingAmount!));
         print(
             '[${request.deviceId}] Policy Update: Added spending of ${session.pendingAmount} sats. Total History: ${policyState.spendingHistory.length}');
+
+        // Persist Policy State (spending history update)
+        try {
+          await policyStore.savePolicy(
+              request.deviceId, jsonEncode(policyState.toJson()));
+        } catch (e) {
+          print(
+              '[${request.deviceId}] Error saving policy spending history: $e');
+        }
       }
 
       final response = SignStep2Response()
@@ -764,6 +827,16 @@ class MPCWalletService extends MPCWalletServiceBase {
 
           policyState.protectedPolicies[newPolicy.id] = newPolicy;
 
+          // Persist New Policy and Refresh Session
+          try {
+            await policyStore.savePolicy(
+                request.deviceId, jsonEncode(policyState.toJson()));
+            await refreshStore.saveSession(
+                request.deviceId, jsonEncode(session.toJson()));
+          } catch (e) {
+            print('[${request.deviceId}] Error saving Refreshed Policy: $e');
+          }
+
           // Prevent re-computation
           session.serverRefreshRound2Secret = null;
 
@@ -839,6 +912,16 @@ class MPCWalletService extends MPCWalletServiceBase {
 }
 
 Future<void> main(List<String> args) async {
+  // Persistence Init
+  final home = Platform.environment['HOME'] ?? Directory.current.path;
+  final serverStorePath = p.join(home, '.mpc_wallet', 'server');
+  final dir = Directory(serverStorePath);
+  if (!dir.existsSync()) {
+    dir.createSync(recursive: true);
+  }
+  Hive.init(serverStorePath);
+  print('Persistence Path: $serverStorePath');
+
   final dkgStore = DKGSessionStore();
   final policyStore = PolicyStore();
   final refreshStore = RefreshSessionStore();

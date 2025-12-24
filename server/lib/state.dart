@@ -46,6 +46,23 @@ class DKGSessionState {
 
   DKGSessionState(this.deviceId);
 
+  Map<String, dynamic> toJson() {
+    return {
+      'deviceId': deviceId,
+      'round1Packages': round1Packages,
+      // Secrets are not persisted to avoid complexity with missing toJson
+      // DKG sessions will restart if server restarts
+    };
+  }
+
+  static DKGSessionState fromJson(Map<String, dynamic> json) {
+    final s = DKGSessionState(json['deviceId']);
+    if (json['round1Packages'] != null) {
+      s.round1Packages.addAll(Map<String, String>.from(json['round1Packages']));
+    }
+    return s;
+  }
+
   void reset() {
     completerStep1 = Completer<void>();
     completerStep2 = Completer<void>();
@@ -71,6 +88,34 @@ class PolicyState {
   final spendingHistory = <SpendingEntry>[];
 
   PolicyState(this.deviceId);
+
+  Map<String, dynamic> toJson() {
+    return {
+      'deviceId': deviceId,
+      'normalPolicy': normalPolicy?.toJson(),
+      'protectedPolicies':
+          protectedPolicies.map((k, v) => MapEntry(k, v.toJson())),
+      'spendingHistory': spendingHistory.map((e) => e.toJson()).toList(),
+    };
+  }
+
+  static PolicyState fromJson(Map<String, dynamic> json) {
+    final s = PolicyState(json['deviceId']);
+    if (json['normalPolicy'] != null) {
+      s.normalPolicy = NormalPolicy.fromJson(json['normalPolicy']);
+    }
+    if (json['protectedPolicies'] != null) {
+      final Map<String, dynamic> map = json['protectedPolicies'];
+      map.forEach((k, v) {
+        s.protectedPolicies[k] = ProtectedPolicy.fromJson(v);
+      });
+    }
+    if (json['spendingHistory'] != null) {
+      final List list = json['spendingHistory'];
+      s.spendingHistory.addAll(list.map((e) => SpendingEntry.fromJson(e)));
+    }
+    return s;
+  }
 }
 
 class RefreshSessionState {
@@ -98,6 +143,35 @@ class RefreshSessionState {
   Completer<void> completerRefreshStep3 = Completer<void>();
 
   RefreshSessionState(this.deviceId);
+
+  Map<String, dynamic> toJson() {
+    return {
+      'deviceId': deviceId,
+      'refreshRound1Packages': refreshRound1Packages,
+      'refreshCreationTime': refreshCreationTime?.millisecondsSinceEpoch,
+      'refreshId': refreshId,
+      'refreshThresholdAmount': refreshThresholdAmount?.toString(),
+      'refreshInterval': refreshInterval,
+    };
+  }
+
+  static RefreshSessionState fromJson(Map<String, dynamic> json) {
+    final s = RefreshSessionState(json['deviceId']);
+    if (json['refreshRound1Packages'] != null) {
+      s.refreshRound1Packages
+          .addAll(Map<String, String>.from(json['refreshRound1Packages']));
+    }
+    if (json['refreshCreationTime'] != null) {
+      s.refreshCreationTime =
+          DateTime.fromMillisecondsSinceEpoch(json['refreshCreationTime']);
+    }
+    s.refreshId = json['refreshId'];
+    if (json['refreshThresholdAmount'] != null) {
+      s.refreshThresholdAmount = Int64.parseInt(json['refreshThresholdAmount']);
+    }
+    s.refreshInterval = json['refreshInterval'];
+    return s;
+  }
 
   void reset() {
     refreshRound1Packages.clear();
@@ -155,6 +229,20 @@ class SpendingEntry {
   final DateTime timestamp;
   final BigInt amount;
   SpendingEntry(this.timestamp, this.amount);
+
+  Map<String, dynamic> toJson() {
+    return {
+      'timestamp': timestamp.millisecondsSinceEpoch,
+      'amount': amount.toString(),
+    };
+  }
+
+  static SpendingEntry fromJson(Map<String, dynamic> json) {
+    return SpendingEntry(
+      DateTime.fromMillisecondsSinceEpoch(json['timestamp']),
+      BigInt.parse(json['amount']),
+    );
+  }
 }
 
 class UtxoState {
