@@ -924,58 +924,119 @@ class MPCWalletService extends MPCWalletServiceBase {
 } // End of MPCWalletService
 
 Future<void> main(List<String> args) async {
-  // Persistence Init
-  final home = Platform.environment['HOME'] ?? Directory.current.path;
-  final serverStorePath = p.join(home, '.mpc_wallet', 'server');
-  final dir = Directory(serverStorePath);
-  if (!dir.existsSync()) {
-    dir.createSync(recursive: true);
+  Server? server;
+  BitcoinHistoryService? historyService;
+  var shuttingDown = false;
+
+  Future<void> shutdown(
+      {int exitCode = 0, Object? error, StackTrace? stack}) async {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    if (error != null) {
+      stderr.writeln('Unhandled exception: $error');
+      if (stack != null) {
+        stderr.writeln(stack);
+      }
+    } else {
+      print('Shutting down...');
+    }
+
+    try {
+      await server?.shutdown();
+    } catch (e) {
+      stderr.writeln('Error shutting down server: $e');
+    }
+
+    try {
+      await historyService?.close();
+    } catch (e) {
+      stderr.writeln('Error closing history service: $e');
+    }
+
+    try {
+      await Hive.close();
+    } catch (e) {
+      stderr.writeln('Error closing Hive: $e');
+    }
+
+    exit(exitCode);
   }
-  Hive.init(serverStorePath);
-  print('Persistence Path: $serverStorePath');
 
-  final dkgStore = DKGSessionStore();
-  final policyStore = PolicyStore();
-  final refreshStore = RefreshSessionStore();
-  final signingStore = SigningSessionStore();
-  final utxoStore = UtxoStore();
+  void handleSignal(ProcessSignal signal) {
+    stderr.writeln('Received $signal, shutting down.');
+    shutdown(exitCode: 0);
+  }
 
-  await dkgStore.init();
-  await policyStore.init();
-  await refreshStore.init();
-  await signingStore.init();
-  await utxoStore.init();
-  print('Store initialized.');
+  for (final signal in [
+    ProcessSignal.sigint,
+    ProcessSignal.sigterm,
+    ProcessSignal.sigquit,
+  ]) {
+    try {
+      signal.watch().listen(handleSignal);
+    } catch (e) {
+      stderr.writeln('Signal $signal not supported: $e');
+    }
+  }
 
-  // Bitcoin Services Init
-  final bitcoinService = BitcoinService(utxoStore); // Legacy/RPC/Broadcast
+  await runZonedGuarded(() async {
+    // Persistence Init
+    final home = Platform.environment['HOME'] ?? Directory.current.path;
+    final serverStorePath = p.join(home, '.mpc_wallet', 'server');
+    final dir = Directory(serverStorePath);
+    if (!dir.existsSync()) {
+      dir.createSync(recursive: true);
+    }
+    Hive.init(serverStorePath);
+    print('Persistence Path: $serverStorePath');
 
-  final electrumUrl =
-      Platform.environment['ELECTRUM_URL'] ?? 'electrum.blockstream.info';
-  final electrumPort =
-      int.tryParse(Platform.environment['ELECTRUM_PORT'] ?? '60002') ?? 60002;
-  print("Connecting to Electrum at $electrumUrl:$electrumPort");
+    final dkgStore = DKGSessionStore();
+    final policyStore = PolicyStore();
+    final refreshStore = RefreshSessionStore();
+    final signingStore = SigningSessionStore();
+    final utxoStore = UtxoStore();
 
-  final historyService = BitcoinHistoryService(
-      electrumUrl: electrumUrl, electrumPort: electrumPort); // Electrum/History
-  await historyService.init();
+    await dkgStore.init();
+    await policyStore.init();
+    await refreshStore.init();
+    await signingStore.init();
+    await utxoStore.init();
+    print('Store initialized.');
 
-  final serverPort =
-      int.tryParse(Platform.environment['PORT'] ?? '') ?? 50051;
-  final server = Server.create(
-    services: [
-      MPCWalletService(
-          dkgStore: dkgStore,
-          signingStore: signingStore,
-          refreshStore: refreshStore,
-          policyStore: policyStore,
-          utxoStore: utxoStore,
-          bitcoinService: bitcoinService,
-          historyService: historyService)
-    ],
-  );
-  await server.serve(port: serverPort);
-  print('Server listening on port ${server.port}...');
+    // Bitcoin Services Init
+    final bitcoinService = BitcoinService(utxoStore); // Legacy/RPC/Broadcast
+
+    final electrumUrl =
+        Platform.environment['ELECTRUM_URL'] ?? 'electrum.blockstream.info';
+    final electrumPort =
+        int.tryParse(Platform.environment['ELECTRUM_PORT'] ?? '60002') ?? 60002;
+    print("Connecting to Electrum at $electrumUrl:$electrumPort");
+
+    historyService = BitcoinHistoryService(
+        electrumUrl: electrumUrl,
+        electrumPort: electrumPort); // Electrum/History
+    await historyService!.init();
+
+    final serverPort =
+        int.tryParse(Platform.environment['PORT'] ?? '') ?? 50051;
+    server = Server.create(
+      services: [
+        MPCWalletService(
+            dkgStore: dkgStore,
+            signingStore: signingStore,
+            refreshStore: refreshStore,
+            policyStore: policyStore,
+            utxoStore: utxoStore,
+            bitcoinService: bitcoinService,
+            historyService: historyService!)
+      ],
+    );
+    await server!.serve(port: serverPort);
+    print('Server listening on port ${server!.port}...');
+  }, (error, stack) async {
+    await shutdown(exitCode: 1, error: error, stack: stack);
+  });
 }
 
 String randomBase64(int bytes) {

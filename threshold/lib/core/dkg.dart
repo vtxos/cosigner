@@ -202,19 +202,20 @@ class PublicKeyPackage {
   PublicKeyPackage(this.verifyingShares, this.verifyingKey);
 
   factory PublicKeyPackage.fromJson(Map<String, dynamic> json) {
-    final verifyingShares = (json['verifyingShares'] as Map<String, dynamic>)
-        .map((key, value) {
-          final id = Identifier.deserialize(
-            Uint8List.fromList(hex.decode(key)),
-          );
-          final share = elemDeserializeCompressed(
-            Uint8List.fromList(hex.decode(value)),
-          );
-          return MapEntry(id, share);
-        });
+    final verifyingSharesJson =
+        Map<String, dynamic>.from(json['verifyingShares'] as Map);
+    final verifyingShares = verifyingSharesJson.map((key, value) {
+      final id = Identifier.deserialize(
+        Uint8List.fromList(hex.decode(key)),
+      );
+      final share = elemDeserializeCompressed(
+        Uint8List.fromList(hex.decode(value.toString())),
+      );
+      return MapEntry(id, share);
+    });
     final verifyingKey = VerifyingKey(
       E: elemDeserializeCompressed(
-        Uint8List.fromList(hex.decode(json['verifyingKey'])),
+        Uint8List.fromList(hex.decode(json['verifyingKey'].toString())),
       ),
     );
     return PublicKeyPackage(verifyingShares, verifyingKey);
