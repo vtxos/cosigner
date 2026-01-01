@@ -571,7 +571,6 @@ class MPCWalletService extends MPCWalletServiceBase {
 
         // Explicitly apply Taproot tweak (Key Path Spending)
         serverKeyPackage = serverKeyPackage.tweak(null);
-        serverPubPackage = serverPubPackage.tweak(null);
 
         final serverShareObj =
             frost.sign(signingPkg, session.serverNonce!, serverKeyPackage);
@@ -591,6 +590,11 @@ class MPCWalletService extends MPCWalletServiceBase {
       session.signRound2Shares.forEach((id, val) {
         sharesMap[id] = frost.SignatureShare(val);
       });
+
+      // CRITICAL: Tweak public package before aggregation
+      // This must happen every time, not just when server signs,
+      // because we reload the untweaked package from state at the top of this function
+      serverPubPackage = serverPubPackage.tweak(null);
 
       final signature =
           frost.aggregate(signingPkg, sharesMap, serverPubPackage);
