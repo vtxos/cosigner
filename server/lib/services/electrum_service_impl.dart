@@ -71,10 +71,24 @@ class ElectrumTcpServiceImpl implements ElectrumServiceProvider {
         if (_pendingRequests.containsKey(id)) {
           final completer = _pendingRequests.remove(id)!;
           if (msg.containsKey('error') && msg['error'] != null) {
-            // Handle Error. Electrum errors can be strings or objects.
-            completer.completeError(msg['error']);
+            final error = msg['error'];
+            String message = 'Unknown Error';
+            if (error is Map && error.containsKey('message')) {
+              message = error['message'];
+            } else if (error is String) {
+              message = error;
+            }
+            Map<String, dynamic>? details;
+            if (error is Map) {
+              details = Map<String, dynamic>.from(error);
+            } else {
+              details = {'info': error};
+            }
+            completer.completeError(
+                RPCError(message: message, errorCode: 0, details: details));
           } else {
-            completer.complete(msg['result']);
+            // Return full message as bitcoin_base seems to expect the JSON-RPC object
+            completer.complete(msg);
           }
         }
       } else if (msg.containsKey('method') &&
@@ -143,12 +157,24 @@ class ElectrumTcpServiceImpl implements ElectrumServiceProvider {
     final completer = Completer<dynamic>();
     _pendingRequests[id] = completer;
 
-    final payload = {
-      "jsonrpc": "2.0",
-      "method": request.method,
-      "params": request.params,
-      "id": id,
-    };
+    var payload = <String, dynamic>{};
+
+    bool isAlreadyJsonRpc = false;
+    final p = request.params;
+    if (p.containsKey('jsonrpc') && p.containsKey('method')) {
+      isAlreadyJsonRpc = true;
+      payload = Map<String, dynamic>.from(p);
+      payload['id'] = id; // Override ID to match our tracker
+    }
+
+    if (!isAlreadyJsonRpc) {
+      payload = {
+        "jsonrpc": "2.0",
+        "method": request.method,
+        "params": request.params,
+        "id": id,
+      };
+    }
 
     // Add newline delimiter
     _socket!.write(jsonEncode(payload) + '\n');
@@ -164,11 +190,11 @@ class ElectrumTcpServiceImpl implements ElectrumServiceProvider {
 }
 
 class ElectrumServiceResponse<T> implements BaseServiceResponse<T> {
-  final T _result;
+  final T? _result;
   ElectrumServiceResponse(this._result);
 
   @override
-  T getResult(BaseServiceRequestParams request) => _result;
+  T getResult(BaseServiceRequestParams request) => _result as T;
 
   @override
   E cast<E extends BaseServiceResponse<dynamic>>() {

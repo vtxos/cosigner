@@ -916,6 +916,23 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   @override
+  Future<FetchRecentTransactionsResponse> fetchRecentTransactions(
+      ServiceCall call, FetchRecentTransactionsRequest request) async {
+    final policyState = _getPolicyState(request.deviceId);
+    try {
+      final txs = await historyService.getRecentTransactions(
+          request.deviceId, policyState);
+
+      print(
+          '[${request.deviceId}] FetchRecentTransactionsResponse: ${txs.length} txs');
+      return FetchRecentTransactionsResponse()..transactions.addAll(txs);
+    } catch (e) {
+      print('[${request.deviceId}] fetchRecentTransactions Error: $e');
+      rethrow;
+    }
+  }
+
+  @override
   Stream<TransactionNotification> subscribeToHistory(
       ServiceCall call, SubscribeToHistoryRequest request) {
     final policyState = _getPolicyState(request.deviceId);
@@ -944,19 +961,33 @@ Future<void> main(List<String> args) async {
 
     // Close services first to terminate active streams (prevents gRPC shutdown hang)
     try {
-      await historyService?.close();
+      if (historyService != null) {
+        await historyService!.close().timeout(const Duration(seconds: 2),
+            onTimeout: () {
+          print("History service close timed out.");
+        });
+      }
     } catch (e) {
       stderr.writeln('Error closing history service: $e');
     }
 
     try {
-      await server?.shutdown();
+      // Shutdown gRPC server
+      if (server != null) {
+        await server!.shutdown().timeout(const Duration(seconds: 2),
+            onTimeout: () {
+          print("Server shutdown timed out.");
+        });
+      }
     } catch (e) {
       stderr.writeln('Error shutting down server: $e');
     }
 
     try {
-      await Hive.close();
+      await Hive.close().timeout(const Duration(seconds: 2), onTimeout: () {
+        print("Hive close timed out.");
+        return [];
+      });
     } catch (e) {
       stderr.writeln('Error closing Hive: $e');
     }
@@ -972,7 +1003,6 @@ Future<void> main(List<String> args) async {
   for (final signal in [
     ProcessSignal.sigint,
     ProcessSignal.sigterm,
-    ProcessSignal.sigquit,
   ]) {
     try {
       signal.watch().listen(handleSignal);

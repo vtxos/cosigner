@@ -26,6 +26,7 @@ service MPCWallet {
 
   // Sync / History
   rpc FetchHistory (FetchHistoryRequest) returns (FetchHistoryResponse);
+  rpc FetchRecentTransactions (FetchRecentTransactionsRequest) returns (FetchRecentTransactionsResponse);
   rpc SubscribeToHistory (SubscribeToHistoryRequest) returns (stream TransactionNotification);
 }
 
@@ -180,6 +181,21 @@ message FetchHistoryRequest {
 message FetchHistoryResponse {
     repeated UtxoInfo utxos = 1; 
     // Could add list of past transaction IDs if needed for UI history
+}
+
+message FetchRecentTransactionsRequest {
+    string device_id = 1;
+}
+
+message FetchRecentTransactionsResponse {
+    repeated TransactionSummary transactions = 1;
+}
+
+message TransactionSummary {
+    string tx_hash = 1;
+    int64 amount_sats = 2; // Signed amount (+ for receive, - for sent)
+    int64 timestamp = 3; // timestamp seconds
+    bool is_pending = 4; // if in mempool
 }
 
 message SubscribeToHistoryRequest {

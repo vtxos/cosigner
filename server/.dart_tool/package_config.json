@@ -363,9 +363,9 @@
     },
     {
       "name": "watcher",
-      "rootUri": "file:///home/joshua/.pub-cache/hosted/pub.dev/watcher-1.1.4",
+      "rootUri": "file:///home/joshua/.pub-cache/hosted/pub.dev/watcher-1.2.0",
       "packageUri": "lib/",
-      "languageVersion": "3.1"
+      "languageVersion": "3.4"
     },
     {
       "name": "web",
@@ -404,7 +404,7 @@
       "languageVersion": "3.0"
     }
   ],
-  "generated": "2025-12-27T10:18:54.155875Z",
+  "generated": "2026-01-01T11:15:12.649580Z",
   "generator": "pub",
   "generatorVersion": "3.4.0",
   "flutterRoot": "file:///home/joshua/flutter",

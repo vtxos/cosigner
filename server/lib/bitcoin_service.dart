@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:typed_data'; // for Uint8List, ByteData, Endian
+import 'package:crypto/crypto.dart'; // for sha256
 import 'package:server/state.dart';
 import 'package:protocol/protocol.dart';
 import 'package:blockchain_utils/blockchain_utils.dart'; // hex
@@ -179,5 +181,147 @@ class BitcoinHistoryService {
       print("_registerSubscriptions internal error: $e");
       rethrow;
     }
+  }
+
+  // Fetch comprehensive transaction history for a device
+  Future<List<TransactionSummary>> getRecentTransactions(
+      String deviceId, PolicyState policyState) async {
+    final summaries = <TransactionSummary>[];
+
+    // 1. Get all script hashes
+    final scriptHash = _deriveScriptHash(
+        policyState.normalPolicy!.publicKeyPackage.tweak(null));
+
+    print('[$deviceId] Fetching history for scriptHash: $scriptHash');
+
+    final txsOfInterest = <String, int>{};
+
+    try {
+      final request =
+          ElectrumRequestScriptHashGetHistory(scriptHash: scriptHash);
+      final history = await _provider!.request(request);
+      print('[$deviceId] History fetched. Count: ${history.length}');
+
+      // print the history
+      print('[$deviceId] History: $history');
+
+      for (final h in history) {
+        txsOfInterest[h['tx_hash']] = h['height'];
+      }
+      print('[$deviceId] Processing ${txsOfInterest.length} unique txs...');
+    } catch (e) {
+      print('[$deviceId] Error fetching history: $e');
+      return [];
+    }
+
+    // 3. Fetch full transaction details and calculate net for each unique Tx
+    for (final entry in txsOfInterest.entries) {
+      final txHash = entry.key;
+      final height = entry.value;
+
+      // print txheigh and height
+      print('[$deviceId] Processing txHash: $txHash, height: $height');
+
+      try {
+        final txHex = await _provider!
+            .request(ElectrumRequestGetTransaction(transactionHash: txHash));
+
+        print('[$deviceId] Fetched txHex: $txHex');
+        final tx = BtcTransaction.deserialize(BytesUtils.fromHexString(txHex));
+
+        // Parse inputs and outputs to calculate net amount
+        // Net = (Sum of my outputs) - (Sum of my inputs)
+        // If Net > 0: Received
+        // If Net < 0: Sent (includes fee)
+
+        BigInt myOutputs = BigInt.zero;
+        BigInt myInputs = BigInt.zero;
+
+        // Check Outputs
+        for (final out in tx.outputs) {
+          final scriptHex = out.scriptPubKey.toHex();
+          final scriptBytes = BytesUtils.fromHexString(scriptHex);
+          final h = BytesUtils.toHexString(
+              sha256.convert(scriptBytes).bytes.reversed.toList());
+
+          if (scriptHash == h) {
+            myOutputs += out.amount;
+          }
+        }
+
+        // Check Inputs
+        for (final input in tx.inputs) {
+          final inputTxId = input.txId;
+
+          if (txsOfInterest.containsKey(inputTxId)) {
+            final prevTxHex = await _provider!.request(
+                ElectrumRequestGetTransaction(transactionHash: inputTxId));
+            final prevTx =
+                BtcTransaction.deserialize(BytesUtils.fromHexString(prevTxHex));
+
+            if (input.txIndex < prevTx.outputs.length) {
+              final prevOut = prevTx.outputs[input.txIndex];
+              final scriptHex = prevOut.scriptPubKey.toHex();
+              final scriptBytes = BytesUtils.fromHexString(scriptHex);
+              final h = BytesUtils.toHexString(
+                  sha256.convert(scriptBytes).bytes.reversed.toList());
+
+              if (scriptHash == h) {
+                myInputs += prevOut.amount;
+              }
+            }
+          }
+        }
+
+        final net = myOutputs - myInputs;
+
+        // Get Timestamp
+        int time = 0;
+        if (height > 0) {
+          time = await _fetchBlockTime(height);
+        } else {
+          time = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+        }
+
+        // print the net amount
+        print('[$deviceId] Net amount: $net');
+
+        summaries.add(TransactionSummary(
+            txHash: txHash,
+            amountSats: Int64(net.toInt()),
+            timestamp: Int64(time),
+            isPending: height <= 0));
+      } catch (e) {
+        print("Error processing tx $txHash: $e");
+      }
+    }
+
+    // Sort by timestamp desc
+    summaries
+        .sort((a, b) => b.timestamp.toInt().compareTo(a.timestamp.toInt()));
+
+    return summaries;
+  }
+
+  final _blockTimeCache = <int, int>{};
+
+  Future<int> _fetchBlockTime(int height) async {
+    if (_blockTimeCache.containsKey(height)) return _blockTimeCache[height]!;
+    try {
+      final header = await _provider!.request(
+          ElectrumRequestBlockHeader(startHeight: height, cpHeight: 0));
+      // header is hex string
+      if (header.length >= 160) {
+        final bytes = BytesUtils.fromHexString(header);
+        // Time is at offset 68 (4 bytes little endian) in standard bitcoin header
+        // 4 (version) + 32 (prev) + 32 (merkle) = 68
+        final timeBytes = bytes.sublist(68, 72);
+        final time = ByteData.sublistView(Uint8List.fromList(timeBytes))
+            .getUint32(0, Endian.little);
+        _blockTimeCache[height] = time;
+        return time;
+      }
+    } catch (_) {}
+    return 0;
   }
 }
