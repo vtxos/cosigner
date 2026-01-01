@@ -942,16 +942,17 @@ Future<void> main(List<String> args) async {
       print('Shutting down...');
     }
 
-    try {
-      await server?.shutdown();
-    } catch (e) {
-      stderr.writeln('Error shutting down server: $e');
-    }
-
+    // Close services first to terminate active streams (prevents gRPC shutdown hang)
     try {
       await historyService?.close();
     } catch (e) {
       stderr.writeln('Error closing history service: $e');
+    }
+
+    try {
+      await server?.shutdown();
+    } catch (e) {
+      stderr.writeln('Error shutting down server: $e');
     }
 
     try {
