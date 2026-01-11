@@ -1,113 +1,103 @@
-import 'dart:convert';
 import 'package:hive/hive.dart';
 
-class DKGSessionStore {
-  static const _sessionBoxName = 'dkg_sessions';
+/// Generic store for session/state persistence using Hive.
+/// Reduces code duplication across DKGSessionStore, SigningSessionStore,
+/// RefreshSessionStore, PolicyStore, and UtxoStore.
+class GenericStore {
+  final String boxName;
   late Box _box;
+  bool _isInitialized = false;
+
+  GenericStore(this.boxName);
+
+  bool get isInitialized => _isInitialized;
 
   Future<void> init() async {
-    // Hive.init should be called by the application entry point
-    _box = await Hive.openBox(_sessionBoxName);
+    if (_isInitialized) return;
+    _box = await Hive.openBox(boxName);
+    _isInitialized = true;
   }
 
-  Future<void> saveSession(String deviceId, String jsonData) async {
-    await _box.put(deviceId, jsonData);
+  Future<void> save(String key, String jsonData) async {
+    if (!_isInitialized) {
+      throw StateError('Store "$boxName" not initialized. Call init() first.');
+    }
+    await _box.put(key, jsonData);
   }
 
-  String? getSession(String deviceId) {
-    return _box.get(deviceId);
+  String? get(String key) {
+    if (!_isInitialized) {
+      throw StateError('Store "$boxName" not initialized. Call init() first.');
+    }
+    return _box.get(key);
   }
 
-  // Clean up if needed
+  Future<void> delete(String key) async {
+    if (!_isInitialized) {
+      throw StateError('Store "$boxName" not initialized. Call init() first.');
+    }
+    await _box.delete(key);
+  }
+
+  Future<void> clear() async {
+    if (!_isInitialized) {
+      throw StateError('Store "$boxName" not initialized. Call init() first.');
+    }
+    await _box.clear();
+  }
+
+  List<String> getAllKeys() {
+    if (!_isInitialized) {
+      throw StateError('Store "$boxName" not initialized. Call init() first.');
+    }
+    return _box.keys.cast<String>().toList();
+  }
+
   Future<void> close() async {
-    await _box.close();
+    if (_isInitialized && _box.isOpen) {
+      await _box.close();
+      _isInitialized = false;
+    }
   }
 }
 
-class SigningSessionStore {
-  static const _sessionBoxName = 'signing_sessions';
-  late Box _box;
+/// Specialized stores using GenericStore
+class DKGSessionStore extends GenericStore {
+  DKGSessionStore() : super('dkg_sessions');
 
-  Future<void> init() async {
-    _box = await Hive.openBox(_sessionBoxName);
-  }
-
-  Future<void> saveSession(String deviceId, String jsonData) async {
-    await _box.put(deviceId, jsonData);
-  }
-
-  String? getSession(String deviceId) {
-    return _box.get(deviceId);
-  }
-
-  // Clean up if needed
-  Future<void> close() async {
-    await _box.close();
-  }
+  Future<void> saveSession(String deviceId, String jsonData) =>
+      save(deviceId, jsonData);
+  String? getSession(String deviceId) => get(deviceId);
 }
 
-class RefreshSessionStore {
-  static const _sessionBoxName = 'refresh_sessions';
-  late Box _box;
+class SigningSessionStore extends GenericStore {
+  SigningSessionStore() : super('signing_sessions');
 
-  Future<void> init() async {
-    _box = await Hive.openBox(_sessionBoxName);
-  }
-
-  Future<void> saveSession(String deviceId, String jsonData) async {
-    await _box.put(deviceId, jsonData);
-  }
-
-  String? getSession(String deviceId) {
-    return _box.get(deviceId);
-  }
-
-  // Clean up if needed
-  Future<void> close() async {
-    await _box.close();
-  }
+  Future<void> saveSession(String deviceId, String jsonData) =>
+      save(deviceId, jsonData);
+  String? getSession(String deviceId) => get(deviceId);
 }
 
-class PolicyStore {
-  static const _policyBoxName = 'policies';
-  late Box _box;
+class RefreshSessionStore extends GenericStore {
+  RefreshSessionStore() : super('refresh_sessions');
 
-  Future<void> init() async {
-    _box = await Hive.openBox(_policyBoxName);
-  }
-
-  Future<void> savePolicy(String deviceId, String jsonData) async {
-    await _box.put(deviceId, jsonData);
-  }
-
-  String? getPolicy(String deviceId) {
-    return _box.get(deviceId);
-  }
-
-  // Clean up if needed
-  Future<void> close() async {
-    await _box.close();
-  }
+  Future<void> saveSession(String deviceId, String jsonData) =>
+      save(deviceId, jsonData);
+  String? getSession(String deviceId) => get(deviceId);
 }
 
-class UtxoStore {
-  static const _utxoBoxName = 'utxos';
-  late Box _box;
+class PolicyStore extends GenericStore {
+  PolicyStore() : super('policies');
 
-  Future<void> init() async {
-    _box = await Hive.openBox(_utxoBoxName);
-  }
+  Future<void> savePolicy(String deviceId, String jsonData) =>
+      save(deviceId, jsonData);
+  String? getPolicy(String deviceId) => get(deviceId);
+}
 
-  Future<void> saveUtxo(String deviceId, String jsonData) async {
-    await _box.put(deviceId, jsonData);
-  }
+class UtxoStore extends GenericStore {
+  UtxoStore() : super('utxos');
 
-  String? getUtxo(String deviceId) {
-    return _box.get(deviceId);
-  }
-
-  // Clean up if needed
-  Future<void> close() async {
-    await _box.close();
-  }
+  Future<void> saveUtxo(String deviceId, String jsonData) =>
+      save(deviceId, jsonData);
+  String? getUtxo(String deviceId) => get(deviceId);
 }

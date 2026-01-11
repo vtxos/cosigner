@@ -7,6 +7,8 @@ import 'package:threshold/threshold.dart' as threshold;
 import 'package:threshold/frost/signing.dart' as frost;
 import 'package:threshold/frost/commitment.dart' as frost_comm;
 import 'package:fixnum/fixnum.dart';
+import 'package:synchronized/synchronized.dart';
+import 'package:logging/logging.dart';
 
 import 'dart:io';
 import 'package:path/path.dart' as p;
@@ -22,16 +24,26 @@ import 'dart:math';
 import 'policy.dart';
 import 'bitcoin.dart';
 import 'bitcoin_service.dart';
+import 'config.dart';
+import 'validation.dart';
+import 'rate_limiter.dart';
+
+final _log = Logger('MPCWalletService');
 
 class MPCWalletService extends MPCWalletServiceBase {
-  // Hardcoded Regtest credentials (as per E2E tests)
-
-  // In-memory cache of active sessions
+  // In-memory cache of active sessions with locks for thread safety
   final Map<String, DKGSessionState> _dkgSessions = {};
   final Map<String, SigningSessionState> _signingSessions = {};
   final Map<String, RefreshSessionState> _refreshSessions = {};
   final Map<String, PolicyState> _policies = {};
   final Map<String, UtxoState> _utxos = {};
+
+  // Locks for synchronized access to session maps
+  final Lock _dkgLock = Lock();
+  final Lock _signingLock = Lock();
+  final Lock _refreshLock = Lock();
+  final Lock _policyLock = Lock();
+  final Lock _utxoLock = Lock();
 
   // Persistence
   final DKGSessionStore dkgStore;
@@ -60,105 +72,114 @@ class MPCWalletService extends MPCWalletServiceBase {
     required this.historyService,
   });
 
-  DKGSessionState _getDKGSession(String deviceId) {
-    if (!_dkgSessions.containsKey(deviceId)) {
-      // Try load
-      final jsonStr = dkgStore.getSession(deviceId);
-      if (jsonStr != null) {
-        try {
-          _dkgSessions[deviceId] =
-              DKGSessionState.fromJson(jsonDecode(jsonStr));
-          print('[$deviceId] Loaded DKG session from store.');
-        } catch (e) {
-          print('[$deviceId] Error loading DKG session: $e');
-        }
-      }
-
+  Future<DKGSessionState> _getDKGSession(String deviceId) async {
+    return await _dkgLock.synchronized(() {
       if (!_dkgSessions.containsKey(deviceId)) {
-        _dkgSessions[deviceId] = DKGSessionState(deviceId);
-        print('New Session Created: $deviceId');
-      }
-    }
-    return _dkgSessions[deviceId]!;
-  }
+        // Try load
+        final jsonStr = dkgStore.getSession(deviceId);
+        if (jsonStr != null) {
+          try {
+            _dkgSessions[deviceId] =
+                DKGSessionState.fromJson(jsonDecode(jsonStr));
+            _log.info('[$deviceId] Loaded DKG session from store.');
+          } catch (e) {
+            _log.warning('[$deviceId] Error loading DKG session: $e');
+          }
+        }
 
-  RefreshSessionState _getRefreshSession(String deviceId) {
-    if (!_refreshSessions.containsKey(deviceId)) {
-      // Try load
-      final jsonStr = refreshStore.getSession(deviceId);
-      if (jsonStr != null) {
-        try {
-          _refreshSessions[deviceId] =
-              RefreshSessionState.fromJson(jsonDecode(jsonStr));
-          print('[$deviceId] Loaded Refresh session from store.');
-        } catch (e) {
-          print('[$deviceId] Error loading Refresh session: $e');
+        if (!_dkgSessions.containsKey(deviceId)) {
+          _dkgSessions[deviceId] = DKGSessionState(deviceId);
+          _log.info('[$deviceId] New DKG session created');
         }
       }
+      return _dkgSessions[deviceId]!;
+    });
+  }
 
+  Future<RefreshSessionState> _getRefreshSession(String deviceId) async {
+    return await _refreshLock.synchronized(() {
       if (!_refreshSessions.containsKey(deviceId)) {
-        _refreshSessions[deviceId] = RefreshSessionState(deviceId);
-        print('New Session Created: $deviceId');
-      }
-    }
-    return _refreshSessions[deviceId]!;
-  }
+        // Try load
+        final jsonStr = refreshStore.getSession(deviceId);
+        if (jsonStr != null) {
+          try {
+            _refreshSessions[deviceId] =
+                RefreshSessionState.fromJson(jsonDecode(jsonStr));
+            _log.info('[$deviceId] Loaded Refresh session from store.');
+          } catch (e) {
+            _log.warning('[$deviceId] Error loading Refresh session: $e');
+          }
+        }
 
-  SigningSessionState _getSigningSession(String deviceId) {
-    if (!_signingSessions.containsKey(deviceId)) {
-      // Check store? (For now, we just create new in-memory if not found,
-      // strictly implies DKG Step 1 starts it).
-      _signingSessions[deviceId] = SigningSessionState(deviceId);
-      print('New Session Created: $deviceId');
-    }
-    return _signingSessions[deviceId]!;
-  }
-
-  PolicyState _getPolicyState(String deviceId) {
-    if (!_policies.containsKey(deviceId)) {
-      // Try load
-      final jsonStr = policyStore.getPolicy(deviceId);
-      if (jsonStr != null) {
-        try {
-          _policies[deviceId] = PolicyState.fromJson(jsonDecode(jsonStr));
-          print('[$deviceId] Loaded Policy state from store.');
-        } catch (e) {
-          print('[$deviceId] Error loading Policy state: $e');
+        if (!_refreshSessions.containsKey(deviceId)) {
+          _refreshSessions[deviceId] = RefreshSessionState(deviceId);
+          _log.info('[$deviceId] New Refresh session created');
         }
       }
+      return _refreshSessions[deviceId]!;
+    });
+  }
+
+  Future<SigningSessionState> _getSigningSession(String deviceId) async {
+    return await _signingLock.synchronized(() {
+      if (!_signingSessions.containsKey(deviceId)) {
+        _signingSessions[deviceId] = SigningSessionState(deviceId);
+        _log.info('[$deviceId] New Signing session created');
+      }
+      return _signingSessions[deviceId]!;
+    });
+  }
+
+  Future<PolicyState> _getPolicyState(String deviceId) async {
+    return await _policyLock.synchronized(() {
       if (!_policies.containsKey(deviceId)) {
-        _policies[deviceId] = PolicyState(deviceId);
-        print('New Session Created: $deviceId');
-      }
-    }
-    return _policies[deviceId]!;
-  }
-
-  UtxoState _getUtxoState(String deviceId) {
-    if (!_utxos.containsKey(deviceId)) {
-      final newState = UtxoState(deviceId);
-
-      // Load from persistence
-      final existingJson = utxoStore.getUtxo(deviceId);
-      if (existingJson != null) {
-        try {
-          final List<dynamic> list = jsonDecode(existingJson);
-          final loadedUtxos = list.map((item) {
-            final amount = BigInt.parse(item['amount'].toString());
-            final txid = item['tx_hash'] as String;
-            final vout = item['vout'] as int;
-            return Utxo(amount, txid, vout);
-          }).toList();
-          newState.addUtxoList(loadedUtxos);
-          print('[$deviceId] Loaded ${loadedUtxos.length} UTXOs from store.');
-        } catch (e) {
-          print('[$deviceId] Error loading UTXOs: $e');
+        // Try load
+        final jsonStr = policyStore.getPolicy(deviceId);
+        if (jsonStr != null) {
+          try {
+            _policies[deviceId] = PolicyState.fromJson(jsonDecode(jsonStr));
+            _log.info('[$deviceId] Loaded Policy state from store.');
+          } catch (e) {
+            _log.warning('[$deviceId] Error loading Policy state: $e');
+          }
+        }
+        if (!_policies.containsKey(deviceId)) {
+          _policies[deviceId] = PolicyState(deviceId);
+          _log.info('[$deviceId] New Policy state created');
         }
       }
+      return _policies[deviceId]!;
+    });
+  }
 
-      _utxos[deviceId] = newState;
-    }
-    return _utxos[deviceId]!;
+  Future<UtxoState> _getUtxoState(String deviceId) async {
+    return await _utxoLock.synchronized(() {
+      if (!_utxos.containsKey(deviceId)) {
+        final newState = UtxoState(deviceId);
+
+        // Load from persistence
+        final existingJson = utxoStore.getUtxo(deviceId);
+        if (existingJson != null) {
+          try {
+            final List<dynamic> list = jsonDecode(existingJson);
+            final loadedUtxos = list.map((item) {
+              final amount = BigInt.parse(item['amount'].toString());
+              final txid = item['tx_hash'] as String;
+              final vout = item['vout'] as int;
+              return Utxo(amount, txid, vout);
+            }).toList();
+            newState.addUtxoList(loadedUtxos);
+            _log.info(
+                '[$deviceId] Loaded ${loadedUtxos.length} UTXOs from store.');
+          } catch (e) {
+            _log.warning('[$deviceId] Error loading UTXOs: $e');
+          }
+        }
+
+        _utxos[deviceId] = newState;
+      }
+      return _utxos[deviceId]!;
+    });
   }
 
   static String _idToString(List<int> id) {
@@ -173,17 +194,17 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<DKGStep1Response> dKGStep1(
       ServiceCall call, DKGStep1Request request) async {
-    final session = _getDKGSession(request.deviceId);
+    final session = await _getDKGSession(request.deviceId);
     try {
       final clientIdHex = _idToString(request.identifier);
-      print(
+      _log.info(
           '[${request.deviceId}] DKGStep1: Received PubPackage from $clientIdHex');
 
       session.round1Packages[clientIdHex] = request.round1Package;
 
       // Server Init for this session
       if (session.serverRound1SecretPackage == null) {
-        print('[${request.deviceId}] Server: Generating DKG secrets...');
+        _log.info('[${request.deviceId}] Server: Generating DKG secrets...');
         final secret = threshold.SecretKey(threshold.modNRandom());
         final coeffs = threshold.generateCoefficients(thresholdCount - 1);
         final (r1Secret, r1Public) = threshold.dkgPart1(
@@ -203,7 +224,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       return DKGStep1Response()..round1Packages.addAll(session.round1Packages);
     } catch (e) {
-      print('[${request.deviceId}] DKGStep1 Error: $e');
+      _log.severe('[${request.deviceId}] DKGStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -212,12 +233,12 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<DKGStep2Response> dKGStep2(
       ServiceCall call, DKGStep2Request request) async {
-    final session = _getDKGSession(request.deviceId);
+    final session = await _getDKGSession(request.deviceId);
     try {
       await session.completerStep1.future;
 
       if (session.dkgRound2PackagesLocal.isEmpty) {
-        print('[${request.deviceId}] DKGStep2: Server computing shares...');
+        _log.info('[${request.deviceId}] DKGStep2: Server computing shares...');
         final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
           final id = threshold.Identifier(BigInt.parse(k, radix: 16));
@@ -244,7 +265,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       return DKGStep2Response()
         ..allRound1Packages.addAll(session.round1Packages);
     } catch (e) {
-      print('[${request.deviceId}] DKGStep2 Error: $e');
+      _log.severe('[${request.deviceId}] DKGStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -253,11 +274,11 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<DKGStep3Response> dKGStep3(
       ServiceCall call, DKGStep3Request request) async {
-    final session = _getDKGSession(request.deviceId);
+    final session = await _getDKGSession(request.deviceId);
     try {
       final senderId = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      print(
+      _log.info(
           '[${request.deviceId}] DKGStep3: Received Shares from ${_idToString(request.identifier)}');
 
       await session.completerStep2.future;
@@ -295,11 +316,12 @@ class MPCWalletService extends MPCWalletServiceBase {
         }
       }
 
-      final policyState = _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(request.deviceId);
 
       if (policyState.normalPolicy == null &&
           session.completerStep3.isCompleted) {
-        print('[${request.deviceId}] DKGStep3: Server computing KeyPackage...');
+        _log.info(
+            '[${request.deviceId}] DKGStep3: Server computing KeyPackage...');
         final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
           final id = threshold.Identifier(BigInt.parse(k, radix: 16));
@@ -323,7 +345,7 @@ class MPCWalletService extends MPCWalletServiceBase {
           keyPackage: keyPkg,
           publicKeyPackage: pubKeyPkg,
         );
-        print(
+        _log.info(
             '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
 
         // Persistence
@@ -332,16 +354,17 @@ class MPCWalletService extends MPCWalletServiceBase {
               request.deviceId, jsonEncode(policyState.toJson()));
           await dkgStore.saveSession(
               request.deviceId, jsonEncode(session.toJson()));
-          print('[${request.deviceId}] Saved DKG completion state.');
+          _log.info('[${request.deviceId}] Saved DKG completion state.');
         } catch (e) {
-          print('[${request.deviceId}] Error saving DKG complete state: $e');
+          _log.severe(
+              '[${request.deviceId}] Error saving DKG complete state: $e');
         }
       }
 
       return DKGStep3Response()
         ..round2PackagesForMe.addAll(packagesForRequester);
     } catch (e) {
-      print('[${request.deviceId}] DKGStep3 Error: $e');
+      _log.severe('[${request.deviceId}] DKGStep3 Error: $e');
       session.reset();
       rethrow;
     }
@@ -350,18 +373,17 @@ class MPCWalletService extends MPCWalletServiceBase {
   // --- Signing ---
 
   // Helper to decode tx and calculate spent amount
-  BigInt _calculateSpentAmount(Uint8List fullTxBytes,
-      threshold.PublicKeyPackage groupKey, String deviceId) {
+  Future<BigInt> _calculateSpentAmount(Uint8List fullTxBytes,
+      threshold.PublicKeyPackage groupKey, String deviceId) async {
     if (fullTxBytes.isEmpty) return BigInt.zero;
 
     try {
       final tx = BtcTransaction.deserialize(fullTxBytes);
 
       BigInt totalIn = BigInt.zero;
+      final utxoState = await _getUtxoState(deviceId);
+      final clientUtxos = utxoState.utxos;
       for (final input in tx.inputs) {
-        // Ensure state is loaded
-        final utxoState = _getUtxoState(deviceId);
-        final clientUtxos = utxoState.utxos;
         for (final y in clientUtxos) {
           if (y.txid == input.txId && y.vout == input.txIndex) {
             totalIn += y.amount;
@@ -392,19 +414,19 @@ class MPCWalletService extends MPCWalletServiceBase {
       // So this is correct.
       return spent;
     } catch (e) {
-      print("Error decoding transaction: $e");
+      _log.warning("Error decoding transaction: $e");
       // Fallback/Fail safe
       return BigInt.zero;
     }
   }
 
-  ProtectedPolicy? _getPolicy(
+  Future<ProtectedPolicy?> _getPolicy(
     List<int> txMessage,
     threshold.PublicKeyPackage groupKey,
     String deviceId,
-  ) {
-    final policies = _getPolicyState(deviceId);
-    final spent = _calculateSpentAmount(
+  ) async {
+    final policies = await _getPolicyState(deviceId);
+    final spent = await _calculateSpentAmount(
         Uint8List.fromList(txMessage), groupKey, deviceId);
 
     // Check cumulative spending for active policies
@@ -442,12 +464,12 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<SignStep1Response> signStep1(
       ServiceCall call, SignStep1Request request) async {
-    final session = _getSigningSession(request.deviceId);
+    final session = await _getSigningSession(request.deviceId);
     try {
-      final policyState = _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(request.deviceId);
       final senderId = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      print(
+      _log.info(
           '[${request.deviceId}] SignStep1: Received from ${_idToString(request.identifier)}');
 
       // Ensure we have a key for this session
@@ -458,7 +480,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       var serverKeyPackage = policyState.normalPolicy!.keyPackage;
 
-      final policy = _getPolicy(
+      final policy = await _getPolicy(
         request.fullTransaction,
         policyState.normalPolicy!.publicKeyPackage,
         request.deviceId,
@@ -467,10 +489,11 @@ class MPCWalletService extends MPCWalletServiceBase {
       if (policy != null) {
         serverKeyPackage = policy.keyPackage;
         session.currentPolicyId = policy.id;
-        print(
+        _log.info(
             '[${request.deviceId}] SignStep1: Switched to Protected Policy: ${policy.id}');
       } else {
-        print('[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
+        _log.info(
+            '[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
       }
 
       // ---------------------------
@@ -483,7 +506,7 @@ class MPCWalletService extends MPCWalletServiceBase {
           frost_comm.SigningCommitments(bindingP, hidingP);
 
       if (session.serverNonce == null) {
-        print(
+        _log.info(
             '[${request.deviceId}] SignStep1: Server generating commitments...');
         session.serverNonce = frost_comm.newNonce(serverKeyPackage.secretShare);
         session.serverCommitments = session.serverNonce!.commitments;
@@ -495,7 +518,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       }
 
       // Calculate spent amount for history tracking
-      final spent = _calculateSpentAmount(
+      final spent = await _calculateSpentAmount(
           Uint8List.fromList(request.fullTransaction),
           policyState.normalPolicy!.publicKeyPackage,
           request.deviceId);
@@ -523,7 +546,7 @@ class MPCWalletService extends MPCWalletServiceBase {
         ..commitments.addAll(responseCommitments)
         ..messageToSign = session.messageToSign!;
     } catch (e) {
-      print('[${request.deviceId}] SignStep1 Error: $e');
+      _log.severe('[${request.deviceId}] SignStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -532,13 +555,13 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<SignStep2Response> signStep2(
       ServiceCall call, SignStep2Request request) async {
-    final session = _getSigningSession(request.deviceId);
+    final session = await _getSigningSession(request.deviceId);
     try {
-      final policyState = _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(request.deviceId);
 
       final senderId = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      print(
+      _log.info(
           '[${request.deviceId}] SignStep2: Received from ${_idToString(request.identifier)}');
 
       var serverKeyPackage = policyState.normalPolicy!.keyPackage;
@@ -555,19 +578,11 @@ class MPCWalletService extends MPCWalletServiceBase {
           threshold.bytesToBigInt(Uint8List.fromList(request.signatureShare));
       session.signRound2Shares[senderId] = share;
 
-      print('DEBUG: Current Policy ID: ${session.currentPolicyId}');
-
       if (!session.signRound2Shares.containsKey(serverId) &&
           session.serverNonce != null) {
-        print('[${request.deviceId}] SignStep2: Server computing share...');
+        _log.info('[${request.deviceId}] SignStep2: Server computing share...');
         final signingPkg = frost_comm.SigningPackage(
             session.signCommitmentsReceived, session.messageToSign!);
-        print('[${request.deviceId}] SignStep2: Generating Server Share...');
-
-        print('DEBUG: Current Policy ID: ${session.currentPolicyId}');
-        print('DEBUG: Server Key ID: ${serverKeyPackage.identifier.s}');
-        print(
-            'DEBUG: Server Secret (partial): ${serverKeyPackage.secretShare.toString().substring(0, 10)}...');
 
         // Explicitly apply Taproot tweak (Key Path Spending)
         serverKeyPackage = serverKeyPackage.tweak(null);
@@ -598,14 +613,14 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       final signature =
           frost.aggregate(signingPkg, sharesMap, serverPubPackage);
-      print('[${request.deviceId}] SignStep2: Aggregated.');
+      _log.info('[${request.deviceId}] SignStep2: Aggregated.');
 
       // Commit Pending Amount to History
       if (session.pendingAmount != null &&
           session.pendingAmount! > BigInt.zero) {
         policyState.spendingHistory
             .add(SpendingEntry(DateTime.now(), session.pendingAmount!));
-        print(
+        _log.info(
             '[${request.deviceId}] Policy Update: Added spending of ${session.pendingAmount} sats. Total History: ${policyState.spendingHistory.length}');
 
         // Persist Policy State (spending history update)
@@ -613,7 +628,7 @@ class MPCWalletService extends MPCWalletServiceBase {
           await policyStore.savePolicy(
               request.deviceId, jsonEncode(policyState.toJson()));
         } catch (e) {
-          print(
+          _log.severe(
               '[${request.deviceId}] Error saving policy spending history: $e');
         }
       }
@@ -624,7 +639,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       return response;
     } catch (e) {
-      print('[${request.deviceId}] SignStep2 Error: $e');
+      _log.severe('[${request.deviceId}] SignStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -635,16 +650,16 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep1Response> refreshStep1(
       ServiceCall call, RefreshStep1Request request) async {
-    final session = _getRefreshSession(request.deviceId);
+    final session = await _getRefreshSession(request.deviceId);
     try {
-      final policyState = _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(request.deviceId);
       final clientIdHex = _idToString(request.identifier);
-      print(
+      _log.info(
           '[${request.deviceId}] RefreshStep1: Received PubPackage from $clientIdHex');
 
       // Auto-Reset if previous session finished
       if (session.completerRefreshStep3.isCompleted) {
-        print(
+        _log.info(
             '[${request.deviceId}] RefreshStep1: Resetting previous refresh session...');
         session.reset();
         // Since reset() clears everything including refreshCreationTime, we need to re-initialize below
@@ -654,7 +669,8 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       // Server Init for this refresh session
       if (session.serverRefreshRound1Secret == null) {
-        print('[${request.deviceId}] Server: Generating Refresh secrets...');
+        _log.info(
+            '[${request.deviceId}] Server: Generating Refresh secrets...');
         if (policyState.normalPolicy == null) {
           throw GrpcError.failedPrecondition("No key to refresh");
         }
@@ -689,7 +705,7 @@ class MPCWalletService extends MPCWalletServiceBase {
         ..startTime = Int64(session.refreshCreationTime!.millisecondsSinceEpoch)
         ..policyId = session.refreshId!;
     } catch (e) {
-      print('[${request.deviceId}] RefreshStep1 Error: $e');
+      _log.severe('[${request.deviceId}] RefreshStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -698,12 +714,13 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep2Response> refreshStep2(
       ServiceCall call, RefreshStep2Request request) async {
-    final session = _getRefreshSession(request.deviceId);
+    final session = await _getRefreshSession(request.deviceId);
     try {
       await session.completerRefreshStep1.future;
 
       if (session.refreshRound2PackagesLocal.isEmpty) {
-        print('[${request.deviceId}] RefreshStep2: Server computing shares...');
+        _log.info(
+            '[${request.deviceId}] RefreshStep2: Server computing shares...');
         final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.refreshRound1Packages.forEach((k, v) {
           final id = threshold.Identifier(BigInt.parse(k, radix: 16));
@@ -725,7 +742,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       return RefreshStep2Response()
         ..allRound1Packages.addAll(session.refreshRound1Packages);
     } catch (e) {
-      print('[${request.deviceId}] RefreshStep2 Error: $e');
+      _log.severe('[${request.deviceId}] RefreshStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -734,13 +751,13 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep3Response> refreshStep3(
       ServiceCall call, RefreshStep3Request request) async {
-    final session = _getRefreshSession(request.deviceId);
+    final session = await _getRefreshSession(request.deviceId);
     try {
-      final policyState = _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(request.deviceId);
 
       final senderId = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      print(
+      _log.info(
           '[${request.deviceId}] RefreshStep3: Received Shares from ${_idToString(request.identifier)}');
 
       await session.completerRefreshStep2.future;
@@ -784,10 +801,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       if (session.completerRefreshStep3.isCompleted) {
         if (session.serverRefreshRound2Secret != null) {
-          // Compute logical "server" share receipt (handled in loop above).
-          // Already added to relay map.
-
-          print(
+          _log.info(
               '[${request.deviceId}] RefreshStep3: Server computing New Key...');
 
           final allRound1Pkgs =
@@ -832,17 +846,20 @@ class MPCWalletService extends MPCWalletServiceBase {
             await refreshStore.saveSession(
                 request.deviceId, jsonEncode(session.toJson()));
           } catch (e) {
-            print('[${request.deviceId}] Error saving Refreshed Policy: $e');
+            _log.severe(
+                '[${request.deviceId}] Error saving Refreshed Policy: $e');
           }
 
           // Prevent re-computation
           session.serverRefreshRound2Secret = null;
 
-          // Verify invariant
+          // Verify invariant - REJECT if group key changed (security critical)
           if (normalPub.verifyingKey.E.getEncoded(true).toString() !=
               pubKeyPkg.verifyingKey.E.getEncoded(true).toString()) {
-            print(
-                "WARNING: Group key changed during refresh! This indicates a protocol failure or attack.");
+            _log.severe(
+                '[${request.deviceId}] CRITICAL: Group key changed during refresh! This indicates a protocol failure or attack.');
+            throw GrpcError.internal(
+                'Protocol violation: Group key changed during refresh');
           }
 
           if (!session.completerRefreshStep3.isCompleted)
@@ -856,7 +873,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       return RefreshStep3Response()
         ..round2PackagesForMe.addAll(packagesForRequester);
     } catch (e) {
-      print('[${request.deviceId}] RefreshStep3 Error: $e');
+      _log.severe('[${request.deviceId}] RefreshStep3 Error: $e');
       session.reset();
       rethrow;
     }
@@ -865,7 +882,7 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<GetPolicyIdResponse> getPolicyId(
       ServiceCall call, GetPolicyIdRequest request) async {
-    final policyState = _getPolicyState(request.deviceId);
+    final policyState = await _getPolicyState(request.deviceId);
 
     if (policyState.normalPolicy == null) {
       throw GrpcError.failedPrecondition(
@@ -873,7 +890,7 @@ class MPCWalletService extends MPCWalletServiceBase {
     }
 
     // request.txMessage is already List<int> (bytes)
-    final policy = _getPolicy(
+    final policy = await _getPolicy(
       request.txMessage,
       policyState.normalPolicy!.publicKeyPackage,
       request.deviceId,
@@ -891,17 +908,10 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<BroadcastTransactionResponse> broadcastTransaction(
       ServiceCall call, BroadcastTransactionRequest request) async {
-    print(
+    _log.info(
         '[${request.deviceId}] Broadcasting Tx: ${request.txHex.substring(0, 20)}...');
 
-    // We assume bitcoinService is available (dependency injection or member).
-    // Let's assume we added `bitcoinService` to the class, see initialization below.
-    // Wait, I need to add the field first.
-    // I will do this in a multi-step or separate replacement if needed,
-    // but here I strictly replace the method body.
-    // I'll assume `bitcoinService` is injected.
-
-    final policyState = _getPolicyState(request.deviceId);
+    final policyState = await _getPolicyState(request.deviceId);
     final (txId, _) = await bitcoinService.broadcastTransaction(
         request.deviceId, request.txHex, policyState);
 
@@ -911,7 +921,7 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<FetchHistoryResponse> fetchHistory(
       ServiceCall call, FetchHistoryRequest request) async {
-    final policyState = _getPolicyState(request.deviceId);
+    final policyState = await _getPolicyState(request.deviceId);
 
     // Fetch from BitcoinHistoryService
     final utxos = await historyService.getUtxos(request.deviceId, policyState);
@@ -922,25 +932,25 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<FetchRecentTransactionsResponse> fetchRecentTransactions(
       ServiceCall call, FetchRecentTransactionsRequest request) async {
-    final policyState = _getPolicyState(request.deviceId);
+    final policyState = await _getPolicyState(request.deviceId);
     try {
       final txs = await historyService.getRecentTransactions(
           request.deviceId, policyState);
 
-      print(
+      _log.info(
           '[${request.deviceId}] FetchRecentTransactionsResponse: ${txs.length} txs');
       return FetchRecentTransactionsResponse()..transactions.addAll(txs);
     } catch (e) {
-      print('[${request.deviceId}] fetchRecentTransactions Error: $e');
+      _log.severe('[${request.deviceId}] fetchRecentTransactions Error: $e');
       rethrow;
     }
   }
 
   @override
   Stream<TransactionNotification> subscribeToHistory(
-      ServiceCall call, SubscribeToHistoryRequest request) {
-    final policyState = _getPolicyState(request.deviceId);
-    return historyService.subscribe(request.deviceId, policyState);
+      ServiceCall call, SubscribeToHistoryRequest request) async* {
+    final policyState = await _getPolicyState(request.deviceId);
+    yield* historyService.subscribe(request.deviceId, policyState);
   }
 } // End of MPCWalletService
 
@@ -1016,6 +1026,23 @@ Future<void> main(List<String> args) async {
   }
 
   await runZonedGuarded(() async {
+    final config = ServerConfig.fromEnvironment();
+    config.validate();
+
+    // Setup logging
+    Logger.root.level = config.loggerLevel;
+    Logger.root.onRecord.listen((record) {
+      final time = record.time.toIso8601String();
+      print(
+          '$time [${record.level.name}] ${record.loggerName}: ${record.message}');
+      if (record.error != null) {
+        print('Error: ${record.error}');
+      }
+      if (record.stackTrace != null) {
+        print('Stack: ${record.stackTrace}');
+      }
+    });
+
     // Persistence Init
     final home = Platform.environment['HOME'] ?? Directory.current.path;
     final serverStorePath = p.join(home, '.mpc_wallet', 'server');
@@ -1024,7 +1051,7 @@ Future<void> main(List<String> args) async {
       dir.createSync(recursive: true);
     }
     Hive.init(serverStorePath);
-    print('Persistence Path: $serverStorePath');
+    _log.info('Persistence Path: $serverStorePath');
 
     final dkgStore = DKGSessionStore();
     final policyStore = PolicyStore();
@@ -1037,24 +1064,24 @@ Future<void> main(List<String> args) async {
     await refreshStore.init();
     await signingStore.init();
     await utxoStore.init();
-    print('Store initialized.');
+    _log.info('Store initialized.');
 
     // Bitcoin Services Init
-    final bitcoinService = BitcoinService(utxoStore); // Legacy/RPC/Broadcast
+    final bitcoinService = BitcoinService(
+      utxoStore,
+      rpcUrl: config.bitcoinRpcUrl,
+      rpcUser: config.bitcoinRpcUser,
+      rpcPassword: config.bitcoinRpcPassword,
+    );
 
-    final electrumUrl =
-        Platform.environment['ELECTRUM_URL'] ?? 'electrum.blockstream.info';
-    final electrumPort =
-        int.tryParse(Platform.environment['ELECTRUM_PORT'] ?? '60002') ?? 60002;
-    print("Connecting to Electrum at $electrumUrl:$electrumPort");
+    _log.info(
+        "Connecting to Electrum at ${config.electrumUrl}:${config.electrumPort}");
 
     historyService = BitcoinHistoryService(
-        electrumUrl: electrumUrl,
-        electrumPort: electrumPort); // Electrum/History
+        electrumUrl: config.electrumUrl,
+        electrumPort: config.electrumPort); // Electrum/History
     await historyService!.init();
 
-    final serverPort =
-        int.tryParse(Platform.environment['PORT'] ?? '') ?? 50051;
     server = Server.create(
       services: [
         MPCWalletService(
@@ -1067,8 +1094,16 @@ Future<void> main(List<String> args) async {
             historyService: historyService!)
       ],
     );
-    await server!.serve(port: serverPort);
-    print('Server listening on port ${server!.port}...');
+
+    final ServerCredentials? serverCredentials = config.tlsEnabled
+        ? ServerTlsCredentials(
+            certificate: File(config.tlsCertPath!).readAsBytesSync(),
+            privateKey: File(config.tlsKeyPath!).readAsBytesSync(),
+          )
+        : null;
+
+    await server!.serve(port: config.port, security: serverCredentials);
+    _log.info('Server listening on port ${server!.port}...');
   }, (error, stack) async {
     await shutdown(exitCode: 1, error: error, stack: stack);
   });

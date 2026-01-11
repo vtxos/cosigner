@@ -15,13 +15,19 @@ import 'state.dart';
 class BitcoinService {
   final UtxoStore _utxoStore;
   final String _rpcUrl;
+  final String _rpcUser;
+  final String _rpcPassword;
 
-  // Hardcoded Regtest credentials (as per E2E tests)
-  static const String _rpcUser = "admin1";
-  static const String _rpcPassword = "123";
-
-  BitcoinService(this._utxoStore, {String rpcUrl = "http://127.0.0.1:18443"})
-      : _rpcUrl = rpcUrl;
+  /// Create BitcoinService with explicit credentials.
+  /// For production use, pass credentials from ServerConfig.
+  BitcoinService(
+    this._utxoStore, {
+    required String rpcUrl,
+    required String rpcUser,
+    required String rpcPassword,
+  })  : _rpcUrl = rpcUrl,
+        _rpcUser = rpcUser,
+        _rpcPassword = rpcPassword;
 
   String get _authHeader {
     return 'Basic ' + base64Encode(utf8.encode('$_rpcUser:$_rpcPassword'));
