@@ -1,18 +1,11 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:grpc/grpc.dart';
+import 'package:convert/convert.dart';
 import 'package:threshold/threshold.dart' as threshold;
-import 'package:threshold/frost/signing.dart' as frost;
 import 'package:threshold/frost/commitment.dart' as frost_comm;
 import 'package:fixnum/fixnum.dart';
 
-import 'package:bitcoin_base/bitcoin_base.dart';
-import 'package:blockchain_utils/blockchain_utils.dart'; // for hex
-
-import 'package:protocol/protocol.dart';
-import 'persistence/store.dart';
 import 'policy.dart';
 
 // --- Session State ---
@@ -22,7 +15,7 @@ import 'policy.dart';
 // DKG state is somewhat ephemeral (only needed during DKG).
 // KeyPackage is persistent.
 class DKGSessionState {
-  final String deviceId;
+  final String userId;
 
   // Ephemeral DKG locks/signals (Not persisted directly, recreated on load)
   Completer<void> completerStep1 = Completer<void>();
@@ -30,10 +23,13 @@ class DKGSessionState {
   Completer<void> completerStep3 = Completer<void>();
 
   // DKG Data (Persisted)
-  final round1Packages = <String, String>{}; // HexID -> JSON
+  final round1Packages = <threshold.Identifier, String>{}; // Identifier -> JSON
+
+  Uint8List? serverId;
 
   threshold.SecretKey? serverInternalSecret;
   threshold.Round1SecretPackage? serverRound1SecretPackage;
+
   threshold.Round2SecretPackage? serverRound2Secret;
 
   // Round 2
@@ -44,21 +40,28 @@ class DKGSessionState {
   final dkgRound2PackagesForRelay = <threshold.Identifier,
       Map<threshold.Identifier, threshold.Round2Package>>{};
 
-  DKGSessionState(this.deviceId);
+  DKGSessionState(this.userId);
 
   Map<String, dynamic> toJson() {
     return {
-      'deviceId': deviceId,
-      'round1Packages': round1Packages,
+      'userId': userId,
+      'round1Packages': round1Packages.map(
+        (k, v) => MapEntry(hex.encode(k.serialize()), v),
+      ),
       // Secrets are not persisted to avoid complexity with missing toJson
       // DKG sessions will restart if server restarts
     };
   }
 
   static DKGSessionState fromJson(Map<String, dynamic> json) {
-    final s = DKGSessionState(json['deviceId']);
+    final s = DKGSessionState(json['userId']);
     if (json['round1Packages'] != null) {
-      s.round1Packages.addAll(Map<String, String>.from(json['round1Packages']));
+      final raw = Map<String, dynamic>.from(json['round1Packages']);
+      raw.forEach((k, v) {
+        final id = threshold.Identifier.deserialize(
+            Uint8List.fromList(hex.decode(k)));
+        s.round1Packages[id] = v as String;
+      });
     }
     return s;
   }
@@ -78,21 +81,23 @@ class DKGSessionState {
 }
 
 class PolicyState {
-  final String deviceId;
+  final String userId;
+  final String recoveryId;
 
   // normal Policy
-  NormalPolicy? normalPolicy;
+  final NormalPolicy normalPolicy;
   // protected Policies
   final protectedPolicies = Map<String, ProtectedPolicy>();
 
   final spendingHistory = <SpendingEntry>[];
 
-  PolicyState(this.deviceId);
+  PolicyState(this.userId, this.recoveryId, this.normalPolicy);
 
   Map<String, dynamic> toJson() {
     return {
-      'deviceId': deviceId,
-      'normalPolicy': normalPolicy?.toJson(),
+      'userId': userId,
+      'recoveryId': recoveryId,
+      'normalPolicy': normalPolicy.toJson(),
       'protectedPolicies':
           protectedPolicies.map((k, v) => MapEntry(k, v.toJson())),
       'spendingHistory': spendingHistory.map((e) => e.toJson()).toList(),
@@ -100,10 +105,9 @@ class PolicyState {
   }
 
   static PolicyState fromJson(Map<String, dynamic> json) {
-    final s = PolicyState(json['deviceId']);
-    if (json['normalPolicy'] != null) {
-      s.normalPolicy = NormalPolicy.fromJson(json['normalPolicy']);
-    }
+    final s = PolicyState(json['userId'], json['recoveryId'],
+        NormalPolicy.fromJson(json['normalPolicy']));
+
     if (json['protectedPolicies'] != null) {
       final Map<String, dynamic> map = json['protectedPolicies'];
       map.forEach((k, v) {
@@ -119,10 +123,12 @@ class PolicyState {
 }
 
 class RefreshSessionState {
-  final String deviceId;
+  final String userId;
+
+  Uint8List? serverId;
 
   // Refresh Ephemeral
-  final refreshRound1Packages = <String, String>{};
+  final refreshRound1Packages = <threshold.Identifier, String>{};
   threshold.Round1SecretPackage? serverRefreshRound1Secret;
   threshold.Round2SecretPackage? serverRefreshRound2Secret;
 
@@ -142,12 +148,14 @@ class RefreshSessionState {
   Completer<void> completerRefreshStep2 = Completer<void>();
   Completer<void> completerRefreshStep3 = Completer<void>();
 
-  RefreshSessionState(this.deviceId);
+  RefreshSessionState(this.userId);
 
   Map<String, dynamic> toJson() {
     return {
-      'deviceId': deviceId,
-      'refreshRound1Packages': refreshRound1Packages,
+      'userId': userId,
+      'refreshRound1Packages': refreshRound1Packages.map(
+        (k, v) => MapEntry(hex.encode(k.serialize()), v),
+      ),
       'refreshCreationTime': refreshCreationTime?.millisecondsSinceEpoch,
       'refreshId': refreshId,
       'refreshThresholdAmount': refreshThresholdAmount?.toString(),
@@ -156,10 +164,14 @@ class RefreshSessionState {
   }
 
   static RefreshSessionState fromJson(Map<String, dynamic> json) {
-    final s = RefreshSessionState(json['deviceId']);
+    final s = RefreshSessionState(json['userId']);
     if (json['refreshRound1Packages'] != null) {
-      s.refreshRound1Packages
-          .addAll(Map<String, String>.from(json['refreshRound1Packages']));
+      final raw = Map<String, dynamic>.from(json['refreshRound1Packages']);
+      raw.forEach((k, v) {
+        final id = threshold.Identifier.deserialize(
+            Uint8List.fromList(hex.decode(k)));
+        s.refreshRound1Packages[id] = v as String;
+      });
     }
     if (json['refreshCreationTime'] != null) {
       s.refreshCreationTime =
@@ -191,33 +203,36 @@ class RefreshSessionState {
 }
 
 class SigningSessionState {
-  final String deviceId;
+  final String userId;
 
   // Signing (Ephemeral per request usually, but if we need persistent sessions for signing...)
   // The prompt implies "session for each DKG", so DKG is the session scope.
-  // Signing refers to the DKG session (device_id) to get keys.
+  // Signing refers to the DKG session (user_id) to get keys.
   Completer<void> completerSignStep1 = Completer<void>();
   Completer<void> completerSignStep2 = Completer<void>();
 
   frost_comm.SigningNonce? serverNonce;
   frost_comm.SigningCommitments? serverCommitments;
-  final signCommitmentsReceived =
-      <threshold.Identifier, frost_comm.SigningCommitments>{};
+  frost_comm.SigningCommitments? userCommitments;
+
   Uint8List? messageToSign;
   final signRound2Shares = <threshold.Identifier, BigInt>{};
+
+  Map<threshold.Identifier, threshold.SigningCommitments> signCommitmentList =
+      {};
 
   // current session PolicyID
   String? currentPolicyId;
   BigInt? pendingAmount;
 
-  SigningSessionState(this.deviceId);
+  SigningSessionState(this.userId);
 
   void reset() {
     completerSignStep1 = Completer<void>();
     completerSignStep2 = Completer<void>();
     serverNonce = null;
     serverCommitments = null;
-    signCommitmentsReceived.clear();
+    userCommitments = null;
     messageToSign = null;
     signRound2Shares.clear();
     currentPolicyId = null;
@@ -246,10 +261,10 @@ class SpendingEntry {
 }
 
 class UtxoState {
-  final String deviceId;
+  final String userId;
   List<Utxo> utxos;
 
-  UtxoState(this.deviceId) : utxos = [];
+  UtxoState(this.userId) : utxos = [];
 
   void addUtxoList(List<Utxo> utxos) {
     this.utxos.addAll(utxos);

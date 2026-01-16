@@ -14,19 +14,9 @@ void main() {
       const maxSigners = 3;
 
       // 1. DKG (Setup)
-      // We use the existing DKG implementation to generate keys
-      final participants = <Identifier>[
-        Identifier(BigInt.from(1)),
-        Identifier(BigInt.from(2)),
-        Identifier(BigInt.from(3)),
-      ];
-
       // Helper to run full DKG locally (simulated)
-      final (keyPackages, pkp) = runDealerDKG(
-        minSigners,
-        maxSigners,
-        participants,
-      );
+      final (keyPackages, pkp) = runDealerDKG(minSigners, maxSigners);
+      final participants = keyPackages.map((k) => k.identifier).toList();
 
       // 2. Signing Setup
       final message = Uint8List.fromList(
@@ -73,29 +63,26 @@ void main() {
 }
 
 // Helper to simulate DKG
-(List<KeyPackage>, PublicKeyPackage) runDealerDKG(
-  int min,
-  int max,
-  List<Identifier> ids,
-) {
+(List<KeyPackage>, PublicKeyPackage) runDealerDKG(int min, int max) {
   // We just run DKG steps locally in loop
 
   // 1. Round 1
   final round1Secrets = <Identifier, Round1SecretPackage>{};
   final round1Publics = <Identifier, Round1Package>{};
 
-  for (final id in ids) {
+  for (var i = 0; i < max; i++) {
     final secret = SecretKey(modNRandom());
     final coeffs = generateCoefficients(min - 1);
-    final (sec, pub) = dkgPart1(id, max, min, secret, coeffs);
-    round1Secrets[id] = sec;
-    round1Publics[id] = pub;
+    final (sec, pub) = dkgPart1(max, min, secret, coeffs);
+    round1Secrets[sec.identifier] = sec;
+    round1Publics[sec.identifier] = pub;
   }
 
   // 2. Round 2
   final round2Secrets = <Identifier, Round2SecretPackage>{};
   final round2Out = <Identifier, Map<Identifier, Round2Package>>{};
 
+  final ids = round1Secrets.keys.toList();
   for (final id in ids) {
     final others = <Identifier, Round1Package>{};
     for (final otherId in ids) {

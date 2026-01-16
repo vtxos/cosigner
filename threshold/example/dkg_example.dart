@@ -10,12 +10,11 @@ void main() {
   // In a real scenario, these would be distinct entities.
   // For demonstration, we'll simulate them locally.
 
-  final participants = <int, Participant>{};
+  final participants = <Participant>[];
   for (var i = 1; i <= maxSigners; i++) {
-    final identifier = identifierFromUint16(i); // Unique ID for each participant
     final secretKey = newSecretKey(); // a_i0 (random secret for participant's polynomial)
     final coefficients = generateCoefficients(minSigners - 1); // a_i1, ..., a_i(t-1)
-    participants[i] = Participant(identifier, secretKey, coefficients);
+    participants.add(Participant(secretKey, coefficients));
   }
 
   // --- 3. DKG Round 1: Generate Commitments and Proofs of Knowledge ---
@@ -23,20 +22,17 @@ void main() {
   final r1Secrets = <Identifier, Round1SecretPackage>{};
   final r1Pkgs = <Identifier, Round1Package>{};
 
-  for (final entry in participants.entries) {
-    final id = entry.key;
-    final participant = entry.value;
-
+  for (var i = 0; i < participants.length; i++) {
+    final participant = participants[i];
     final (secretPkg, pubPkg) = dkgPart1(
-      participant.identifier,
       maxSigners,
       minSigners,
       participant.secretKey,
       participant.coefficients,
     );
-    r1Secrets[participant.identifier] = secretPkg;
-    r1Pkgs[participant.identifier] = pubPkg;
-    print('Participant $id: Generated R1 Package (Commitment & PoK)');
+    r1Secrets[secretPkg.identifier] = secretPkg;
+    r1Pkgs[secretPkg.identifier] = pubPkg;
+    print('Participant ${i + 1}: Generated R1 Package (Commitment & PoK)');
   }
 
   // --- 4. DKG Round 2: Generate Shares for Peers ---
@@ -44,22 +40,23 @@ void main() {
   final r2Secrets = <Identifier, Round2SecretPackage>{};
   final r2Outgoing = <Identifier, Map<Identifier, Round2Package>>{};
 
-  for (final entry in participants.entries) {
-    final id = entry.key;
-    final r1Secret = r1Secrets[entry.value.identifier]!;
+  final ids = r1Secrets.keys.toList();
+  for (var i = 0; i < ids.length; i++) {
+    final id = ids[i];
+    final r1Secret = r1Secrets[id]!;
 
     // Collect all other participants' R1 packages
     final othersR1Pkgs = <Identifier, Round1Package>{};
-    for (final otherEntry in participants.entries) {
-      if (otherEntry.key != id) {
-        othersR1Pkgs[otherEntry.value.identifier] = r1Pkgs[otherEntry.value.identifier]!;
+    for (final otherId in ids) {
+      if (otherId != id) {
+        othersR1Pkgs[otherId] = r1Pkgs[otherId]!;
       }
     }
 
     final (r2s, out) = dkgPart2(r1Secret, othersR1Pkgs);
-    r2Secrets[entry.value.identifier] = r2s;
-    r2Outgoing[entry.value.identifier] = out;
-    print('Participant $id: Generated R2 Secret & Shares for Peers');
+    r2Secrets[id] = r2s;
+    r2Outgoing[id] = out;
+    print('Participant ${i + 1}: Generated R2 Secret & Shares for Peers');
   }
 
   // --- 5. DKG Round 3: Combine Shares and Form Key Packages ---
@@ -67,16 +64,16 @@ void main() {
   final keyPackages = <Identifier, KeyPackage>{};
   PublicKeyPackage? publicKeyPackage; // The final combined public key package
 
-  for (final entry in participants.entries) {
-    final id = entry.key;
-    final r1Secret = r1Secrets[entry.value.identifier]!;
-    final r2Secret = r2Secrets[entry.value.identifier]!;
+  for (var i = 0; i < ids.length; i++) {
+    final id = ids[i];
+    final r1Secret = r1Secrets[id]!;
+    final r2Secret = r2Secrets[id]!;
 
     // Collect R2 shares sent *to this participant* from others
     final inboundR2Pkgs = <Identifier, Round2Package>{};
-    for (final otherEntry in participants.entries) {
-      if (otherEntry.key != id) {
-        inboundR2Pkgs[otherEntry.value.identifier] = r2Outgoing[otherEntry.value.identifier]![r1Secret.identifier]!;
+    for (final otherId in ids) {
+      if (otherId != id) {
+        inboundR2Pkgs[otherId] = r2Outgoing[otherId]![id]!;
       }
     }
 
@@ -95,7 +92,7 @@ void main() {
     );
     keyPackages[kp.identifier] = kp;
     publicKeyPackage ??= pkp; // Store the first one, they should all be identical
-    print('Participant $id: Formed Key Package');
+    print('Participant ${i + 1}: Formed Key Package');
   }
 
   // --- 6. Verification ---
@@ -106,7 +103,7 @@ void main() {
 
   // Sum of all individual a_i0 values (secretKey.scalar from setup)
   var expectedCombinedSecret = modNZero();
-  for (final participant in participants.values) {
+  for (final participant in participants) {
     expectedCombinedSecret = (expectedCombinedSecret + participant.secretKey.scalar) % secp256k1Curve.n;
   }
   print('Expected Combined Secret (sum of a_i0): ${expectedCombinedSecret.toRadixString(16)}');
@@ -139,9 +136,8 @@ void main() {
 
 // Helper class for Participant state in this example
 class Participant {
-  final Identifier identifier;
   final SecretKey secretKey;
   final List<BigInt> coefficients;
 
-  Participant(this.identifier, this.secretKey, this.coefficients);
+  Participant(this.secretKey, this.coefficients);
 }

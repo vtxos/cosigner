@@ -33,8 +33,8 @@ service MPCWallet {
 // DKG Messages
 
 message DKGStep1Request {
-  string device_id = 1;
-  bytes identifier = 2;
+  bytes user_id = 1;
+  bytes identifier = 2;    
   string round1_package = 3; // JSON
 }
 
@@ -43,7 +43,7 @@ message DKGStep1Response {
 }
 
 message DKGStep2Request {
-  string device_id = 1;
+  bytes user_id = 1;
   bytes identifier = 2;
   string round1_package = 3; // JSON
 }
@@ -53,8 +53,8 @@ message DKGStep2Response {
 }
 
 message DKGStep3Request {
-   string device_id = 1;
-   bytes identifier = 2;
+   bytes user_id = 1;
+    bytes identifier = 2;
    map<string, string> round2_packages_for_others = 3;
 }
 
@@ -65,22 +65,14 @@ message DKGStep3Response {
 // Signing Messages
 
 message SignStep1Request {
-  string device_id = 1;
-  bytes identifier = 2;
-  bytes hiding_commitment = 3;
-  bytes binding_commitment = 4;
-  bytes message_to_sign = 5; 
-
-  // New: Transaction Context for Policy Enforcement
-  bytes full_transaction = 6; // Serialized Transaction (e.g. Raw Tx bytes)
-  repeated UtxoInfo input_utxos = 7; // Details of inputs being spent (amounts)
+  bytes user_id = 1;
+  bytes hiding_commitment = 2;
+  bytes binding_commitment = 3;
+  bytes message_to_sign = 4;
+  bytes signature = 5; // Pre-signature for authorization
+  bytes full_transaction = 6;
 }
 
-message UtxoInfo {
-    string tx_hash = 1;
-    int32 vout = 2;
-    int64 amount = 3; // satoshis
-}
 
 message SignStep1Response {
    message Commitment {
@@ -93,10 +85,17 @@ message SignStep1Response {
 }
 
 message SignStep2Request {
-   string device_id = 1;
-   bytes identifier = 2;
+   bytes user_id = 1;
    bytes signature_share = 3;
+   bytes signature = 4; // Signature over parameters for authentication
 }
+
+message UtxoInfo {
+    string tx_hash = 1;
+    int32 vout = 2;
+    int64 amount = 3; // satoshis
+}
+
 
 message SignStep2Response {
    // Final aggregated signature
@@ -108,11 +107,11 @@ message SignStep2Response {
 // Refresh Messages
 
 message RefreshStep1Request {
-  string device_id = 1;
-  bytes identifier = 2;
+  bytes user_id = 1;
   string round1_package = 3; // JSON
   int64 threshold_amount = 4;
   int64 interval = 5;
+  bytes signature = 6; // Signature over parameters for authentication
 }
 
 message RefreshStep1Response {
@@ -122,11 +121,11 @@ message RefreshStep1Response {
 }
 
 message RefreshStep2Request {
-  string device_id = 1;
-  bytes identifier = 2;
+  bytes user_id = 1;
   // In DKG Step 2 we sent round1_package again, but strict state management 
   // might not need it if session is locked. We will mirror DKG for consistency.
   string round1_package = 3; 
+  bytes signature = 4; // Signature over parameters for authentication
 }
 
 message RefreshStep2Response {
@@ -134,9 +133,9 @@ message RefreshStep2Response {
 }
 
 message RefreshStep3Request {
-   string device_id = 1;
-   bytes identifier = 2;
+   bytes user_id = 1;
    map<string, string> round2_packages_for_others = 3;
+   bytes signature = 4; // Signature over parameters for authentication
 }
 
 message RefreshStep3Response {
@@ -144,10 +143,11 @@ message RefreshStep3Response {
 }
 
 message CreateSpendingPolicyRequest {
-    string device_id = 1;
+    bytes user_id = 1;
     int64 threshold_sats = 2;
     int64 start_time = 3; // timestamp seconds
     int64 interval_seconds = 4; // duration in seconds
+    bytes signature = 5; // Signature over policy parameters for authentication
 }
 
 message CreateSpendingPolicyResponse {
@@ -156,8 +156,9 @@ message CreateSpendingPolicyResponse {
 }
 
 message GetPolicyIdRequest {
-    string device_id = 1;
+    bytes user_id = 1;
     bytes tx_message = 2; // Transaction bytes
+    bytes signature = 3; // Signature over tx_message for authentication
 }
 
 message GetPolicyIdResponse {
@@ -165,7 +166,7 @@ message GetPolicyIdResponse {
 }
 
 message BroadcastTransactionRequest {
-    string device_id = 1;
+    bytes user_id = 1;
     string tx_hex = 2;
 }
 
@@ -175,7 +176,8 @@ message BroadcastTransactionResponse {
 
 
 message FetchHistoryRequest {
-    string device_id = 1;
+    bytes user_id = 1;
+    bytes signature = 2; // Signature over user_id for authentication
 }
 
 message FetchHistoryResponse {
@@ -184,7 +186,8 @@ message FetchHistoryResponse {
 }
 
 message FetchRecentTransactionsRequest {
-    string device_id = 1;
+    bytes user_id = 1;
+    bytes signature = 2; // Signature over user_id for authentication
 }
 
 message FetchRecentTransactionsResponse {
@@ -199,7 +202,8 @@ message TransactionSummary {
 }
 
 message SubscribeToHistoryRequest {
-    string device_id = 1;
+    bytes user_id = 1;
+    bytes signature = 2; // Signature over user_id for authentication
 }
 
 message TransactionNotification {

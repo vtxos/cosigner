@@ -14,8 +14,8 @@ class BitcoinHistoryService {
   final String electrumUrl;
   final int electrumPort;
 
-  // Active subscriptions: DeviceId -> StreamController
-  final _deviceStreams = <String, StreamController<TransactionNotification>>{};
+  // Active subscriptions: UserId -> StreamController
+  final _userStreams = <String, StreamController<TransactionNotification>>{};
 
   // The new robust client from bitcoin_base (BitcoinBase ElectrumProvider + Custom Service)
   ElectrumProvider? _provider;
@@ -54,25 +54,22 @@ class BitcoinHistoryService {
   }
 
   Future<void> close() async {
-    for (final controller in _deviceStreams.values) {
+    for (final controller in _userStreams.values) {
       await controller.close();
     }
-    _deviceStreams.clear();
+    _userStreams.clear();
     await _serviceImpl?.disconnect();
     _provider = null;
     _serviceImpl = null;
   }
 
-  // Fetch UTXOs for a device (aggregating all active policies)
+  // Fetch UTXOs for a user (aggregating all active policies)
   Future<List<UtxoInfo>> getUtxos(
-      String deviceId, PolicyState policyState) async {
+      String userId, PolicyState policyState) async {
     final utxos = <UtxoInfo>[];
 
     // 1. Get all relevant addresses/scripts from policies
-    if (policyState.normalPolicy != null) {
-      utxos.addAll(
-          await _fetchForPolicy(policyState.normalPolicy!.publicKeyPackage));
-    }
+    utxos.addAll(await _fetchForPolicy(policyState.normalPolicy.publicKeyPackage));
     for (final p in policyState.protectedPolicies.values) {
       utxos.addAll(await _fetchForPolicy(p.publicKeyPackage));
     }
@@ -114,20 +111,20 @@ class BitcoinHistoryService {
 
   // Stream updates
   Stream<TransactionNotification> subscribe(
-      String deviceId, PolicyState policyState) {
-    // Reuse specific stream for this device if exists
-    if (_deviceStreams.containsKey(deviceId)) {
-      return _deviceStreams[deviceId]!.stream;
+      String userId, PolicyState policyState) {
+    // Reuse specific stream for this user if exists
+    if (_userStreams.containsKey(userId)) {
+      return _userStreams[userId]!.stream;
     }
 
     final controller =
         StreamController<TransactionNotification>.broadcast(onCancel: () {
-      _deviceStreams.remove(deviceId);
+      _userStreams.remove(userId);
     });
-    _deviceStreams[deviceId] = controller;
+    _userStreams[userId] = controller;
 
     _registerSubscriptions(controller, policyState).catchError((e) {
-      print("Subscription registration failed (CAUGHT) for $deviceId: $e");
+      print("Subscription registration failed (CAUGHT) for $userId: $e");
     });
 
     return controller.stream;
@@ -140,9 +137,8 @@ class BitcoinHistoryService {
       if (_provider == null) await init();
 
       final policies = [
-        if (policyState.normalPolicy != null)
-          policyState.normalPolicy!.publicKeyPackage,
-        ...policyState.protectedPolicies.values.map((e) => e.publicKeyPackage)
+        policyState.normalPolicy.publicKeyPackage,
+        ...policyState.protectedPolicies.values.map((e) => e.publicKeyPackage),
       ];
 
       for (var pkg in policies) {
@@ -164,7 +160,7 @@ class BitcoinHistoryService {
           if (params.containsKey('0')) {
             final scriptHash = params['0'];
 
-            // Check if it belongs to this device
+            // Check if it belongs to this user
             // (Inefficient O(N) lookup but fine for now)
             final belongs = policies.any((p) {
               final tweaked = p.tweak(null);
@@ -183,16 +179,16 @@ class BitcoinHistoryService {
     }
   }
 
-  // Fetch comprehensive transaction history for a device
+  // Fetch comprehensive transaction history for a user
   Future<List<TransactionSummary>> getRecentTransactions(
-      String deviceId, PolicyState policyState) async {
+      String userId, PolicyState policyState) async {
     final summaries = <TransactionSummary>[];
 
     // 1. Get all script hashes
     final scriptHash = _deriveScriptHash(
-        policyState.normalPolicy!.publicKeyPackage.tweak(null));
+        policyState.normalPolicy.publicKeyPackage.tweak(null));
 
-    print('[$deviceId] Fetching history for scriptHash: $scriptHash');
+    print('[$userId] Fetching history for scriptHash: $scriptHash');
 
     final txsOfInterest = <String, int>{};
 
@@ -200,17 +196,17 @@ class BitcoinHistoryService {
       final request =
           ElectrumRequestScriptHashGetHistory(scriptHash: scriptHash);
       final history = await _provider!.request(request);
-      print('[$deviceId] History fetched. Count: ${history.length}');
+      print('[$userId] History fetched. Count: ${history.length}');
 
       // print the history
-      print('[$deviceId] History: $history');
+      print('[$userId] History: $history');
 
       for (final h in history) {
         txsOfInterest[h['tx_hash']] = h['height'];
       }
-      print('[$deviceId] Processing ${txsOfInterest.length} unique txs...');
+      print('[$userId] Processing ${txsOfInterest.length} unique txs...');
     } catch (e) {
-      print('[$deviceId] Error fetching history: $e');
+      print('[$userId] Error fetching history: $e');
       return [];
     }
 
@@ -220,13 +216,13 @@ class BitcoinHistoryService {
       final height = entry.value;
 
       // print txheigh and height
-      print('[$deviceId] Processing txHash: $txHash, height: $height');
+      print('[$userId] Processing txHash: $txHash, height: $height');
 
       try {
         final txHex = await _provider!
             .request(ElectrumRequestGetTransaction(transactionHash: txHash));
 
-        print('[$deviceId] Fetched txHex: $txHex');
+        print('[$userId] Fetched txHex: $txHex');
         final tx = BtcTransaction.deserialize(BytesUtils.fromHexString(txHex));
 
         // Parse inputs and outputs to calculate net amount
@@ -284,7 +280,7 @@ class BitcoinHistoryService {
         }
 
         // print the net amount
-        print('[$deviceId] Net amount: $net');
+        print('[$userId] Net amount: $net');
 
         summaries.add(TransactionSummary(
             txHash: txHash,

@@ -23,8 +23,7 @@ class Participant {
 ) {
   validateNumOfSigners(min, max);
 
-  final ids = participants.map((p) => p.identifier).toList();
-  if (ids.length != max) {
+  if (participants.length != max) {
     throw IncorrectNumberOfIdsException("incorrect number of identifiers");
   }
 
@@ -34,15 +33,16 @@ class Participant {
 
   for (final participant in participants) {
     final (sec, pkg) = dkgPart1(
-      participant.identifier,
       max,
       min,
       participant.secretKey,
       participant.coefficients,
     );
-    r1Secrets[participant.identifier] = sec;
-    r1Pkgs[participant.identifier] = pkg;
+    r1Secrets[sec.identifier] = sec;
+    r1Pkgs[sec.identifier] = pkg;
   }
+
+  final ids = r1Secrets.keys.toList();
 
   // Everyone runs part2
   final r2Secrets = <Identifier, Round2SecretPackage>{};

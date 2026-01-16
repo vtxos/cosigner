@@ -22,28 +22,32 @@ class DKGSignature {
   }
 
   Map<String, dynamic> toJson() => {
-    'R': hex.encode(elemSerializeCompressed(R)),
-    'Z': hex.encode(bigIntToBytes(Z)),
-  };
+        'R': hex.encode(elemSerializeCompressed(R)),
+        'Z': hex.encode(bigIntToBytes(Z)),
+      };
 }
 
 class Round1Package {
   final VerifiableSecretSharingCommitment commitment;
   final DKGSignature proofOfKnowledge;
+  final VerifyingKey verifyingKey;
 
-  Round1Package(this.commitment, this.proofOfKnowledge);
+  Round1Package(this.commitment, this.proofOfKnowledge, this.verifyingKey);
 
   factory Round1Package.fromJson(Map<String, dynamic> json) {
     return Round1Package(
-      VerifiableSecretSharingCommitment.fromJson(json['commitment']),
-      DKGSignature.fromJson(json['proofOfKnowledge']),
-    );
+        VerifiableSecretSharingCommitment.fromJson(json['commitment']),
+        DKGSignature.fromJson(json['proofOfKnowledge']),
+        VerifyingKey.fromJson(
+          json['verifyingKey'],
+        ));
   }
 
   Map<String, dynamic> toJson() => {
-    'commitment': commitment.toJson(),
-    'proofOfKnowledge': proofOfKnowledge.toJson(),
-  };
+        'commitment': commitment.toJson(),
+        'proofOfKnowledge': proofOfKnowledge.toJson(),
+        'verifyingKey': verifyingKey.toJson(),
+      };
 }
 
 class Challenge {
@@ -79,8 +83,8 @@ class Round2Package {
   }
 
   Map<String, dynamic> toJson() => {
-    'secretShare': hex.encode(bigIntToBytes(secretShare)),
-  };
+        'secretShare': hex.encode(bigIntToBytes(secretShare)),
+      };
 }
 
 class Round2SecretPackage {
@@ -133,12 +137,12 @@ class KeyPackage {
   }
 
   Map<String, dynamic> toJson() => {
-    'identifier': hex.encode(identifier.serialize()),
-    'secretShare': hex.encode(bigIntToBytes(secretShare)),
-    'verifyingShare': hex.encode(elemSerializeCompressed(verifyingShare)),
-    'verifyingKey': hex.encode(elemSerializeCompressed(verifyingKey.E)),
-    'minSigners': minSigners,
-  };
+        'identifier': hex.encode(identifier.serialize()),
+        'secretShare': hex.encode(bigIntToBytes(secretShare)),
+        'verifyingShare': hex.encode(elemSerializeCompressed(verifyingShare)),
+        'verifyingKey': hex.encode(elemSerializeCompressed(verifyingKey.E)),
+        'minSigners': minSigners,
+      };
 
   bool get hasEvenY {
     return verifyingKey.E.y!.toBigInteger()!.isEven;
@@ -223,11 +227,11 @@ class PublicKeyPackage {
 
   Map<String, dynamic> toJson() {
     final verifyingShares = this.verifyingShares.map(
-      (key, value) => MapEntry(
-        hex.encode(key.serialize()),
-        hex.encode(elemSerializeCompressed(value)),
-      ),
-    );
+          (key, value) => MapEntry(
+            hex.encode(key.serialize()),
+            hex.encode(elemSerializeCompressed(value)),
+          ),
+        );
     return {
       'verifyingShares': verifyingShares,
       'verifyingKey': hex.encode(elemSerializeCompressed(verifyingKey.E)),
@@ -292,7 +296,6 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
 }
 
 (Round1SecretPackage, Round1Package) dkgPart1(
-  Identifier identifier,
   int maxSigners,
   int minSigners,
   SecretKey secretKey,
@@ -309,6 +312,9 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
 
   final verifyingCommit = VerifiableSecretSharingCommitment(commitment);
   final verifyingKey = verifyingCommit.toVerifyingKey();
+  final verifyingKeyBytes = elemSerializeCompressed(verifyingKey.E);
+
+  final identifier = Identifier.derive(verifyingKeyBytes);
 
   final sig = computeProofOfKnowledge(identifier, coeffs, verifyingKey);
 
@@ -322,6 +328,7 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   final pubPkg = Round1Package(
     VerifiableSecretSharingCommitment(commitment),
     sig,
+    verifyingKey,
   );
   return (secretPkg, pubPkg);
 }
@@ -484,7 +491,7 @@ PublicKeyPackage pkpFromCommitment(
     minSigners,
     maxSigners,
   );
-  final pub = Round1Package(trimCommit, sig);
+  final pub = Round1Package(trimCommit, sig, verifyingKey);
   return (sec, pub);
 }
 
@@ -555,10 +562,8 @@ PublicKeyPackage pkpFromCommitment(
     final senderID = entry.key;
     final r1 = entry.value;
     final coeffs = <ECPoint>[identity, ...r1.commitment.coeffs];
-    newR1[senderID] = Round1Package(
-      VerifiableSecretSharingCommitment(coeffs),
-      r1.proofOfKnowledge,
-    );
+    newR1[senderID] = Round1Package(VerifiableSecretSharingCommitment(coeffs),
+        r1.proofOfKnowledge, oldPKP.verifyingKey);
   }
 
   if (newR1.length != r2Secret.maxSigners - 1) {

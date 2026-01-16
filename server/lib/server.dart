@@ -25,8 +25,6 @@ import 'policy.dart';
 import 'bitcoin.dart';
 import 'bitcoin_service.dart';
 import 'config.dart';
-import 'validation.dart';
-import 'rate_limiter.dart';
 
 final _log = Logger('MPCWalletService');
 
@@ -55,10 +53,6 @@ class MPCWalletService extends MPCWalletServiceBase {
   final BitcoinService bitcoinService;
   final BitcoinHistoryService historyService;
 
-  // Server Identity: ID=3
-  static final serverId = threshold.Identifier(BigInt.from(3));
-  static final serverIdHex =
-      _idToString(threshold.bigIntToBytes(serverId.toScalar()));
   static const int totalParticipants = 3;
   static const int thresholdCount = 2;
 
@@ -72,93 +66,105 @@ class MPCWalletService extends MPCWalletServiceBase {
     required this.historyService,
   });
 
-  Future<DKGSessionState> _getDKGSession(String deviceId) async {
+  Future<DKGSessionState> _getDKGSession(String userId) async {
     return await _dkgLock.synchronized(() {
-      if (!_dkgSessions.containsKey(deviceId)) {
+      if (!_dkgSessions.containsKey(userId)) {
         // Try load
-        final jsonStr = dkgStore.getSession(deviceId);
+        final jsonStr = dkgStore.getSession(userId);
         if (jsonStr != null) {
           try {
-            _dkgSessions[deviceId] =
+            _dkgSessions[userId] =
                 DKGSessionState.fromJson(jsonDecode(jsonStr));
-            _log.info('[$deviceId] Loaded DKG session from store.');
+            _log.info('[$userId] Loaded DKG session from store.');
           } catch (e) {
-            _log.warning('[$deviceId] Error loading DKG session: $e');
+            _log.warning('[$userId] Error loading DKG session: $e');
           }
         }
 
-        if (!_dkgSessions.containsKey(deviceId)) {
-          _dkgSessions[deviceId] = DKGSessionState(deviceId);
-          _log.info('[$deviceId] New DKG session created');
+        if (!_dkgSessions.containsKey(userId)) {
+          _dkgSessions[userId] = DKGSessionState(userId);
+          _log.info('[$userId] New DKG session created');
         }
       }
-      return _dkgSessions[deviceId]!;
+      return _dkgSessions[userId]!;
     });
   }
 
-  Future<RefreshSessionState> _getRefreshSession(String deviceId) async {
+  Future<RefreshSessionState> _getRefreshSession(String userId) async {
     return await _refreshLock.synchronized(() {
-      if (!_refreshSessions.containsKey(deviceId)) {
+      if (!_refreshSessions.containsKey(userId)) {
         // Try load
-        final jsonStr = refreshStore.getSession(deviceId);
+        final jsonStr = refreshStore.getSession(userId);
         if (jsonStr != null) {
           try {
-            _refreshSessions[deviceId] =
+            _refreshSessions[userId] =
                 RefreshSessionState.fromJson(jsonDecode(jsonStr));
-            _log.info('[$deviceId] Loaded Refresh session from store.');
+            _log.info('[$userId] Loaded Refresh session from store.');
           } catch (e) {
-            _log.warning('[$deviceId] Error loading Refresh session: $e');
+            _log.warning('[$userId] Error loading Refresh session: $e');
           }
         }
 
-        if (!_refreshSessions.containsKey(deviceId)) {
-          _refreshSessions[deviceId] = RefreshSessionState(deviceId);
-          _log.info('[$deviceId] New Refresh session created');
+        if (!_refreshSessions.containsKey(userId)) {
+          _refreshSessions[userId] = RefreshSessionState(userId);
+          _log.info('[$userId] New Refresh session created');
         }
       }
-      return _refreshSessions[deviceId]!;
+      return _refreshSessions[userId]!;
     });
   }
 
-  Future<SigningSessionState> _getSigningSession(String deviceId) async {
+  Future<SigningSessionState> _getSigningSession(String userId) async {
     return await _signingLock.synchronized(() {
-      if (!_signingSessions.containsKey(deviceId)) {
-        _signingSessions[deviceId] = SigningSessionState(deviceId);
-        _log.info('[$deviceId] New Signing session created');
+      if (!_signingSessions.containsKey(userId)) {
+        _signingSessions[userId] = SigningSessionState(userId);
+        _log.info('[$userId] New Signing session created');
       }
-      return _signingSessions[deviceId]!;
+      return _signingSessions[userId]!;
     });
   }
 
-  Future<PolicyState> _getPolicyState(String deviceId) async {
+  Future<PolicyState> _getPolicyState(String userId) async {
     return await _policyLock.synchronized(() {
-      if (!_policies.containsKey(deviceId)) {
+      if (!_policies.containsKey(userId)) {
         // Try load
-        final jsonStr = policyStore.getPolicy(deviceId);
+        final jsonStr = policyStore.getPolicy(userId);
         if (jsonStr != null) {
           try {
-            _policies[deviceId] = PolicyState.fromJson(jsonDecode(jsonStr));
-            _log.info('[$deviceId] Loaded Policy state from store.');
+            _policies[userId] = PolicyState.fromJson(jsonDecode(jsonStr));
+            _log.info('[$userId] Loaded Policy state from store.');
           } catch (e) {
-            _log.warning('[$deviceId] Error loading Policy state: $e');
+            _log.warning('[$userId] Error loading Policy state: $e');
           }
         }
-        if (!_policies.containsKey(deviceId)) {
-          _policies[deviceId] = PolicyState(deviceId);
-          _log.info('[$deviceId] New Policy state created');
+        if (!_policies.containsKey(userId)) {
+          throw StateError('No Policy state found for user $userId');
         }
       }
-      return _policies[deviceId]!;
+      return _policies[userId]!;
     });
   }
 
-  Future<UtxoState> _getUtxoState(String deviceId) async {
+  Future<PolicyState> _newPolicyState(
+      String userId, String recoveryId, NormalPolicy policy) async {
+    return await _policyLock.synchronized(() {
+      if (_policies.containsKey(userId)) {
+        //remove existing
+        _policies.remove(userId);
+      }
+      _policies[userId] = PolicyState(userId, recoveryId, policy);
+      _log.info('[$userId] New Policy state created');
+      return _policies[userId]!;
+    });
+  }
+
+  Future<UtxoState> _getUtxoState(String userId) async {
     return await _utxoLock.synchronized(() {
-      if (!_utxos.containsKey(deviceId)) {
-        final newState = UtxoState(deviceId);
+      if (!_utxos.containsKey(userId)) {
+        final newState = UtxoState(userId);
 
         // Load from persistence
-        final existingJson = utxoStore.getUtxo(deviceId);
+        final existingJson = utxoStore.getUtxo(userId);
         if (existingJson != null) {
           try {
             final List<dynamic> list = jsonDecode(existingJson);
@@ -170,49 +176,74 @@ class MPCWalletService extends MPCWalletServiceBase {
             }).toList();
             newState.addUtxoList(loadedUtxos);
             _log.info(
-                '[$deviceId] Loaded ${loadedUtxos.length} UTXOs from store.');
+                '[$userId] Loaded ${loadedUtxos.length} UTXOs from store.');
           } catch (e) {
-            _log.warning('[$deviceId] Error loading UTXOs: $e');
+            _log.warning('[$userId] Error loading UTXOs: $e');
           }
         }
 
-        _utxos[deviceId] = newState;
+        _utxos[userId] = newState;
       }
-      return _utxos[deviceId]!;
+      return _utxos[userId]!;
     });
   }
 
-  static String _idToString(List<int> id) {
-    return id.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  static String _idToString(threshold.Identifier id) {
+    final idList = threshold.bigIntToBytes(id.toScalar());
+    return idList.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 
   static threshold.Identifier _stringToId(String s) {
     return threshold.Identifier(BigInt.parse(s, radix: 16));
   }
 
+  static Map<String, String> _stringKeyedPackageMap(
+      Map<threshold.Identifier, String> input) {
+    return {
+      for (final entry in input.entries) _idToString(entry.key): entry.value,
+    };
+  }
+
+  static String _userIdFromVerifyingKey(threshold.VerifyingKey verifyingKey) {
+    final bytes = threshold.elemSerializeCompressed(verifyingKey.E);
+    return hex.encode(bytes);
+  }
+
   // --- DKG ---
   @override
   Future<DKGStep1Response> dKGStep1(
       ServiceCall call, DKGStep1Request request) async {
-    final session = await _getDKGSession(request.deviceId);
-    try {
-      final clientIdHex = _idToString(request.identifier);
-      _log.info(
-          '[${request.deviceId}] DKGStep1: Received PubPackage from $clientIdHex');
+    final userId = request.userId;
 
-      session.round1Packages[clientIdHex] = request.round1Package;
+    final userIdHex = hex.encode(userId);
+
+    final session = await _getDKGSession(userIdHex);
+    try {
+      final identifier = threshold.Identifier.deserialize(
+          Uint8List.fromList(request.identifier));
+      _log.info(
+          '[$userIdHex] DKGStep1: Received PubPackage from ${hex.encode(userId)}');
+
+      session.round1Packages[identifier] = request.round1Package;
 
       // Server Init for this session
       if (session.serverRound1SecretPackage == null) {
-        _log.info('[${request.deviceId}] Server: Generating DKG secrets...');
+        _log.info('[$userIdHex] Server: Generating DKG secrets...');
         final secret = threshold.SecretKey(threshold.modNRandom());
         final coeffs = threshold.generateCoefficients(thresholdCount - 1);
         final (r1Secret, r1Public) = threshold.dkgPart1(
-            serverId, totalParticipants, thresholdCount, secret, coeffs);
+            totalParticipants, thresholdCount, secret, coeffs);
+
+        final serverId =
+            threshold.elemSerializeCompressed(r1Public.verifyingKey.E);
 
         session.serverInternalSecret = secret;
         session.serverRound1SecretPackage = r1Secret;
-        session.round1Packages[serverIdHex] = jsonEncode(r1Public.toJson());
+        session.serverId = serverId;
+
+        final serverIdentifier = threshold.Identifier.derive(session.serverId!);
+        session.round1Packages[serverIdentifier] =
+            jsonEncode(r1Public.toJson());
       }
 
       if (session.round1Packages.length == totalParticipants) {
@@ -222,9 +253,10 @@ class MPCWalletService extends MPCWalletServiceBase {
         await session.completerStep1.future;
       }
 
-      return DKGStep1Response()..round1Packages.addAll(session.round1Packages);
+      return DKGStep1Response()
+        ..round1Packages.addAll(_stringKeyedPackageMap(session.round1Packages));
     } catch (e) {
-      _log.severe('[${request.deviceId}] DKGStep1 Error: $e');
+      _log.severe('[$userIdHex] DKGStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -233,23 +265,30 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<DKGStep2Response> dKGStep2(
       ServiceCall call, DKGStep2Request request) async {
-    final session = await _getDKGSession(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    final session = await _getDKGSession(userIdHex);
     try {
       await session.completerStep1.future;
 
+      if (session.serverId == null) {
+        throw StateError('Server ID not initialized for session $userIdHex');
+      }
+
       if (session.dkgRound2PackagesLocal.isEmpty) {
-        _log.info('[${request.deviceId}] DKGStep2: Server computing shares...');
+        _log.info('[$userIdHex] DKGStep2: Server computing shares...');
         final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
-          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-          if (id != serverId) {
-            round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          final serverIdenfier = threshold.Identifier.derive(session.serverId!);
+
+          if (k != serverIdenfier) {
+            round1Pkgs[k] = threshold.Round1Package.fromJson(jsonDecode(v));
           }
         });
 
         if (session.serverRound1SecretPackage == null) {
-          throw StateError(
-              'Server secrets missing for session ${request.deviceId}');
+          throw StateError('Server secrets missing for session $userIdHex');
         }
 
         final (serverRound2Secret, serverRound2Pkgs) =
@@ -263,9 +302,10 @@ class MPCWalletService extends MPCWalletServiceBase {
         session.completerStep2.complete();
 
       return DKGStep2Response()
-        ..allRound1Packages.addAll(session.round1Packages);
+        ..allRound1Packages
+            .addAll(_stringKeyedPackageMap(session.round1Packages));
     } catch (e) {
-      _log.severe('[${request.deviceId}] DKGStep2 Error: $e');
+      _log.severe('[$userIdHex] DKGStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -274,12 +314,21 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<DKGStep3Response> dKGStep3(
       ServiceCall call, DKGStep3Request request) async {
-    final session = await _getDKGSession(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    _log.info('[$userIdHex] DKGStep3: Received Shares from ${userIdHex}');
+
+    final session = await _getDKGSession(userIdHex);
     try {
-      final senderId = threshold.Identifier.deserialize(
+      if (session.serverId == null) {
+        throw StateError('Server ID not initialized for session $userIdHex');
+      }
+
+      final identifier = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      _log.info(
-          '[${request.deviceId}] DKGStep3: Received Shares from ${_idToString(request.identifier)}');
+
+      final serverIdentifier = threshold.Identifier.derive(session.serverId!);
 
       await session.completerStep2.future;
 
@@ -290,14 +339,14 @@ class MPCWalletService extends MPCWalletServiceBase {
         final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
         sharesFromSenderForOthers[recipientId] = pkg;
 
-        if (recipientId == serverId) {
-          session.dkgRound2PackagesReceived[senderId] = pkg;
+        if (recipientId == serverIdentifier) {
+          session.dkgRound2PackagesReceived[identifier] = pkg;
         }
       }
-      session.dkgRound2PackagesForRelay[senderId] = sharesFromSenderForOthers;
+      session.dkgRound2PackagesForRelay[identifier] = sharesFromSenderForOthers;
 
       if (session.dkgRound2PackagesForRelay.length == totalParticipants - 1) {
-        session.dkgRound2PackagesForRelay[serverId] =
+        session.dkgRound2PackagesForRelay[serverIdentifier] =
             session.dkgRound2PackagesLocal;
         if (!session.completerStep3.isCompleted)
           session.completerStep3.complete();
@@ -309,24 +358,30 @@ class MPCWalletService extends MPCWalletServiceBase {
       for (final participantId in session.dkgRound2PackagesForRelay.keys) {
         final participantShares =
             session.dkgRound2PackagesForRelay[participantId]!;
-        if (participantShares.containsKey(senderId)) {
-          packagesForRequester[_idToString(
-                  threshold.bigIntToBytes(participantId.toScalar()))] =
-              jsonEncode(participantShares[senderId]!.toJson());
+        if (participantShares.containsKey(identifier)) {
+          packagesForRequester[_idToString(participantId)] =
+              jsonEncode(participantShares[identifier]!.toJson());
         }
       }
 
-      final policyState = await _getPolicyState(request.deviceId);
+      if (session.completerStep3.isCompleted) {
+        _log.info('[$userIdHex] DKGStep3: Server computing KeyPackage...');
 
-      if (policyState.normalPolicy == null &&
-          session.completerStep3.isCompleted) {
-        _log.info(
-            '[${request.deviceId}] DKGStep3: Server computing KeyPackage...');
+        final userSigningIdentifier =
+            threshold.Identifier.derive(Uint8List.fromList(userId));
+
+        Uint8List? userRecoveryIdentifier;
+
         final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
-          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-          if (id != serverId) {
-            allRound1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          final decodedPkg = threshold.Round1Package.fromJson(jsonDecode(v));
+          if (k != serverIdentifier) {
+            allRound1Pkgs[k] = decodedPkg;
+
+            if (k != userSigningIdentifier && userRecoveryIdentifier == null) {
+              userRecoveryIdentifier =
+                  threshold.elemSerializeCompressed(decodedPkg.verifyingKey.E);
+            }
           }
         });
 
@@ -340,31 +395,35 @@ class MPCWalletService extends MPCWalletServiceBase {
             allRound1Pkgs,
             allReceivedSharesPoints);
 
-        policyState.normalPolicy = NormalPolicy(
+        final normalPolicy = NormalPolicy(
           id: "normal policies",
           keyPackage: keyPkg,
           publicKeyPackage: pubKeyPkg,
         );
-        _log.info(
-            '[${request.deviceId}] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
+
+        // fresh policy state
+        final userRecoveryIdHex = hex.encode(userRecoveryIdentifier!);
+        final policyState =
+            await _newPolicyState(userIdHex, userRecoveryIdHex, normalPolicy);
+        _policies[userIdHex] = policyState;
+
+        _log.info('[$userId] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
 
         // Persistence
         try {
           await policyStore.savePolicy(
-              request.deviceId, jsonEncode(policyState.toJson()));
-          await dkgStore.saveSession(
-              request.deviceId, jsonEncode(session.toJson()));
-          _log.info('[${request.deviceId}] Saved DKG completion state.');
+              userIdHex, jsonEncode(policyState.toJson()));
+          await dkgStore.saveSession(userIdHex, jsonEncode(session.toJson()));
+          _log.info('[$userId] Saved DKG completion state.');
         } catch (e) {
-          _log.severe(
-              '[${request.deviceId}] Error saving DKG complete state: $e');
+          _log.severe('[$userId] Error saving DKG complete state: $e');
         }
       }
 
       return DKGStep3Response()
         ..round2PackagesForMe.addAll(packagesForRequester);
     } catch (e) {
-      _log.severe('[${request.deviceId}] DKGStep3 Error: $e');
+      _log.severe('[$userIdHex] DKGStep3 Error: $e');
       session.reset();
       rethrow;
     }
@@ -374,14 +433,14 @@ class MPCWalletService extends MPCWalletServiceBase {
 
   // Helper to decode tx and calculate spent amount
   Future<BigInt> _calculateSpentAmount(Uint8List fullTxBytes,
-      threshold.PublicKeyPackage groupKey, String deviceId) async {
+      threshold.PublicKeyPackage groupKey, String userId) async {
     if (fullTxBytes.isEmpty) return BigInt.zero;
 
     try {
       final tx = BtcTransaction.deserialize(fullTxBytes);
 
       BigInt totalIn = BigInt.zero;
-      final utxoState = await _getUtxoState(deviceId);
+      final utxoState = await _getUtxoState(userId);
       final clientUtxos = utxoState.utxos;
       for (final input in tx.inputs) {
         for (final y in clientUtxos) {
@@ -423,11 +482,11 @@ class MPCWalletService extends MPCWalletServiceBase {
   Future<ProtectedPolicy?> _getPolicy(
     List<int> txMessage,
     threshold.PublicKeyPackage groupKey,
-    String deviceId,
+    String userId,
   ) async {
-    final policies = await _getPolicyState(deviceId);
+    final policies = await _getPolicyState(userId);
     final spent = await _calculateSpentAmount(
-        Uint8List.fromList(txMessage), groupKey, deviceId);
+        Uint8List.fromList(txMessage), groupKey, userId);
 
     // Check cumulative spending for active policies
     final now = DateTime.now();
@@ -464,36 +523,31 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<SignStep1Response> signStep1(
       ServiceCall call, SignStep1Request request) async {
-    final session = await _getSigningSession(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    final session = await _getSigningSession(userIdHex);
     try {
-      final policyState = await _getPolicyState(request.deviceId);
-      final senderId = threshold.Identifier.deserialize(
-          Uint8List.fromList(request.identifier));
-      _log.info(
-          '[${request.deviceId}] SignStep1: Received from ${_idToString(request.identifier)}');
+      final policyState = await _getPolicyState(userIdHex);
+      _log.info('[$userId] SignStep1: Received from ${userIdHex}');
 
-      // Ensure we have a key for this session
-      if (policyState.normalPolicy == null) {
-        throw GrpcError.failedPrecondition(
-            "DKG not completed for device ${request.deviceId}");
-      }
-
-      var serverKeyPackage = policyState.normalPolicy!.keyPackage;
+      final userIdentifier =
+          threshold.Identifier.derive(Uint8List.fromList(userId));
+      var serverKeyPackage = policyState.normalPolicy.keyPackage;
 
       final policy = await _getPolicy(
         request.fullTransaction,
-        policyState.normalPolicy!.publicKeyPackage,
-        request.deviceId,
+        policyState.normalPolicy.publicKeyPackage,
+        userIdHex,
       );
 
       if (policy != null) {
         serverKeyPackage = policy.keyPackage;
         session.currentPolicyId = policy.id;
         _log.info(
-            '[${request.deviceId}] SignStep1: Switched to Protected Policy: ${policy.id}');
+            '[$userId] SignStep1: Switched to Protected Policy: ${policy.id}');
       } else {
-        _log.info(
-            '[${request.deviceId}] SignStep1: Using Normal Policy (Default)');
+        _log.info('[$userId] SignStep1: Using Normal Policy (Default)');
       }
 
       // ---------------------------
@@ -502,15 +556,13 @@ class MPCWalletService extends MPCWalletServiceBase {
           Uint8List.fromList(request.hidingCommitment));
       final bindingP = threshold.elemDeserializeCompressed(
           Uint8List.fromList(request.bindingCommitment));
-      session.signCommitmentsReceived[senderId] =
+      session.userCommitments =
           frost_comm.SigningCommitments(bindingP, hidingP);
 
       if (session.serverNonce == null) {
-        _log.info(
-            '[${request.deviceId}] SignStep1: Server generating commitments...');
+        _log.info('[$userId] SignStep1: Server generating commitments...');
         session.serverNonce = frost_comm.newNonce(serverKeyPackage.secretShare);
         session.serverCommitments = session.serverNonce!.commitments;
-        session.signCommitmentsReceived[serverId] = session.serverCommitments!;
       }
 
       if (session.messageToSign == null && request.messageToSign.isNotEmpty) {
@@ -520,33 +572,41 @@ class MPCWalletService extends MPCWalletServiceBase {
       // Calculate spent amount for history tracking
       final spent = await _calculateSpentAmount(
           Uint8List.fromList(request.fullTransaction),
-          policyState.normalPolicy!.publicKeyPackage,
-          request.deviceId);
+          policyState.normalPolicy.publicKeyPackage,
+          userIdHex);
       session.pendingAmount = spent;
 
-      if (session.signCommitmentsReceived.length >= thresholdCount) {
+      if (session.userCommitments != null &&
+          session.serverCommitments != null) {
         if (!session.completerSignStep1.isCompleted)
           session.completerSignStep1.complete();
       } else {
         await session.completerSignStep1.future;
       }
 
+      final serverIdentifier = serverKeyPackage.identifier;
       final responseCommitments = <String, SignStep1Response_Commitment>{};
-      for (final entry in session.signCommitmentsReceived.entries) {
-        final comm = entry.value;
-        responseCommitments[
-                _idToString(threshold.bigIntToBytes(entry.key.toScalar()))] =
-            SignStep1Response_Commitment(
+      final signCommitmentList = [
+        (serverIdentifier, session.serverCommitments!),
+        (userIdentifier, session.userCommitments!)
+      ];
+
+      session.signCommitmentList = {};
+
+      for (final (id, comm) in signCommitmentList) {
+        responseCommitments[_idToString(id)] = SignStep1Response_Commitment(
           hiding: threshold.elemSerializeCompressed(comm.hiding),
           binding: threshold.elemSerializeCompressed(comm.binding),
         );
+
+        session.signCommitmentList[id] = comm;
       }
 
       return SignStep1Response()
         ..commitments.addAll(responseCommitments)
         ..messageToSign = session.messageToSign!;
     } catch (e) {
-      _log.severe('[${request.deviceId}] SignStep1 Error: $e');
+      _log.severe('[$userId] SignStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -555,17 +615,21 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<SignStep2Response> signStep2(
       ServiceCall call, SignStep2Request request) async {
-    final session = await _getSigningSession(request.deviceId);
+    final userId = request.userId;
+
+    final userIdHex = hex.encode(userId);
+
+    _log.info('[$userId] SignStep2: Received from ${userIdHex}');
+
+    final session = await _getSigningSession(userIdHex);
     try {
-      final policyState = await _getPolicyState(request.deviceId);
+      final policyState = await _getPolicyState(userIdHex);
 
-      final senderId = threshold.Identifier.deserialize(
-          Uint8List.fromList(request.identifier));
-      _log.info(
-          '[${request.deviceId}] SignStep2: Received from ${_idToString(request.identifier)}');
+      final userIdentifier =
+          threshold.Identifier.derive(Uint8List.fromList(userId));
 
-      var serverKeyPackage = policyState.normalPolicy!.keyPackage;
-      var serverPubPackage = policyState.normalPolicy!.publicKeyPackage;
+      var serverKeyPackage = policyState.normalPolicy.keyPackage;
+      var serverPubPackage = policyState.normalPolicy.publicKeyPackage;
 
       if (session.currentPolicyId != null) {
         serverKeyPackage =
@@ -576,20 +640,22 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       final share =
           threshold.bytesToBigInt(Uint8List.fromList(request.signatureShare));
-      session.signRound2Shares[senderId] = share;
+      session.signRound2Shares[userIdentifier] = share;
 
-      if (!session.signRound2Shares.containsKey(serverId) &&
+      final serverIdentifier = serverKeyPackage.identifier;
+
+      if (!session.signRound2Shares.containsKey(serverIdentifier) &&
           session.serverNonce != null) {
-        _log.info('[${request.deviceId}] SignStep2: Server computing share...');
+        _log.info('[$userId] SignStep2: Server computing share...');
         final signingPkg = frost_comm.SigningPackage(
-            session.signCommitmentsReceived, session.messageToSign!);
+            session.signCommitmentList, session.messageToSign!);
 
         // Explicitly apply Taproot tweak (Key Path Spending)
         serverKeyPackage = serverKeyPackage.tweak(null);
 
         final serverShareObj =
             frost.sign(signingPkg, session.serverNonce!, serverKeyPackage);
-        session.signRound2Shares[serverId] = serverShareObj.s;
+        session.signRound2Shares[serverIdentifier] = serverShareObj.s;
       }
 
       if (session.signRound2Shares.length >= thresholdCount) {
@@ -600,7 +666,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       }
 
       final signingPkg = frost_comm.SigningPackage(
-          session.signCommitmentsReceived, session.messageToSign!);
+          session.signCommitmentList, session.messageToSign!);
       final sharesMap = <threshold.Identifier, frost.SignatureShare>{};
       session.signRound2Shares.forEach((id, val) {
         sharesMap[id] = frost.SignatureShare(val);
@@ -613,7 +679,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       final signature =
           frost.aggregate(signingPkg, sharesMap, serverPubPackage);
-      _log.info('[${request.deviceId}] SignStep2: Aggregated.');
+      _log.info('[$userId] SignStep2: Aggregated.');
 
       // Commit Pending Amount to History
       if (session.pendingAmount != null &&
@@ -621,15 +687,14 @@ class MPCWalletService extends MPCWalletServiceBase {
         policyState.spendingHistory
             .add(SpendingEntry(DateTime.now(), session.pendingAmount!));
         _log.info(
-            '[${request.deviceId}] Policy Update: Added spending of ${session.pendingAmount} sats. Total History: ${policyState.spendingHistory.length}');
+            '[$userId] Policy Update: Added spending of ${session.pendingAmount} sats. Total History: ${policyState.spendingHistory.length}');
 
         // Persist Policy State (spending history update)
         try {
           await policyStore.savePolicy(
-              request.deviceId, jsonEncode(policyState.toJson()));
+              hex.encode(userId), jsonEncode(policyState.toJson()));
         } catch (e) {
-          _log.severe(
-              '[${request.deviceId}] Error saving policy spending history: $e');
+          _log.severe('[$userId] Error saving policy spending history: $e');
         }
       }
 
@@ -639,7 +704,7 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       return response;
     } catch (e) {
-      _log.severe('[${request.deviceId}] SignStep2 Error: $e');
+      _log.severe('[$userId] SignStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -650,33 +715,41 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep1Response> refreshStep1(
       ServiceCall call, RefreshStep1Request request) async {
-    final session = await _getRefreshSession(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    _log.info('[$userId] RefreshStep1: Received PubPackage from $userIdHex');
+
+    final session = await _getRefreshSession(userIdHex);
+
+    final userIdentifier =
+        threshold.Identifier.derive(Uint8List.fromList(userId));
+
     try {
-      final policyState = await _getPolicyState(request.deviceId);
-      final clientIdHex = _idToString(request.identifier);
-      _log.info(
-          '[${request.deviceId}] RefreshStep1: Received PubPackage from $clientIdHex');
+      final policyState = await _getPolicyState(userIdHex);
 
       // Auto-Reset if previous session finished
       if (session.completerRefreshStep3.isCompleted) {
         _log.info(
-            '[${request.deviceId}] RefreshStep1: Resetting previous refresh session...');
+            '[$userId] RefreshStep1: Resetting previous refresh session...');
         session.reset();
         // Since reset() clears everything including refreshCreationTime, we need to re-initialize below
       }
 
-      session.refreshRound1Packages[clientIdHex] = request.round1Package;
+      session.refreshRound1Packages[userIdentifier] = request.round1Package;
 
       // Server Init for this refresh session
       if (session.serverRefreshRound1Secret == null) {
-        _log.info(
-            '[${request.deviceId}] Server: Generating Refresh secrets...');
-        if (policyState.normalPolicy == null) {
-          throw GrpcError.failedPrecondition("No key to refresh");
-        }
+        _log.info('[$userId] Server: Generating Refresh secrets...');
+
+        final serverIdentifier = policyState.normalPolicy.keyPackage.identifier;
+        final serverId = threshold.elemSerializeCompressed(
+            policyState.normalPolicy.publicKeyPackage.verifyingKey.E);
+
+        session.serverId = serverId;
 
         final (r1Secret, r1Public) = threshold.dkgRefreshPart1(
-          serverId,
+          serverIdentifier,
           2,
           thresholdCount,
         );
@@ -689,7 +762,7 @@ class MPCWalletService extends MPCWalletServiceBase {
         }
 
         session.serverRefreshRound1Secret = r1Secret;
-        session.refreshRound1Packages[serverIdHex] =
+        session.refreshRound1Packages[serverIdentifier] =
             jsonEncode(r1Public.toJson());
       }
 
@@ -701,11 +774,12 @@ class MPCWalletService extends MPCWalletServiceBase {
       }
 
       return RefreshStep1Response()
-        ..round1Packages.addAll(session.refreshRound1Packages)
+        ..round1Packages
+            .addAll(_stringKeyedPackageMap(session.refreshRound1Packages))
         ..startTime = Int64(session.refreshCreationTime!.millisecondsSinceEpoch)
         ..policyId = session.refreshId!;
     } catch (e) {
-      _log.severe('[${request.deviceId}] RefreshStep1 Error: $e');
+      _log.severe('[$userId] RefreshStep1 Error: $e');
       session.reset();
       rethrow;
     }
@@ -714,18 +788,25 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep2Response> refreshStep2(
       ServiceCall call, RefreshStep2Request request) async {
-    final session = await _getRefreshSession(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    final session = await _getRefreshSession(userIdHex);
+
+    if (session.serverId == null) {
+      throw StateError('Server ID not initialized for session $userIdHex');
+    }
+
+    final serverIdentifier = threshold.Identifier.derive(session.serverId!);
     try {
       await session.completerRefreshStep1.future;
 
       if (session.refreshRound2PackagesLocal.isEmpty) {
-        _log.info(
-            '[${request.deviceId}] RefreshStep2: Server computing shares...');
+        _log.info('[$userId] RefreshStep2: Server computing shares...');
         final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.refreshRound1Packages.forEach((k, v) {
-          final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-          if (id != serverId) {
-            round1Pkgs[id] = threshold.Round1Package.fromJson(jsonDecode(v));
+          if (k != serverIdentifier) {
+            round1Pkgs[k] = threshold.Round1Package.fromJson(jsonDecode(v));
           }
         });
 
@@ -740,9 +821,10 @@ class MPCWalletService extends MPCWalletServiceBase {
         session.completerRefreshStep2.complete();
 
       return RefreshStep2Response()
-        ..allRound1Packages.addAll(session.refreshRound1Packages);
+        ..allRound1Packages
+            .addAll(_stringKeyedPackageMap(session.refreshRound1Packages));
     } catch (e) {
-      _log.severe('[${request.deviceId}] RefreshStep2 Error: $e');
+      _log.severe('[$userId] RefreshStep2 Error: $e');
       session.reset();
       rethrow;
     }
@@ -751,14 +833,23 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<RefreshStep3Response> refreshStep3(
       ServiceCall call, RefreshStep3Request request) async {
-    final session = await _getRefreshSession(request.deviceId);
-    try {
-      final policyState = await _getPolicyState(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
 
-      final senderId = threshold.Identifier.deserialize(
-          Uint8List.fromList(request.identifier));
-      _log.info(
-          '[${request.deviceId}] RefreshStep3: Received Shares from ${_idToString(request.identifier)}');
+    _log.info('[$userId] RefreshStep3: Received Shares from ${userIdHex}');
+
+    final session = await _getRefreshSession(userIdHex);
+
+    if (session.serverId == null) {
+      throw StateError('Server ID not initialized for session $userIdHex');
+    }
+    final serverIdentifier = threshold.Identifier.derive(session.serverId!);
+
+    try {
+      final policyState = await _getPolicyState(userIdHex);
+
+      final userIdentifier =
+          threshold.Identifier.derive(Uint8List.fromList(userId));
 
       await session.completerRefreshStep2.future;
 
@@ -769,18 +860,18 @@ class MPCWalletService extends MPCWalletServiceBase {
         final pkg = threshold.Round2Package.fromJson(jsonDecode(entry.value));
         sharesFromSenderForOthers[recipientId] = pkg;
 
-        if (recipientId == serverId) {
-          session.refreshRound2PackagesReceived[senderId] = pkg;
+        if (recipientId == serverIdentifier) {
+          session.refreshRound2PackagesReceived[userIdentifier] = pkg;
         }
       }
-      session.refreshRound2PackagesForRelay[senderId] =
+      session.refreshRound2PackagesForRelay[userIdentifier] =
           sharesFromSenderForOthers;
 
       // Determine N based on session state
       int n = 2;
 
       if (session.refreshRound2PackagesForRelay.length == n - 1) {
-        session.refreshRound2PackagesForRelay[serverId] =
+        session.refreshRound2PackagesForRelay[serverIdentifier] =
             session.refreshRound2PackagesLocal;
         if (!session.completerRefreshStep3.isCompleted)
           session.completerRefreshStep3.complete();
@@ -792,24 +883,21 @@ class MPCWalletService extends MPCWalletServiceBase {
       for (final participantId in session.refreshRound2PackagesForRelay.keys) {
         final participantShares =
             session.refreshRound2PackagesForRelay[participantId]!;
-        if (participantShares.containsKey(senderId)) {
-          packagesForRequester[_idToString(
-                  threshold.bigIntToBytes(participantId.toScalar()))] =
-              jsonEncode(participantShares[senderId]!.toJson());
+        if (participantShares.containsKey(userIdentifier)) {
+          packagesForRequester[_idToString(participantId)] =
+              jsonEncode(participantShares[userIdentifier]!.toJson());
         }
       }
 
       if (session.completerRefreshStep3.isCompleted) {
         if (session.serverRefreshRound2Secret != null) {
-          _log.info(
-              '[${request.deviceId}] RefreshStep3: Server computing New Key...');
+          _log.info('[$userId] RefreshStep3: Server computing New Key...');
 
           final allRound1Pkgs =
               <threshold.Identifier, threshold.Round1Package>{};
           session.refreshRound1Packages.forEach((k, v) {
-            final id = threshold.Identifier(BigInt.parse(k, radix: 16));
-            if (id != serverId) {
-              allRound1Pkgs[id] =
+            if (k != serverIdentifier) {
+              allRound1Pkgs[k] =
                   threshold.Round1Package.fromJson(jsonDecode(v));
             }
           });
@@ -818,8 +906,8 @@ class MPCWalletService extends MPCWalletServiceBase {
               <threshold.Identifier, threshold.Round2Package>{};
           allReceivedSharesPoints.addAll(session.refreshRound2PackagesReceived);
 
-          final normalKey = policyState.normalPolicy!.keyPackage;
-          final normalPub = policyState.normalPolicy!.publicKeyPackage;
+          final normalKey = policyState.normalPolicy.keyPackage;
+          final normalPub = policyState.normalPolicy.publicKeyPackage;
 
           final (keyPkg, pubKeyPkg) = threshold.dkgRefreshPart3(
               session.serverRefreshRound2Secret!,
@@ -842,12 +930,11 @@ class MPCWalletService extends MPCWalletServiceBase {
           // Persist New Policy and Refresh Session
           try {
             await policyStore.savePolicy(
-                request.deviceId, jsonEncode(policyState.toJson()));
+                userIdHex, jsonEncode(policyState.toJson()));
             await refreshStore.saveSession(
-                request.deviceId, jsonEncode(session.toJson()));
+                userIdHex, jsonEncode(session.toJson()));
           } catch (e) {
-            _log.severe(
-                '[${request.deviceId}] Error saving Refreshed Policy: $e');
+            _log.severe('[$userId] Error saving Refreshed Policy: $e');
           }
 
           // Prevent re-computation
@@ -857,7 +944,7 @@ class MPCWalletService extends MPCWalletServiceBase {
           if (normalPub.verifyingKey.E.getEncoded(true).toString() !=
               pubKeyPkg.verifyingKey.E.getEncoded(true).toString()) {
             _log.severe(
-                '[${request.deviceId}] CRITICAL: Group key changed during refresh! This indicates a protocol failure or attack.');
+                '[$userId] CRITICAL: Group key changed during refresh! This indicates a protocol failure or attack.');
             throw GrpcError.internal(
                 'Protocol violation: Group key changed during refresh');
           }
@@ -873,7 +960,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       return RefreshStep3Response()
         ..round2PackagesForMe.addAll(packagesForRequester);
     } catch (e) {
-      _log.severe('[${request.deviceId}] RefreshStep3 Error: $e');
+      _log.severe('[$userId] RefreshStep3 Error: $e');
       session.reset();
       rethrow;
     }
@@ -882,18 +969,16 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<GetPolicyIdResponse> getPolicyId(
       ServiceCall call, GetPolicyIdRequest request) async {
-    final policyState = await _getPolicyState(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
 
-    if (policyState.normalPolicy == null) {
-      throw GrpcError.failedPrecondition(
-          "DKG not completed for device ${request.deviceId}");
-    }
+    final policyState = await _getPolicyState(userIdHex);
 
     // request.txMessage is already List<int> (bytes)
     final policy = await _getPolicy(
       request.txMessage,
-      policyState.normalPolicy!.publicKeyPackage,
-      request.deviceId,
+      policyState.normalPolicy.publicKeyPackage,
+      userIdHex,
     );
 
     return GetPolicyIdResponse()..policyId = policy?.id ?? "";
@@ -908,12 +993,15 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<BroadcastTransactionResponse> broadcastTransaction(
       ServiceCall call, BroadcastTransactionRequest request) async {
-    _log.info(
-        '[${request.deviceId}] Broadcasting Tx: ${request.txHex.substring(0, 20)}...');
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
 
-    final policyState = await _getPolicyState(request.deviceId);
+    _log.info(
+        '[$userId] Broadcasting Tx: ${request.txHex.substring(0, 20)}...');
+
+    final policyState = await _getPolicyState(userIdHex);
     final (txId, _) = await bitcoinService.broadcastTransaction(
-        request.deviceId, request.txHex, policyState);
+        userIdHex, request.txHex, policyState);
 
     return BroadcastTransactionResponse()..txId = txId;
   }
@@ -921,10 +1009,13 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<FetchHistoryResponse> fetchHistory(
       ServiceCall call, FetchHistoryRequest request) async {
-    final policyState = await _getPolicyState(request.deviceId);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    final policyState = await _getPolicyState(userIdHex);
 
     // Fetch from BitcoinHistoryService
-    final utxos = await historyService.getUtxos(request.deviceId, policyState);
+    final utxos = await historyService.getUtxos(userIdHex, policyState);
 
     return FetchHistoryResponse()..utxos.addAll(utxos);
   }
@@ -932,16 +1023,18 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Future<FetchRecentTransactionsResponse> fetchRecentTransactions(
       ServiceCall call, FetchRecentTransactionsRequest request) async {
-    final policyState = await _getPolicyState(request.deviceId);
-    try {
-      final txs = await historyService.getRecentTransactions(
-          request.deviceId, policyState);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
 
-      _log.info(
-          '[${request.deviceId}] FetchRecentTransactionsResponse: ${txs.length} txs');
+    final policyState = await _getPolicyState(userIdHex);
+    try {
+      final txs =
+          await historyService.getRecentTransactions(userIdHex, policyState);
+
+      _log.info('[$userId] FetchRecentTransactionsResponse: ${txs.length} txs');
       return FetchRecentTransactionsResponse()..transactions.addAll(txs);
     } catch (e) {
-      _log.severe('[${request.deviceId}] fetchRecentTransactions Error: $e');
+      _log.severe('[$userId] fetchRecentTransactions Error: $e');
       rethrow;
     }
   }
@@ -949,8 +1042,11 @@ class MPCWalletService extends MPCWalletServiceBase {
   @override
   Stream<TransactionNotification> subscribeToHistory(
       ServiceCall call, SubscribeToHistoryRequest request) async* {
-    final policyState = await _getPolicyState(request.deviceId);
-    yield* historyService.subscribe(request.deviceId, policyState);
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    final policyState = await _getPolicyState(userIdHex);
+    yield* historyService.subscribe(userIdHex, policyState);
   }
 } // End of MPCWalletService
 

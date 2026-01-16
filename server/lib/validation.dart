@@ -4,25 +4,22 @@ import 'package:grpc/grpc.dart';
 /// Input validation utilities for gRPC request parameters.
 /// Throws GrpcError with appropriate status codes on validation failure.
 class InputValidator {
-  // Device ID: 32 hex characters (16 bytes)
-  static final _deviceIdPattern = RegExp(r'^[a-fA-F0-9]{32}$');
+  // User ID: either 32 hex chars (pre-DKG session) or 66 hex chars (compressed key)
+  static final _userIdPattern =
+      RegExp(r'^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{66}$');
 
   // Hex string pattern
   static final _hexPattern = RegExp(r'^[a-fA-F0-9]*$');
 
-  /// Validate device ID format (32 hex characters).
+  /// Validate user ID format (32 hex characters pre-DKG or 66 after DKG).
   /// Throws GrpcError.invalidArgument if invalid.
-  static void validateDeviceId(String deviceId) {
-    if (deviceId.isEmpty) {
-      throw GrpcError.invalidArgument('device_id is required');
+  static void validateUserId(String userId) {
+    if (userId.isEmpty) {
+      throw GrpcError.invalidArgument('user_id is required');
     }
-    if (deviceId.length > 64) {
+    if (!_userIdPattern.hasMatch(userId)) {
       throw GrpcError.invalidArgument(
-          'device_id exceeds maximum length (64 characters)');
-    }
-    if (!_deviceIdPattern.hasMatch(deviceId)) {
-      throw GrpcError.invalidArgument(
-          'device_id must be 32 hex characters (got ${deviceId.length} chars)');
+          'user_id must be 32 or 66 hex characters (got ${userId.length} chars)');
     }
   }
 

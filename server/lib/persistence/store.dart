@@ -65,39 +65,39 @@ class GenericStore {
 class DKGSessionStore extends GenericStore {
   DKGSessionStore() : super('dkg_sessions');
 
-  Future<void> saveSession(String deviceId, String jsonData) =>
-      save(deviceId, jsonData);
-  String? getSession(String deviceId) => get(deviceId);
+  Future<void> saveSession(String userId, String jsonData) =>
+      save(userId, jsonData);
+  String? getSession(String userId) => get(userId);
 }
 
 class SigningSessionStore extends GenericStore {
   SigningSessionStore() : super('signing_sessions');
 
-  Future<void> saveSession(String deviceId, String jsonData) =>
-      save(deviceId, jsonData);
-  String? getSession(String deviceId) => get(deviceId);
+  Future<void> saveSession(String userId, String jsonData) =>
+      save(userId, jsonData);
+  String? getSession(String userId) => get(userId);
 }
 
 class RefreshSessionStore extends GenericStore {
   RefreshSessionStore() : super('refresh_sessions');
 
-  Future<void> saveSession(String deviceId, String jsonData) =>
-      save(deviceId, jsonData);
-  String? getSession(String deviceId) => get(deviceId);
+  Future<void> saveSession(String userId, String jsonData) =>
+      save(userId, jsonData);
+  String? getSession(String userId) => get(userId);
 }
 
 class PolicyStore extends GenericStore {
   PolicyStore() : super('policies');
 
-  Future<void> savePolicy(String deviceId, String jsonData) =>
-      save(deviceId, jsonData);
-  String? getPolicy(String deviceId) => get(deviceId);
+  Future<void> savePolicy(String userId, String jsonData) =>
+      save(userId, jsonData);
+  String? getPolicy(String userId) => get(userId);
 }
 
 class UtxoStore extends GenericStore {
   UtxoStore() : super('utxos');
 
-  Future<void> saveUtxo(String deviceId, String jsonData) =>
-      save(deviceId, jsonData);
-  String? getUtxo(String deviceId) => get(deviceId);
+  Future<void> saveUtxo(String userId, String jsonData) =>
+      save(userId, jsonData);
+  String? getUtxo(String userId) => get(userId);
 }

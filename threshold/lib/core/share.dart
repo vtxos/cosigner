@@ -38,6 +38,17 @@ class VerifyingKey {
     }
     return this;
   }
+
+  factory VerifyingKey.fromJson(Map<String, dynamic> json) {
+    final bytes =
+        Uint8List.fromList((json['E'] as List).map((e) => e as int).toList());
+    final point = elemDeserializeCompressed(bytes);
+    return VerifyingKey(E: point);
+  }
+
+  Map<String, dynamic> toJson() => {
+        'E': elemSerializeCompressed(E).toList(),
+      };
 }
 
 class ThresholdShare {
