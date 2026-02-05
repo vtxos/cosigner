@@ -16,3 +16,7 @@ export 'frost/errors.dart';
 export 'frost/hasher.dart';
 export 'frost/signing.dart';
 export 'frost/utils.dart';
+
+// Authentication
+export 'auth/auth_message.dart';
+export 'auth/auth_signer.dart';

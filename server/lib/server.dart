@@ -25,6 +25,7 @@ import 'policy.dart';
 import 'bitcoin.dart';
 import 'bitcoin_service.dart';
 import 'config.dart';
+import 'auth_verifier.dart';
 
 final _log = Logger('MPCWalletService');
 
@@ -53,6 +54,9 @@ class MPCWalletService extends MPCWalletServiceBase {
   final BitcoinService bitcoinService;
   final BitcoinHistoryService historyService;
 
+  // Authentication verifier for request signatures
+  final AuthVerifier authVerifier;
+
   static const int totalParticipants = 3;
   static const int thresholdCount = 2;
 
@@ -64,7 +68,8 @@ class MPCWalletService extends MPCWalletServiceBase {
     required this.utxoStore,
     required this.bitcoinService,
     required this.historyService,
-  });
+    AuthVerifier? authVerifier,
+  }) : authVerifier = authVerifier ?? AuthVerifier();
 
   Future<DKGSessionState> _getDKGSession(String userId) async {
     return await _dkgLock.synchronized(() {
@@ -526,6 +531,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
 
+    // Verify authentication signature
+    authVerifier.verifySignStep1(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
+
     final session = await _getSigningSession(userIdHex);
     try {
       final policyState = await _getPolicyState(userIdHex);
@@ -618,6 +630,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
 
     final userIdHex = hex.encode(userId);
+
+    // Verify authentication signature
+    authVerifier.verifySignStep2(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
 
     _log.info('[$userId] SignStep2: Received from ${userIdHex}');
 
@@ -718,6 +737,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
 
+    // Verify authentication signature
+    authVerifier.verifyRefreshStep1(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
+
     _log.info('[$userId] RefreshStep1: Received PubPackage from $userIdHex');
 
     final session = await _getRefreshSession(userIdHex);
@@ -791,6 +817,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
 
+    // Verify authentication signature
+    authVerifier.verifyRefreshStep2(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
+
     final session = await _getRefreshSession(userIdHex);
 
     if (session.serverId == null) {
@@ -835,6 +868,13 @@ class MPCWalletService extends MPCWalletServiceBase {
       ServiceCall call, RefreshStep3Request request) async {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
+
+    // Verify authentication signature
+    authVerifier.verifyRefreshStep3(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
 
     _log.info('[$userId] RefreshStep3: Received Shares from ${userIdHex}');
 
@@ -972,6 +1012,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
 
+    // Verify authentication signature
+    authVerifier.verifyGetPolicyId(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
+
     final policyState = await _getPolicyState(userIdHex);
 
     // request.txMessage is already List<int> (bytes)
@@ -1012,6 +1059,13 @@ class MPCWalletService extends MPCWalletServiceBase {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
 
+    // Verify authentication signature
+    authVerifier.verifyFetchHistory(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
+
     final policyState = await _getPolicyState(userIdHex);
 
     // Fetch from BitcoinHistoryService
@@ -1025,6 +1079,13 @@ class MPCWalletService extends MPCWalletServiceBase {
       ServiceCall call, FetchRecentTransactionsRequest request) async {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
+
+    // Verify authentication signature
+    authVerifier.verifyFetchRecentTransactions(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
 
     final policyState = await _getPolicyState(userIdHex);
     try {
@@ -1044,6 +1105,13 @@ class MPCWalletService extends MPCWalletServiceBase {
       ServiceCall call, SubscribeToHistoryRequest request) async* {
     final userId = request.userId;
     final userIdHex = hex.encode(userId);
+
+    // Verify authentication signature
+    authVerifier.verifySubscribeHistory(
+      userId: Uint8List.fromList(userId),
+      signature: Uint8List.fromList(request.signature),
+      timestampMs: request.timestampMs.toInt(),
+    );
 
     final policyState = await _getPolicyState(userIdHex);
     yield* historyService.subscribe(userIdHex, policyState);

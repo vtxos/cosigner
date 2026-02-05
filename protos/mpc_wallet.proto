@@ -69,8 +69,9 @@ message SignStep1Request {
   bytes hiding_commitment = 2;
   bytes binding_commitment = 3;
   bytes message_to_sign = 4;
-  bytes signature = 5; // Pre-signature for authorization
+  bytes signature = 5; // Schnorr signature over auth message for authentication
   bytes full_transaction = 6;
+  int64 timestamp_ms = 7; // Unix timestamp in milliseconds for replay protection
 }
 
 
@@ -87,7 +88,8 @@ message SignStep1Response {
 message SignStep2Request {
    bytes user_id = 1;
    bytes signature_share = 3;
-   bytes signature = 4; // Signature over parameters for authentication
+   bytes signature = 4; // Schnorr signature over auth message for authentication
+   int64 timestamp_ms = 5; // Unix timestamp in milliseconds for replay protection
 }
 
 message UtxoInfo {
@@ -111,7 +113,8 @@ message RefreshStep1Request {
   string round1_package = 3; // JSON
   int64 threshold_amount = 4;
   int64 interval = 5;
-  bytes signature = 6; // Signature over parameters for authentication
+  bytes signature = 6; // Schnorr signature over auth message for authentication
+  int64 timestamp_ms = 7; // Unix timestamp in milliseconds for replay protection
 }
 
 message RefreshStep1Response {
@@ -122,10 +125,11 @@ message RefreshStep1Response {
 
 message RefreshStep2Request {
   bytes user_id = 1;
-  // In DKG Step 2 we sent round1_package again, but strict state management 
+  // In DKG Step 2 we sent round1_package again, but strict state management
   // might not need it if session is locked. We will mirror DKG for consistency.
-  string round1_package = 3; 
-  bytes signature = 4; // Signature over parameters for authentication
+  string round1_package = 3;
+  bytes signature = 4; // Schnorr signature over auth message for authentication
+  int64 timestamp_ms = 5; // Unix timestamp in milliseconds for replay protection
 }
 
 message RefreshStep2Response {
@@ -135,7 +139,8 @@ message RefreshStep2Response {
 message RefreshStep3Request {
    bytes user_id = 1;
    map<string, string> round2_packages_for_others = 3;
-   bytes signature = 4; // Signature over parameters for authentication
+   bytes signature = 4; // Schnorr signature over auth message for authentication
+   int64 timestamp_ms = 5; // Unix timestamp in milliseconds for replay protection
 }
 
 message RefreshStep3Response {
@@ -147,7 +152,8 @@ message CreateSpendingPolicyRequest {
     int64 threshold_sats = 2;
     int64 start_time = 3; // timestamp seconds
     int64 interval_seconds = 4; // duration in seconds
-    bytes signature = 5; // Signature over policy parameters for authentication
+    bytes signature = 5; // Schnorr signature over auth message for authentication
+    int64 timestamp_ms = 6; // Unix timestamp in milliseconds for replay protection
 }
 
 message CreateSpendingPolicyResponse {
@@ -158,7 +164,8 @@ message CreateSpendingPolicyResponse {
 message GetPolicyIdRequest {
     bytes user_id = 1;
     bytes tx_message = 2; // Transaction bytes
-    bytes signature = 3; // Signature over tx_message for authentication
+    bytes signature = 3; // Schnorr signature over auth message for authentication
+    int64 timestamp_ms = 4; // Unix timestamp in milliseconds for replay protection
 }
 
 message GetPolicyIdResponse {
@@ -177,7 +184,8 @@ message BroadcastTransactionResponse {
 
 message FetchHistoryRequest {
     bytes user_id = 1;
-    bytes signature = 2; // Signature over user_id for authentication
+    bytes signature = 2; // Schnorr signature over auth message for authentication
+    int64 timestamp_ms = 3; // Unix timestamp in milliseconds for replay protection
 }
 
 message FetchHistoryResponse {
@@ -187,7 +195,8 @@ message FetchHistoryResponse {
 
 message FetchRecentTransactionsRequest {
     bytes user_id = 1;
-    bytes signature = 2; // Signature over user_id for authentication
+    bytes signature = 2; // Schnorr signature over auth message for authentication
+    int64 timestamp_ms = 3; // Unix timestamp in milliseconds for replay protection
 }
 
 message FetchRecentTransactionsResponse {
@@ -203,7 +212,8 @@ message TransactionSummary {
 
 message SubscribeToHistoryRequest {
     bytes user_id = 1;
-    bytes signature = 2; // Signature over user_id for authentication
+    bytes signature = 2; // Schnorr signature over auth message for authentication
+    int64 timestamp_ms = 3; // Unix timestamp in milliseconds for replay protection
 }
 
 message TransactionNotification {
