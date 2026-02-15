@@ -126,6 +126,7 @@ class RefreshSessionState {
   final String userId;
 
   Uint8List? serverId;
+  threshold.Identifier? serverIdentifier;
 
   // Refresh Ephemeral
   final refreshRound1Packages = <threshold.Identifier, String>{};
@@ -189,6 +190,7 @@ class RefreshSessionState {
     refreshRound1Packages.clear();
     serverRefreshRound1Secret = null;
     serverRefreshRound2Secret = null;
+    serverIdentifier = null;
     refreshRound2PackagesReceived.clear();
     refreshRound2PackagesLocal.clear();
     refreshRound2PackagesForRelay.clear();

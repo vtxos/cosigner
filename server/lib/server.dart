@@ -773,6 +773,7 @@ class MPCWalletService extends MPCWalletServiceBase {
             policyState.normalPolicy.publicKeyPackage.verifyingKey.E);
 
         session.serverId = serverId;
+        session.serverIdentifier = serverIdentifier;
 
         final (r1Secret, r1Public) = threshold.dkgRefreshPart1(
           serverIdentifier,
@@ -826,11 +827,11 @@ class MPCWalletService extends MPCWalletServiceBase {
 
     final session = await _getRefreshSession(userIdHex);
 
-    if (session.serverId == null) {
-      throw StateError('Server ID not initialized for session $userIdHex');
+    if (session.serverIdentifier == null) {
+      throw StateError('Server identifier not initialized for session $userIdHex');
     }
 
-    final serverIdentifier = threshold.Identifier.derive(session.serverId!);
+    final serverIdentifier = session.serverIdentifier!;
     try {
       await session.completerRefreshStep1.future;
 
@@ -880,10 +881,10 @@ class MPCWalletService extends MPCWalletServiceBase {
 
     final session = await _getRefreshSession(userIdHex);
 
-    if (session.serverId == null) {
-      throw StateError('Server ID not initialized for session $userIdHex');
+    if (session.serverIdentifier == null) {
+      throw StateError('Server identifier not initialized for session $userIdHex');
     }
-    final serverIdentifier = threshold.Identifier.derive(session.serverId!);
+    final serverIdentifier = session.serverIdentifier!;
 
     try {
       final policyState = await _getPolicyState(userIdHex);
