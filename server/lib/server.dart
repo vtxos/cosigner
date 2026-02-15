@@ -72,10 +72,10 @@ class MPCWalletService extends MPCWalletServiceBase {
   }) : authVerifier = authVerifier ?? AuthVerifier();
 
   Future<DKGSessionState> _getDKGSession(String userId) async {
-    return await _dkgLock.synchronized(() {
+    return await _dkgLock.synchronized(() async {
       if (!_dkgSessions.containsKey(userId)) {
         // Try load
-        final jsonStr = dkgStore.getSession(userId);
+        final jsonStr = await dkgStore.getSession(userId);
         if (jsonStr != null) {
           try {
             _dkgSessions[userId] =
@@ -96,10 +96,10 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   Future<RefreshSessionState> _getRefreshSession(String userId) async {
-    return await _refreshLock.synchronized(() {
+    return await _refreshLock.synchronized(() async {
       if (!_refreshSessions.containsKey(userId)) {
         // Try load
-        final jsonStr = refreshStore.getSession(userId);
+        final jsonStr = await refreshStore.getSession(userId);
         if (jsonStr != null) {
           try {
             _refreshSessions[userId] =
@@ -130,10 +130,10 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   Future<PolicyState> _getPolicyState(String userId) async {
-    return await _policyLock.synchronized(() {
+    return await _policyLock.synchronized(() async {
       if (!_policies.containsKey(userId)) {
         // Try load
-        final jsonStr = policyStore.getPolicy(userId);
+        final jsonStr = await policyStore.getPolicy(userId);
         if (jsonStr != null) {
           try {
             _policies[userId] = PolicyState.fromJson(jsonDecode(jsonStr));
@@ -164,12 +164,12 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   Future<UtxoState> _getUtxoState(String userId) async {
-    return await _utxoLock.synchronized(() {
+    return await _utxoLock.synchronized(() async {
       if (!_utxos.containsKey(userId)) {
         final newState = UtxoState(userId);
 
         // Load from persistence
-        final existingJson = utxoStore.getUtxo(userId);
+        final existingJson = await utxoStore.getUtxo(userId);
         if (existingJson != null) {
           try {
             final List<dynamic> list = jsonDecode(existingJson);

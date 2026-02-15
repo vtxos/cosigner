@@ -103,7 +103,7 @@ class BitcoinService {
           }
         }
 
-        final existingJson = _utxoStore.getUtxo(userId);
+        final existingJson = await _utxoStore.getUtxo(userId);
         List<dynamic> currentList = [];
         if (existingJson != null) {
           try {
