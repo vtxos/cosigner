@@ -112,6 +112,19 @@ class AuthVerifier {
     return '$timestampMs:$userIdHex:$operation';
   }
 
+  /// Validates timestamp and records nonce without verifying a signature.
+  ///
+  /// Used for FROST-signed requests where the signature verification
+  /// is handled separately (not single-key Schnorr).
+  void validateRequestTiming({
+    required int timestampMs,
+    required String userIdHex,
+    required String operation,
+  }) {
+    _validateTimestamp(timestampMs, userIdHex, operation);
+    _recordNonce(timestampMs, userIdHex, operation);
+  }
+
   /// Clears the nonce cache. Primarily for testing.
   void clearNonceCache() {
     _usedNonces.clear();
