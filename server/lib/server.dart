@@ -1042,6 +1042,144 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   @override
+  Future<UpdatePolicyResponse> updatePolicy(
+      ServiceCall call, UpdatePolicyRequest request) async {
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    _log.info('[$userIdHex] UpdatePolicy: policy=${request.policyId}');
+
+    // 1. Validate timestamp and replay protection
+    authVerifier.validateRequestTiming(
+      timestampMs: request.timestampMs.toInt(),
+      userIdHex: userIdHex,
+      operation: threshold.AuthMessage.opUpdatePolicy,
+    );
+
+    // 2. Load policy state and verify policy exists
+    final policyState = await _getPolicyState(userIdHex);
+    if (!policyState.protectedPolicies.containsKey(request.policyId)) {
+      throw GrpcError.notFound('Policy ${request.policyId} not found');
+    }
+
+    // 3. Reconstruct the signed message
+    final message = threshold.RecoveryAuthMessage.buildUpdatePolicyMessage(
+      policyId: request.policyId,
+      thresholdSats: request.thresholdSats.toInt(),
+      intervalSeconds: request.intervalSeconds.toInt(),
+      timestampMs: request.timestampMs.toInt(),
+      userIdHex: userIdHex,
+    );
+
+    // 4. Verify FROST signature against group public key
+    _verifyFrostSignature(
+      signatureR: Uint8List.fromList(request.frostSignatureR),
+      signatureZ: Uint8List.fromList(request.frostSignatureZ),
+      message: message,
+      groupPublicKey: policyState.normalPolicy.publicKeyPackage,
+      userIdHex: userIdHex,
+      operation: 'UpdatePolicy',
+    );
+
+    // 5. Update policy metadata
+    final existing = policyState.protectedPolicies[request.policyId]!;
+    policyState.protectedPolicies[request.policyId] = ProtectedPolicy(
+      id: existing.id,
+      thresholdSats: BigInt.from(request.thresholdSats.toInt()),
+      startTime: existing.startTime,
+      interval: Duration(seconds: request.intervalSeconds.toInt()),
+      keyPackage: existing.keyPackage,
+      publicKeyPackage: existing.publicKeyPackage,
+    );
+
+    // 6. Persist
+    try {
+      await policyStore.savePolicy(
+          userIdHex, jsonEncode(policyState.toJson()));
+      _log.info('[$userIdHex] UpdatePolicy: Policy ${request.policyId} updated successfully');
+    } catch (e) {
+      _log.severe('[$userIdHex] UpdatePolicy: Error saving policy: $e');
+      rethrow;
+    }
+
+    return UpdatePolicyResponse()..success = true;
+  }
+
+  @override
+  Future<DeletePolicyResponse> deletePolicy(
+      ServiceCall call, DeletePolicyRequest request) async {
+    final userId = request.userId;
+    final userIdHex = hex.encode(userId);
+
+    _log.info('[$userIdHex] DeletePolicy: policy=${request.policyId}');
+
+    // 1. Validate timestamp and replay protection
+    authVerifier.validateRequestTiming(
+      timestampMs: request.timestampMs.toInt(),
+      userIdHex: userIdHex,
+      operation: threshold.AuthMessage.opDeletePolicy,
+    );
+
+    // 2. Load policy state and verify policy exists
+    final policyState = await _getPolicyState(userIdHex);
+    if (!policyState.protectedPolicies.containsKey(request.policyId)) {
+      throw GrpcError.notFound('Policy ${request.policyId} not found');
+    }
+
+    // 3. Reconstruct the signed message
+    final message = threshold.RecoveryAuthMessage.buildDeletePolicyMessage(
+      policyId: request.policyId,
+      timestampMs: request.timestampMs.toInt(),
+      userIdHex: userIdHex,
+    );
+
+    // 4. Verify FROST signature against group public key
+    _verifyFrostSignature(
+      signatureR: Uint8List.fromList(request.frostSignatureR),
+      signatureZ: Uint8List.fromList(request.frostSignatureZ),
+      message: message,
+      groupPublicKey: policyState.normalPolicy.publicKeyPackage,
+      userIdHex: userIdHex,
+      operation: 'DeletePolicy',
+    );
+
+    // 5. Remove policy
+    policyState.protectedPolicies.remove(request.policyId);
+
+    // 6. Persist
+    try {
+      await policyStore.savePolicy(
+          userIdHex, jsonEncode(policyState.toJson()));
+      _log.info('[$userIdHex] DeletePolicy: Policy ${request.policyId} deleted successfully');
+    } catch (e) {
+      _log.severe('[$userIdHex] DeletePolicy: Error saving policy: $e');
+      rethrow;
+    }
+
+    return DeletePolicyResponse()..success = true;
+  }
+
+  /// Verifies a FROST threshold signature against the group public key.
+  void _verifyFrostSignature({
+    required Uint8List signatureR,
+    required Uint8List signatureZ,
+    required Uint8List message,
+    required threshold.PublicKeyPackage groupPublicKey,
+    required String userIdHex,
+    required String operation,
+  }) {
+    try {
+      final R = threshold.elemDeserializeCompressed(signatureR);
+      final z = threshold.bytesToBigInt(signatureZ);
+      final signature = threshold.Signature(R, z);
+      signature.verify(groupPublicKey.verifyingKey, message);
+    } catch (e) {
+      _log.warning('[$userIdHex] FROST signature verification failed for $operation: $e');
+      throw GrpcError.unauthenticated('Invalid recovery signature');
+    }
+  }
+
+  @override
   Future<BroadcastTransactionResponse> broadcastTransaction(
       ServiceCall call, BroadcastTransactionRequest request) async {
     final userId = request.userId;

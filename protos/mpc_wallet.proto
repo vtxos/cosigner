@@ -20,6 +20,8 @@ service MPCWallet {
   // Policy
   rpc CreateSpendingPolicy (CreateSpendingPolicyRequest) returns (CreateSpendingPolicyResponse);
   rpc GetPolicyId (GetPolicyIdRequest) returns (GetPolicyIdResponse);
+  rpc UpdatePolicy (UpdatePolicyRequest) returns (UpdatePolicyResponse);
+  rpc DeletePolicy (DeletePolicyRequest) returns (DeletePolicyResponse);
 
   // Broadcast
   rpc BroadcastTransaction (BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
@@ -170,6 +172,32 @@ message GetPolicyIdRequest {
 
 message GetPolicyIdResponse {
     string policy_id = 1;
+}
+
+message UpdatePolicyRequest {
+    bytes user_id = 1;
+    string policy_id = 2;
+    int64 threshold_sats = 3;
+    int64 interval_seconds = 4;
+    bytes frost_signature_r = 5;
+    bytes frost_signature_z = 6;
+    int64 timestamp_ms = 7;
+}
+
+message UpdatePolicyResponse {
+    bool success = 1;
+}
+
+message DeletePolicyRequest {
+    bytes user_id = 1;
+    string policy_id = 2;
+    bytes frost_signature_r = 3;
+    bytes frost_signature_z = 4;
+    int64 timestamp_ms = 5;
+}
+
+message DeletePolicyResponse {
+    bool success = 1;
 }
 
 message BroadcastTransactionRequest {
