@@ -12,6 +12,14 @@ pub enum Error {
     IncorrectBindingFactorPreimages,
     MismatchedCommitment,
     SerializationError,
+    // DKG errors
+    InvalidProofOfKnowledge,
+    InvalidSecretShare,
+    InvalidCoefficients,
+    InvalidMinSigners,
+    InvalidMaxSigners,
+    IncorrectNumberOfPackages,
+    IncorrectPackageMapping,
 }
 
 impl fmt::Display for Error {
@@ -31,6 +39,19 @@ impl fmt::Display for Error {
             }
             Error::MismatchedCommitment => write!(f, "mismatched commitment"),
             Error::SerializationError => write!(f, "serialization error"),
+            Error::InvalidProofOfKnowledge => {
+                write!(f, "invalid proof of knowledge")
+            }
+            Error::InvalidSecretShare => write!(f, "invalid secret share"),
+            Error::InvalidCoefficients => write!(f, "invalid coefficients"),
+            Error::InvalidMinSigners => write!(f, "invalid min_signers"),
+            Error::InvalidMaxSigners => write!(f, "invalid max_signers"),
+            Error::IncorrectNumberOfPackages => {
+                write!(f, "incorrect number of packages")
+            }
+            Error::IncorrectPackageMapping => {
+                write!(f, "incorrect package mapping")
+            }
         }
     }
 }
