@@ -1192,6 +1192,12 @@ class MPCWalletService extends MPCWalletServiceBase {
     final (txId, _) = await bitcoinService.broadcastTransaction(
         userIdHex, request.txHex, policyState);
 
+    // Invalidate the in-memory UTXO cache so _calculateSpentAmount
+    // reloads from persistence on the next sign request.
+    await _utxoLock.synchronized(() async {
+      _utxos.remove(userIdHex);
+    });
+
     return BroadcastTransactionResponse()..txId = txId;
   }
 
