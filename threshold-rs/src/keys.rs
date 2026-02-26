@@ -198,6 +198,31 @@ impl PublicKeyPackage {
         }
     }
 
+    /// Serialize to JSON (matching Dart format).
+    pub fn to_json(&self) -> alloc::string::String {
+        use alloc::format;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+
+        let vk = hex_encode(&self.verifying_key.serialize());
+
+        let shares: Vec<String> = self
+            .verifying_shares
+            .iter()
+            .map(|(id, share)| {
+                let id_hex = hex_encode(&id.serialize());
+                let share_hex = hex_encode(&point::serialize_compressed(share));
+                format!(r#""{}":"{}""#, id_hex, share_hex)
+            })
+            .collect();
+
+        let shares_str = shares.join(",");
+        format!(
+            r#"{{"verifyingKey":"{}","verifyingShares":{{{}}}}}"#,
+            vk, shares_str
+        )
+    }
+
     /// Deserialize from JSON (matching Dart format).
     pub fn from_json(json: &str) -> Result<Self, Error> {
         let v: serde_json::Value =
