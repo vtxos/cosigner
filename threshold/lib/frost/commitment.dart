@@ -1,78 +1,76 @@
-import 'dart:math';
+import 'dart:convert';
+import 'dart:ffi';
 import 'dart:typed_data';
-
-import 'package:pointycastle/ecc/api.dart';
+import 'package:ffi/ffi.dart';
 import 'package:threshold/core/identifier.dart';
-import 'package:threshold/core/share.dart'; // for SecretShare
-import 'package:threshold/core/utils.dart';
-import 'package:threshold/frost/errors.dart';
-import 'package:threshold/frost/hasher.dart';
-import 'package:threshold/frost/utils.dart';
-import 'package:threshold/frost/binding.dart';
+import 'package:threshold/core/share.dart';
+import 'package:threshold/src/bindings.dart';
+import 'package:threshold/src/ffi_result.dart';
 
 class SigningNonce {
   final BigInt hiding;
   final BigInt binding;
   final SigningCommitments commitments;
+  /// Opaque FFI handle for the Rust-side nonce.
+  final Pointer<Void>? _handle;
 
-  SigningNonce(this.hiding, this.binding, this.commitments);
+  SigningNonce(this.hiding, this.binding, this.commitments, [this._handle]);
+
+  Pointer<Void> get handle {
+    final h = _handle;
+    if (h == null || h.address == 0) {
+      throw StateError('SigningNonce has no FFI handle');
+    }
+    return h;
+  }
 }
 
 class SigningCommitments {
-  final ECPoint binding;
-  final ECPoint hiding;
+  /// Compressed point hex.
+  final String binding;
+  /// Compressed point hex.
+  final String hiding;
 
   SigningCommitments(this.binding, this.hiding);
 }
 
 class GroupCommitmentShare {
-  final ECPoint elem;
+  final String elem; // compressed hex
   GroupCommitmentShare(this.elem);
 }
 
 class GroupCommitment {
-  final ECPoint elem;
+  final String elem; // compressed hex
   GroupCommitment(this.elem);
 }
 
-// Generates a new nonce pair and returns the SigningNonce struct
+/// Generates a new nonce pair and returns the SigningNonce struct.
 SigningNonce newNonce(SecretShare secret) {
-  final hiding = generateFrostNonce(secret);
-  final binding = generateFrostNonce(secret);
+  final secretHex = _bigIntToHex64(secret);
+  final ptr = secretHex.toNativeUtf8();
+  try {
+    final (data, handle) = callFfi(newNonceFfi(ptr));
+    final parsed = jsonDecode(data) as Map<String, dynamic>;
 
-  final hidingCommitment = (secp256k1Curve.G * hiding)!;
-  final bindingCommitment = (secp256k1Curve.G * binding)!;
+    final hidingHex = parsed['hiding'] as String;
+    final bindingHex = parsed['binding'] as String;
 
-  final commitments = SigningCommitments(bindingCommitment, hidingCommitment);
+    final commitments = SigningCommitments(bindingHex, hidingHex);
 
-  return SigningNonce(hiding, binding, commitments);
-}
-
-BigInt generateFrostNonce(SecretShare secret) {
-  final rand = Random.secure();
-  final rb = Uint8List(32);
-  for (var i = 0; i < 32; i++) {
-    rb[i] = rand.nextInt(256);
+    // The actual hiding/binding scalars are inside the Rust handle.
+    // We store zero here since they're not needed on the Dart side.
+    return SigningNonce(BigInt.zero, BigInt.zero, commitments, handle);
+  } finally {
+    calloc.free(ptr);
   }
-
-  // secret is BigInt (typedef SecretShare = BigInt)
-  final secretBytes = bigIntToBytes(secret);
-  final concatenatedBytes = Uint8List.fromList(rb + secretBytes);
-
-  return h3(concatenatedBytes);
 }
 
 extension SigningCommitmentsExt on SigningCommitments {
   GroupCommitmentShare toGroupCommitmentShare(BigInt bindingScalar) {
-    // sum = B_i + b_i * H_i (NOTE: Go code logic: sum = Hiding + bindingScalar * Binding)
-    // Wait, looking at Go code:
-    // secp256k1.ScalarMultNonConst(&bindingScalar, &s.Binding, &bH)
-    // secp256k1.AddNonConst(&s.Hiding, &bH, &sum)
-    // So it is Hiding + scalar * Binding
-
-    final bH = (binding * bindingScalar)!;
-    final sum = (hiding + bH)!;
-    return GroupCommitmentShare(sum);
+    // Point arithmetic done in Rust during signing.
+    throw UnimplementedError(
+      'toGroupCommitmentShare is handled internally by Rust FFI.',
+    );
   }
 }
 
@@ -85,44 +83,48 @@ class SigningPackage {
   SigningCommitments? signingCommitment(Identifier id) {
     return commitments[id];
   }
+
+  /// Serialize to JSON format expected by FFI.
+  String toJson() {
+    final commsMap = <String, dynamic>{};
+    for (final entry in commitments.entries) {
+      final idHex = _identifierToHex(entry.key);
+      commsMap[idHex] = {
+        'hiding': entry.value.hiding,
+        'binding': entry.value.binding,
+      };
+    }
+    return jsonEncode({
+      'commitments': commsMap,
+      'message': _bytesToHex(message),
+    });
+  }
 }
 
-// computeGroupCommitment
-GroupCommitment computeGroupCommitment(
-  SigningPackage s,
-  BindingFactorList bfl,
-) {
-  var groupCommitment = secp256k1Curve.curve.infinity!;
+/// Compute the group commitment (handled by Rust internally during aggregate).
+GroupCommitment computeGroupCommitment(SigningPackage s, dynamic bfl) {
+  throw UnimplementedError(
+    'computeGroupCommitment is handled internally by Rust FFI.',
+  );
+}
 
-  final bindingScalars = <BigInt>[];
-  final bindingElements = <ECPoint>[];
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
 
-  for (final entry in s.commitments.entries) {
-    final id = entry.key;
-    final comm = entry.value;
-    final bind = comm.binding;
-    final hide = comm.hiding;
-
-    if (bind.isInfinity || hide.isInfinity) {
-      throw errIdentityCommitment;
-    }
-
-    // lookup binding factor
-    final bf = bfl.get(id);
-    if (bf == null) {
-      throw errUnknownIdentifier;
-    }
-
-    bindingElements.add(bind);
-    bindingScalars.add(bf.scalar);
-
-    // sum hiding commitments
-    groupCommitment = (groupCommitment + hide)!;
+String _bigIntToHex64(BigInt v) {
+  var h = v.toRadixString(16);
+  while (h.length < 64) {
+    h = '0$h';
   }
+  return h;
+}
 
-  // accumulated binding
-  final acc = vartimeMultiscalarMul(bindingScalars, bindingElements);
-  groupCommitment = (groupCommitment + acc)!;
+String _identifierToHex(Identifier id) {
+  final bytes = id.serialize();
+  return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+}
 
-  return GroupCommitment(groupCommitment);
+String _bytesToHex(Uint8List bytes) {
+  return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 }

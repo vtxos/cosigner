@@ -17,7 +17,7 @@ hex-conservative = { version = "0.2", default-features = false, features = ["all
 
 [features]
 default = []
-std = ["k256/std", "sha2/std", "serde/std", "serde_json/std"]
+std = ["k256/std", "sha2/std", "serde/std", "serde_json/std", "rand_core/std"]
 
 [dev-dependencies]
 rand = "0.8"

@@ -872,3 +872,274 @@ fn test_dkg_round2_package_json_round_trip() {
         scalar_to_bytes(&recovered.secret_share)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Key Refresh tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_key_refresh_preserves_group_key() {
+    let mut rng = OsRng;
+
+    // Run full DKG for 3-of-3
+    let (key_packages, pubkeys) = run_full_dkg(2, 3);
+
+    let original_group_key = pubkeys.verifying_key.serialize();
+
+    // All 3 participants do refresh
+    let ids: Vec<Identifier> = key_packages.iter().map(|kp| kp.identifier.clone()).collect();
+
+    // Round 1: each participant generates refresh polynomial
+    let mut r1_secrets = Vec::new();
+    let mut r1_packages: BTreeMap<Identifier, dkg::Round1Package> = BTreeMap::new();
+
+    for kp in &key_packages {
+        let coefficients: Vec<Scalar> = (0..1).map(|_| random_scalar(&mut rng)).collect(); // min_signers-1 = 1
+        let (secret_pkg, pub_pkg) =
+            dkg::dkg_refresh_part1(&kp.identifier, 3, 2, &coefficients, &mut rng)
+                .expect("refresh part1 failed");
+
+        r1_packages.insert(kp.identifier.clone(), pub_pkg);
+        r1_secrets.push(secret_pkg);
+    }
+
+    // Round 2: each participant computes refresh shares
+    let mut r2_secrets = Vec::new();
+    let mut all_r2_packages: Vec<BTreeMap<Identifier, Round2Package>> = Vec::new();
+
+    for (i, secret_pkg) in r1_secrets.iter().enumerate() {
+        let others: BTreeMap<Identifier, dkg::Round1Package> = r1_packages
+            .iter()
+            .filter(|(id, _)| **id != ids[i])
+            .map(|(id, pkg)| (id.clone(), pkg.clone()))
+            .collect();
+
+        let (r2_secret, r2_out) =
+            dkg::dkg_refresh_part2(secret_pkg, &others).expect("refresh part2 failed");
+
+        r2_secrets.push(r2_secret);
+        all_r2_packages.push(r2_out);
+    }
+
+    // Round 3: each participant combines refresh delta with old key
+    let mut new_key_packages = Vec::new();
+    let mut new_pubkeys: Option<PublicKeyPackage> = None;
+
+    for (i, r2_secret) in r2_secrets.iter().enumerate() {
+        let others_r1: BTreeMap<Identifier, dkg::Round1Package> = r1_packages
+            .iter()
+            .filter(|(id, _)| **id != ids[i])
+            .map(|(id, pkg)| (id.clone(), pkg.clone()))
+            .collect();
+
+        let mut our_r2: BTreeMap<Identifier, Round2Package> = BTreeMap::new();
+        for (j, r2_pkgs) in all_r2_packages.iter().enumerate() {
+            if j == i {
+                continue;
+            }
+            if let Some(pkg) = r2_pkgs.get(&ids[i]) {
+                our_r2.insert(ids[j].clone(), pkg.clone());
+            }
+        }
+
+        let (new_kp, new_pkp) = dkg::dkg_refresh_part3(
+            r2_secret,
+            &others_r1,
+            &our_r2,
+            &pubkeys,
+            &key_packages[i],
+        )
+        .expect("refresh part3 failed");
+
+        new_key_packages.push(new_kp);
+
+        if let Some(ref existing) = new_pubkeys {
+            assert!(
+                point::points_equal(
+                    &existing.verifying_key.point,
+                    &new_pkp.verifying_key.point
+                ),
+                "Group public key mismatch after refresh"
+            );
+        }
+        new_pubkeys = Some(new_pkp);
+    }
+
+    let new_pubkeys = new_pubkeys.unwrap();
+
+    // Group key must be preserved
+    assert_eq!(
+        original_group_key,
+        new_pubkeys.verifying_key.serialize(),
+        "Group key changed after refresh — this should never happen"
+    );
+
+    // Verify signing still works with refreshed keys
+    let message = b"test message after refresh";
+    let signers = vec![0, 1]; // 2-of-3
+
+    let mut nonces = Vec::new();
+    let mut commitments: BTreeMap<Identifier, threshold::nonce::SigningCommitments> =
+        BTreeMap::new();
+
+    for &idx in &signers {
+        let nonce = new_nonce(&mut rng, &new_key_packages[idx].secret_share);
+        commitments.insert(
+            new_key_packages[idx].identifier.clone(),
+            nonce.commitments.clone(),
+        );
+        nonces.push(nonce);
+    }
+
+    let signing_package = SigningPackage::new(commitments, message.to_vec());
+
+    let mut shares: BTreeMap<Identifier, threshold::signing::SignatureShare> = BTreeMap::new();
+    for (i, &idx) in signers.iter().enumerate() {
+        let share = sign(&signing_package, &nonces[i], &new_key_packages[idx])
+            .expect("signing failed");
+        shares.insert(new_key_packages[idx].identifier.clone(), share);
+    }
+
+    let signature = aggregate(&signing_package, &shares, &new_pubkeys)
+        .expect("aggregation failed");
+
+    signature
+        .verify(&new_pubkeys.verifying_key, message)
+        .expect("signature verification failed after refresh");
+}
+
+// ---------------------------------------------------------------------------
+// Auth tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+mod auth_tests {
+    use threshold::auth::{AuthSigner, verify_schnorr_signature};
+    use threshold::scalar::scalar_to_bytes;
+    use threshold::nonce::new_nonce;
+    use k256::Scalar;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_auth_signer_sign_verify() {
+        let mut rng = OsRng;
+        let nonce = new_nonce(&mut rng, &Scalar::ONE);
+        let secret_bytes = scalar_to_bytes(&nonce.hiding);
+
+        let signer = AuthSigner::from_secret_bytes(&secret_bytes)
+            .expect("AuthSigner creation failed");
+
+        let message = b"test auth message";
+        let signature = signer.sign(message);
+
+        assert_eq!(signature.len(), 64);
+
+        let pk = signer.public_key_compressed();
+        assert!(
+            verify_schnorr_signature(&pk, message, &signature),
+            "Signature verification failed"
+        );
+    }
+
+    #[test]
+    fn test_auth_signer_wrong_message_fails() {
+        let mut rng = OsRng;
+        let nonce = new_nonce(&mut rng, &Scalar::ONE);
+        let secret_bytes = scalar_to_bytes(&nonce.hiding);
+
+        let signer = AuthSigner::from_secret_bytes(&secret_bytes).unwrap();
+
+        let signature = signer.sign(b"correct message");
+        let pk = signer.public_key_compressed();
+
+        assert!(
+            !verify_schnorr_signature(&pk, b"wrong message", &signature),
+            "Signature should not verify with wrong message"
+        );
+    }
+
+    #[test]
+    fn test_auth_signer_wrong_key_fails() {
+        let mut rng = OsRng;
+        let nonce1 = new_nonce(&mut rng, &Scalar::ONE);
+        let nonce2 = new_nonce(&mut rng, &Scalar::ONE);
+
+        let signer1 = AuthSigner::from_secret_bytes(&scalar_to_bytes(&nonce1.hiding)).unwrap();
+        let signer2 = AuthSigner::from_secret_bytes(&scalar_to_bytes(&nonce2.hiding)).unwrap();
+
+        let message = b"test message";
+        let signature = signer1.sign(message);
+        let wrong_pk = signer2.public_key_compressed();
+
+        assert!(
+            !verify_schnorr_signature(&wrong_pk, message, &signature),
+            "Signature should not verify with wrong key"
+        );
+    }
+
+    #[test]
+    fn test_auth_signer_deterministic() {
+        let mut rng = OsRng;
+        let nonce = new_nonce(&mut rng, &Scalar::ONE);
+        let secret_bytes = scalar_to_bytes(&nonce.hiding);
+
+        let signer = AuthSigner::from_secret_bytes(&secret_bytes).unwrap();
+
+        let message = b"deterministic test";
+        let sig1 = signer.sign(message);
+        let sig2 = signer.sign(message);
+
+        assert_eq!(sig1, sig2, "Deterministic nonce should produce identical signatures");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Random utility tests
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+mod random_tests {
+    use threshold::random::{mod_n_random, mod_n_random_seeded, generate_coefficients, generate_coefficients_seeded};
+    use threshold::scalar::scalar_to_bytes;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn test_mod_n_random_non_zero() {
+        let mut rng = OsRng;
+        for _ in 0..100 {
+            let s = mod_n_random(&mut rng);
+            assert!(!bool::from(s.is_zero()));
+        }
+    }
+
+    #[test]
+    fn test_mod_n_random_seeded_deterministic() {
+        let seed = b"test seed";
+        let s1 = mod_n_random_seeded(seed, 0);
+        let s2 = mod_n_random_seeded(seed, 0);
+        assert_eq!(scalar_to_bytes(&s1), scalar_to_bytes(&s2));
+
+        // Different counter should give different result
+        let s3 = mod_n_random_seeded(seed, 1);
+        assert_ne!(scalar_to_bytes(&s1), scalar_to_bytes(&s3));
+    }
+
+    #[test]
+    fn test_generate_coefficients_count() {
+        let mut rng = OsRng;
+        let coeffs = generate_coefficients(5, &mut rng);
+        assert_eq!(coeffs.len(), 5);
+    }
+
+    #[test]
+    fn test_generate_coefficients_seeded_deterministic() {
+        let seed = b"coeff seed";
+        let c1 = generate_coefficients_seeded(3, seed);
+        let c2 = generate_coefficients_seeded(3, seed);
+
+        assert_eq!(c1.len(), 3);
+        for i in 0..3 {
+            assert_eq!(scalar_to_bytes(&c1[i]), scalar_to_bytes(&c2[i]));
+        }
+    }
+}

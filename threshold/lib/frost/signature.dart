@@ -1,55 +1,54 @@
-import 'package:pointycastle/ecc/api.dart';
+import 'dart:typed_data';
+import 'package:convert/convert.dart';
+import 'package:ffi/ffi.dart';
 import 'package:threshold/core/share.dart';
 import 'package:threshold/core/utils.dart';
-import 'package:convert/convert.dart';
-import 'package:threshold/frost/hasher.dart';
-import 'package:threshold/frost/utils.dart';
-import 'dart:typed_data';
+import 'package:threshold/src/bindings.dart';
+import 'package:threshold/src/ffi_result.dart';
 
 class Signature {
-  final ECPoint R;
+  /// Compressed point hex for R.
+  final String R;
   final BigInt Z;
 
   Signature(this.R, this.Z);
 
   factory Signature.fromJson(Map<String, dynamic> json) {
-    final R = elemDeserializeCompressed(
-      Uint8List.fromList(hex.decode(json['R'])),
-    );
+    final R = json['R'] as String;
     final Z = bytesToBigInt(Uint8List.fromList(hex.decode(json['Z'])));
     return Signature(R, Z);
   }
 
   Map<String, dynamic> toJson() => {
-    'R': hex.encode(elemSerializeCompressed(R)),
-    'Z': hex.encode(bigIntToBytes(Z)),
-  };
+        'R': R,
+        'Z': hex.encode(bigIntToBytes(Z)),
+      };
 
   bool get hasEvenY {
-    return R.y!.toBigInteger()!.isEven;
+    // Compressed point: first byte is 0x02 (even) or 0x03 (odd)
+    final firstByte = int.parse(R.substring(0, 2), radix: 16);
+    return firstByte == 0x02;
   }
 
   Signature intoEvenY({bool? isEven}) {
     final currentIsEven = isEven ?? hasEvenY;
     if (!currentIsEven) {
-      final n = secp256k1Curve.n;
-      final negMultiplier = n - BigInt.one;
-
-      final newR = (R * negMultiplier)!;
-      return Signature(newR, Z);
+      // Flip prefix byte 02<->03
+      final prefix = R.substring(0, 2) == '02' ? '03' : '02';
+      return Signature('$prefix${R.substring(2)}', Z);
     }
     return this;
   }
 
-  // bip340 signature
+  /// BIP-340 signature serialization: 64 bytes (32-byte R x-only + 32-byte s).
   Uint8List serialize() {
-    final rBytesCompressed = elemSerializeCompressed(R);
+    final rBytes = Uint8List.fromList(hex.decode(R));
     final zBytes = bigIntToBytes(Z);
 
     final out = Uint8List(64);
 
     // R bytes: skip first byte (0x02 or 0x03)
-    out.setRange(0, 32, rBytesCompressed.sublist(1));
+    out.setRange(0, 32, rBytes.sublist(1));
 
     // Z bytes: big endian, padded to 32 bytes
     final zOffset = 32 + (32 - zBytes.length);
@@ -58,39 +57,40 @@ class Signature {
     return out;
   }
 
-  // Verify signature against public key P and message m
+  /// Verify signature against public key P and message m.
   Signature verify(VerifyingKey pk, Uint8List message) {
-    final pkEvenY = pk.intoEvenY();
-    final sigEvenY = intoEvenY();
-
-    final challenge = computeChallenge(sigEvenY.R, pkEvenY, message);
-
-    // 2. Check s*G = R + e*P
-    final s = Z;
-    final P = pkEvenY.E;
-
-    final sG = (secp256k1Curve.G * s)!;
-    final eP = (P * challenge)!;
-    final R_plus_eP = (sigEvenY.R + eP)!;
-
-    if (!pointsEqual(sG, R_plus_eP)) {
-      throw Exception("Invalid signature");
+    // Delegate to Rust via verifySchnorrSignature
+    final pkHex = pk.E;
+    final sigBytes = serialize();
+    final sigHex = hex.encode(sigBytes);
+    final msgBytes = toNativeBytes(message);
+    final pkPtr = pkHex.toNativeUtf8();
+    final sigPtr = sigHex.toNativeUtf8();
+    try {
+      final result = callFfiData(
+        verifySchnorrFfi(pkPtr, msgBytes, message.length, sigPtr),
+      );
+      if (result != 'true') {
+        throw Exception("Invalid signature");
+      }
+      return intoEvenY();
+    } finally {
+      calloc.free(pkPtr);
+      calloc.free(sigPtr);
+      calloc.free(msgBytes);
     }
-
-    return sigEvenY;
   }
 }
 
-BigInt computeChallenge(ECPoint R, VerifyingKey vk, Uint8List message) {
+BigInt computeChallenge(String rHex, VerifyingKey vk, Uint8List message) {
   // BIP-340: e = hash_BIP0340/challenge(bytes(R) || bytes(P) || m)
   // bytes(R) and bytes(P) are x-only (32 bytes)
-
-  final RBytes = elemSerializeCompressed(R).sublist(1);
-  final PBytes = elemSerializeCompressed(vk.E).sublist(1);
+  final rBytes = hex.decode(rHex).sublist(1);
+  final pBytes = hex.decode(vk.E).sublist(1);
 
   final builder = BytesBuilder();
-  builder.add(RBytes);
-  builder.add(PBytes);
+  builder.add(rBytes);
+  builder.add(pBytes);
   builder.add(message);
 
   return taggedHash("BIP0340/challenge", builder.toBytes());
