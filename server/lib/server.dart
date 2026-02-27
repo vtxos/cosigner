@@ -843,11 +843,11 @@ class MPCWalletService extends MPCWalletServiceBase {
 
     final session = await _getRefreshSession(userIdHex);
 
-    final userIdentifier =
-        threshold.Identifier.derive(Uint8List.fromList(userId));
-
     try {
       final policyState = await _getPolicyState(userIdHex);
+
+      final userIdentifier = policyState.userSigningIdentifier ??
+          threshold.Identifier.derive(Uint8List.fromList(userId));
 
       // Auto-Reset if previous session finished
       if (session.completerRefreshStep3.isCompleted) {
@@ -984,7 +984,7 @@ class MPCWalletService extends MPCWalletServiceBase {
     try {
       final policyState = await _getPolicyState(userIdHex);
 
-      final userIdentifier =
+      final userIdentifier = policyState.userSigningIdentifier ??
           threshold.Identifier.derive(Uint8List.fromList(userId));
 
       await session.completerRefreshStep2.future;
@@ -1077,8 +1077,7 @@ class MPCWalletService extends MPCWalletServiceBase {
           session.serverRefreshRound2Secret = null;
 
           // Verify invariant - REJECT if group key changed (security critical)
-          if (normalPub.verifyingKey.E.getEncoded(true).toString() !=
-              pubKeyPkg.verifyingKey.E.getEncoded(true).toString()) {
+          if (normalPub.verifyingKey.E != pubKeyPkg.verifyingKey.E) {
             _log.severe(
                 '[$userId] CRITICAL: Group key changed during refresh! This indicates a protocol failure or attack.');
             throw GrpcError.internal(

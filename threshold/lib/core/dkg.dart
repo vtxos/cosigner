@@ -1,28 +1,30 @@
-import 'package:pointycastle/ecc/api.dart';
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:typed_data';
+import 'package:convert/convert.dart';
+import 'package:ffi/ffi.dart';
 import 'package:threshold/core/commitment.dart';
-import 'package:threshold/core/errors.dart';
 import 'package:threshold/core/identifier.dart';
 import 'package:threshold/core/share.dart';
 import 'package:threshold/core/utils.dart';
-import 'package:convert/convert.dart';
-import 'dart:typed_data';
+import 'package:threshold/src/bindings.dart';
+import 'package:threshold/src/ffi_result.dart';
 
 class DKGSignature {
-  final ECPoint R;
+  /// Compressed point hex.
+  final String R;
   final BigInt Z;
 
   DKGSignature(this.R, this.Z);
 
   factory DKGSignature.fromJson(Map<String, dynamic> json) {
-    final R = elemDeserializeCompressed(
-      Uint8List.fromList(hex.decode(json['R'])),
-    );
+    final R = json['R'] as String;
     final Z = bytesToBigInt(Uint8List.fromList(hex.decode(json['Z'])));
     return DKGSignature(R, Z);
   }
 
   Map<String, dynamic> toJson() => {
-        'R': hex.encode(elemSerializeCompressed(R)),
+        'R': R,
         'Z': hex.encode(bigIntToBytes(Z)),
       };
 }
@@ -36,11 +38,10 @@ class Round1Package {
 
   factory Round1Package.fromJson(Map<String, dynamic> json) {
     return Round1Package(
-        VerifiableSecretSharingCommitment.fromJson(json['commitment']),
-        DKGSignature.fromJson(json['proofOfKnowledge']),
-        VerifyingKey.fromJson(
-          json['verifyingKey'],
-        ));
+      VerifiableSecretSharingCommitment.fromJson(json['commitment']),
+      DKGSignature.fromJson(json['proofOfKnowledge']),
+      VerifyingKey.fromJson(json['verifyingKey']),
+    );
   }
 
   Map<String, dynamic> toJson() => {
@@ -61,14 +62,25 @@ class Round1SecretPackage {
   final VerifiableSecretSharingCommitment commitment;
   final int minSigners;
   final int maxSigners;
+  /// Opaque FFI handle (if created via FFI).
+  final Pointer<Void>? _handle;
 
   Round1SecretPackage(
     this.identifier,
     this.coefficients,
     this.commitment,
     this.minSigners,
-    this.maxSigners,
-  );
+    this.maxSigners, [
+    this._handle,
+  ]);
+
+  Pointer<Void> get handle {
+    final h = _handle;
+    if (h == null || h.address == 0) {
+      throw StateError('Round1SecretPackage has no FFI handle');
+    }
+    return h;
+  }
 }
 
 class Round2Package {
@@ -93,20 +105,31 @@ class Round2SecretPackage {
   final BigInt secretShare;
   final int minSigners;
   final int maxSigners;
+  /// Opaque FFI handle (if created via FFI).
+  final Pointer<Void>? _handle;
 
   Round2SecretPackage(
     this.identifier,
     this.commitment,
     this.secretShare,
     this.minSigners,
-    this.maxSigners,
-  );
+    this.maxSigners, [
+    this._handle,
+  ]);
+
+  Pointer<Void> get handle {
+    final h = _handle;
+    if (h == null || h.address == 0) {
+      throw StateError('Round2SecretPackage has no FFI handle');
+    }
+    return h;
+  }
 }
 
 class KeyPackage {
   final Identifier identifier;
   final SecretShare secretShare;
-  final VerifyingShare verifyingShare;
+  final String verifyingShare; // compressed hex
   final VerifyingKey verifyingKey;
   final int minSigners;
 
@@ -124,14 +147,8 @@ class KeyPackage {
         Uint8List.fromList(hex.decode(json['identifier'])),
       ),
       bytesToBigInt(Uint8List.fromList(hex.decode(json['secretShare']))),
-      elemDeserializeCompressed(
-        Uint8List.fromList(hex.decode(json['verifyingShare'])),
-      ),
-      VerifyingKey(
-        E: elemDeserializeCompressed(
-          Uint8List.fromList(hex.decode(json['verifyingKey'])),
-        ),
-      ),
+      json['verifyingShare'] as String,
+      VerifyingKey(E: json['verifyingKey'] as String),
       json['minSigners'],
     );
   }
@@ -139,68 +156,52 @@ class KeyPackage {
   Map<String, dynamic> toJson() => {
         'identifier': hex.encode(identifier.serialize()),
         'secretShare': hex.encode(bigIntToBytes(secretShare)),
-        'verifyingShare': hex.encode(elemSerializeCompressed(verifyingShare)),
-        'verifyingKey': hex.encode(elemSerializeCompressed(verifyingKey.E)),
+        'verifyingShare': verifyingShare,
+        'verifyingKey': verifyingKey.E,
         'minSigners': minSigners,
       };
 
   bool get hasEvenY {
-    return verifyingKey.E.y!.toBigInteger()!.isEven;
+    return verifyingKey.hasEvenY;
   }
 
   KeyPackage intoEvenY({bool? isEven}) {
-    final currentIsEven = isEven ?? hasEvenY;
-    if (!currentIsEven) {
-      // Negate all components
-      final n = secp256k1Curve.n;
-      final negMultiplier = n - BigInt.one;
-
-      final newSecretShare = (n - secretShare) % n;
-      // Negate points by multiplying by (n-1) since .negate() is missing
-      final newVerifyingShare = (verifyingShare * negMultiplier)!;
-      final newVerifyingKeyPoint = (verifyingKey.E * negMultiplier)!;
-
-      return KeyPackage(
-        identifier,
-        newSecretShare,
-        newVerifyingShare,
-        VerifyingKey(E: newVerifyingKeyPoint),
-        minSigners,
-      );
+    final kpJson = jsonEncode(toJson());
+    final ptr = kpJson.toNativeUtf8();
+    try {
+      final resultJson = callFfiData(keyPackageIntoEvenYFfi(ptr));
+      final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
+      return KeyPackage.fromJson(parsed);
+    } finally {
+      calloc.free(ptr);
     }
-    return this;
   }
 
   KeyPackage tweak(List<int>? merkleRoot) {
-    // 1. Ensure even Y
-    final keyPackage = intoEvenY();
-
-    // 2. Compute tweak t
-    final t = computeTweak(keyPackage.verifyingKey.E, merkleRoot);
-    final tp = elemBaseMul(t);
-
-    // 3. Update verification key Q = P + t*G
-    final newVerifyingKeyPoint = elemAdd(keyPackage.verifyingKey.E, tp);
-
-    // 4. Update secret share s' = s + t
-    final n = secp256k1Curve.n;
-    final newSecretShare = (keyPackage.secretShare + t) % n;
-
-    // 5. Update verifying share vs' = vs + t*G
-    final newVerifyingShare = elemAdd(keyPackage.verifyingShare, tp);
-
-    return KeyPackage(
-      keyPackage.identifier,
-      newSecretShare,
-      newVerifyingShare,
-      VerifyingKey(E: newVerifyingKeyPoint),
-      keyPackage.minSigners,
-    );
+    final kpJson = jsonEncode(toJson());
+    final kpPtr = kpJson.toNativeUtf8();
+    Pointer<Uint8> mrPtr;
+    int mrLen;
+    if (merkleRoot != null && merkleRoot.isNotEmpty) {
+      mrPtr = toNativeBytes(merkleRoot);
+      mrLen = merkleRoot.length;
+    } else {
+      mrPtr = Pointer<Uint8>.fromAddress(0);
+      mrLen = 0;
+    }
+    try {
+      final resultJson = callFfiData(keyPackageTweakFfi(kpPtr, mrPtr, mrLen));
+      final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
+      return KeyPackage.fromJson(parsed);
+    } finally {
+      calloc.free(kpPtr);
+      if (mrLen > 0) calloc.free(mrPtr);
+    }
   }
 }
 
 class PublicKeyPackage {
-  final Map<Identifier, VerifyingShare> verifyingShares;
+  final Map<Identifier, String> verifyingShares; // id -> compressed hex
   final VerifyingKey verifyingKey;
 
   PublicKeyPackage(this.verifyingShares, this.verifyingKey);
@@ -212,77 +213,64 @@ class PublicKeyPackage {
       final id = Identifier.deserialize(
         Uint8List.fromList(hex.decode(key)),
       );
-      final share = elemDeserializeCompressed(
-        Uint8List.fromList(hex.decode(value.toString())),
-      );
-      return MapEntry(id, share);
+      return MapEntry(id, value.toString());
     });
     final verifyingKey = VerifyingKey(
-      E: elemDeserializeCompressed(
-        Uint8List.fromList(hex.decode(json['verifyingKey'].toString())),
-      ),
+      E: json['verifyingKey'].toString(),
     );
     return PublicKeyPackage(verifyingShares, verifyingKey);
   }
 
   Map<String, dynamic> toJson() {
-    final verifyingShares = this.verifyingShares.map(
-          (key, value) => MapEntry(
-            hex.encode(key.serialize()),
-            hex.encode(elemSerializeCompressed(value)),
-          ),
-        );
+    final shares = verifyingShares.map(
+      (key, value) => MapEntry(
+        hex.encode(key.serialize()),
+        value,
+      ),
+    );
     return {
-      'verifyingShares': verifyingShares,
-      'verifyingKey': hex.encode(elemSerializeCompressed(verifyingKey.E)),
+      'verifyingShares': shares,
+      'verifyingKey': verifyingKey.E,
     };
   }
 
   bool get hasEvenY {
-    return verifyingKey.E.y!.toBigInteger()!.isEven;
+    return verifyingKey.hasEvenY;
   }
 
   PublicKeyPackage intoEvenY({bool? isEven}) {
-    final currentIsEven = isEven ?? hasEvenY;
-    if (!currentIsEven) {
-      final n = secp256k1Curve.n;
-      final negMultiplier = n - BigInt.one;
-
-      final newVerifyingKeyPoint = (verifyingKey.E * negMultiplier)!;
-      final newVerifyingShares = verifyingShares.map((id, share) {
-        final newShare = (share * negMultiplier)!;
-        return MapEntry(id, newShare);
-      });
-
-      return PublicKeyPackage(
-        newVerifyingShares,
-        VerifyingKey(E: newVerifyingKeyPoint),
-      );
+    final pkpJson = jsonEncode(toJson());
+    final ptr = pkpJson.toNativeUtf8();
+    try {
+      final resultJson = callFfiData(pubKeyPackageIntoEvenYFfi(ptr));
+      final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
+      return PublicKeyPackage.fromJson(parsed);
+    } finally {
+      calloc.free(ptr);
     }
-    return this;
   }
 
   PublicKeyPackage tweak(List<int>? merkleRoot) {
-    // 1. Ensure even Y
-    final pubKeyPackage = intoEvenY();
-
-    // 2. Compute tweak t
-    final t = computeTweak(pubKeyPackage.verifyingKey.E, merkleRoot);
-    final tp = elemBaseMul(t);
-
-    // 3. Update verification key Q = P + t*G
-    final newVerifyingKeyPoint = elemAdd(pubKeyPackage.verifyingKey.E, tp);
-
-    // 4. Update verifying shares vs_i' = vs_i + t*G
-    final newVerifyingShares = pubKeyPackage.verifyingShares.map((id, vs) {
-      final newShare = elemAdd(vs, tp);
-      return MapEntry(id, newShare);
-    });
-
-    return PublicKeyPackage(
-      newVerifyingShares,
-      VerifyingKey(E: newVerifyingKeyPoint),
-    );
+    final pkpJson = jsonEncode(toJson());
+    final pkpPtr = pkpJson.toNativeUtf8();
+    Pointer<Uint8> mrPtr;
+    int mrLen;
+    if (merkleRoot != null && merkleRoot.isNotEmpty) {
+      mrPtr = toNativeBytes(merkleRoot);
+      mrLen = merkleRoot.length;
+    } else {
+      mrPtr = Pointer<Uint8>.fromAddress(0);
+      mrLen = 0;
+    }
+    try {
+      final resultJson =
+          callFfiData(pubKeyPackageTweakFfi(pkpPtr, mrPtr, mrLen));
+      final parsed = jsonDecode(resultJson) as Map<String, dynamic>;
+      return PublicKeyPackage.fromJson(parsed);
+    } finally {
+      calloc.free(pkpPtr);
+      if (mrLen > 0) calloc.free(mrPtr);
+    }
   }
 }
 
@@ -295,95 +283,100 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   return evaluatePolynomial(peer, coeffs);
 }
 
+SecretKey newSecretKey() {
+  return SecretKey(modNRandom());
+}
+
+// ---------------------------------------------------------------------------
+// DKG Part 1
+// ---------------------------------------------------------------------------
+
 (Round1SecretPackage, Round1Package) dkgPart1(
   int maxSigners,
   int minSigners,
   SecretKey secretKey,
-  List<BigInt> coffiecients,
+  List<BigInt> coefficients,
 ) {
-  validateNumOfSigners(minSigners, maxSigners);
+  final secretHex = _bigIntToHex64(secretKey.scalar);
+  final coeffsJson = _coeffsToJson(coefficients);
 
-  final (coeffs, commitment) = generateSecretPolynomial(
-    secretKey.scalar,
-    maxSigners,
-    minSigners,
-    coffiecients,
-  );
+  final secretPtr = secretHex.toNativeUtf8();
+  final coeffsPtr = coeffsJson.toNativeUtf8();
+  try {
+    final (data, handle) = callFfi(
+      dkgPart1Ffi(maxSigners, minSigners, secretPtr, coeffsPtr),
+    );
 
-  final verifyingCommit = VerifiableSecretSharingCommitment(commitment);
-  final verifyingKey = verifyingCommit.toVerifyingKey();
-  final verifyingKeyBytes = elemSerializeCompressed(verifyingKey.E);
+    final r1Pkg = Round1Package.fromJson(
+      jsonDecode(data) as Map<String, dynamic>,
+    );
 
-  final identifier = Identifier.derive(verifyingKeyBytes);
+    // Build the Round1SecretPackage with the opaque handle
+    final vk = r1Pkg.commitment.toVerifyingKey();
+    final vkBytes = elemSerializeCompressed(vk.E);
+    final identifier = Identifier.derive(vkBytes);
 
-  final sig = computeProofOfKnowledge(identifier, coeffs, verifyingKey);
+    final allCoeffs = <BigInt>[secretKey.scalar, ...coefficients];
 
-  final secretPkg = Round1SecretPackage(
-    identifier,
-    coeffs,
-    VerifiableSecretSharingCommitment(commitment),
-    minSigners,
-    maxSigners,
-  );
-  final pubPkg = Round1Package(
-    VerifiableSecretSharingCommitment(commitment),
-    sig,
-    verifyingKey,
-  );
-  return (secretPkg, pubPkg);
+    final r1Secret = Round1SecretPackage(
+      identifier,
+      allCoeffs,
+      r1Pkg.commitment,
+      minSigners,
+      maxSigners,
+      handle,
+    );
+
+    return (r1Secret, r1Pkg);
+  } finally {
+    calloc.free(secretPtr);
+    calloc.free(coeffsPtr);
+  }
 }
+
+// ---------------------------------------------------------------------------
+// DKG Part 2
+// ---------------------------------------------------------------------------
 
 (Round2SecretPackage, Map<Identifier, Round2Package>) dkgPart2(
   Round1SecretPackage secretPkg,
   Map<Identifier, Round1Package> round1Pkgs, {
   List<Identifier> receiverIdentifiers = const [],
 }) {
-  if (round1Pkgs.length + receiverIdentifiers.length !=
-      secretPkg.maxSigners - 1) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
-  for (final p in round1Pkgs.values) {
-    if (p.commitment.coeffs.length != secretPkg.minSigners) {
-      throw IncorrectNumberOfCommitmentsException(
-        "incorrect number of commitments",
-      );
-    }
-  }
+  final r1PkgsJson = _encodeR1PkgsJson(round1Pkgs);
+  final receiverIdsJson = _encodeIdentifierListJson(receiverIdentifiers);
 
-  final out = <Identifier, Round2Package>{};
+  final r1PkgsPtr = r1PkgsJson.toNativeUtf8();
+  final receiverIdsPtr = receiverIdsJson.toNativeUtf8();
+  try {
+    final (data, handle) = callFfi(
+      dkgPart2Ffi(secretPkg.handle, r1PkgsPtr, receiverIdsPtr),
+    );
 
-  // Compute shares for other dealers (verify proofs)
-  for (final entry in round1Pkgs.entries) {
-    final senderID = entry.key;
-    final pkg = entry.value;
+    final r2PkgsMap = _decodeR2PkgsJson(data);
 
-    final verifyingKey = pkg.commitment.toVerifyingKey();
-    verifyProofOfKnowledge(senderID, verifyingKey, pkg.proofOfKnowledge);
+    // Compute self-share for Round2SecretPackage
+    final fii = evaluatePolynomial(secretPkg.identifier, secretPkg.coefficients);
 
-    final share = secretShareFromCoefficients(secretPkg.coefficients, senderID);
-    out[senderID] = Round2Package(share);
-  }
-
-  // Compute shares for passive receivers (no proof to verify)
-  for (final receiverId in receiverIdentifiers) {
-    final share =
-        secretShareFromCoefficients(secretPkg.coefficients, receiverId);
-    out[receiverId] = Round2Package(share);
-  }
-
-  final fii = evaluatePolynomial(secretPkg.identifier, secretPkg.coefficients);
-
-  return (
-    Round2SecretPackage(
+    final r2Secret = Round2SecretPackage(
       secretPkg.identifier,
       secretPkg.commitment,
       fii,
       secretPkg.minSigners,
       secretPkg.maxSigners,
-    ),
-    out,
-  );
+      handle,
+    );
+
+    return (r2Secret, r2PkgsMap);
+  } finally {
+    calloc.free(r1PkgsPtr);
+    calloc.free(receiverIdsPtr);
+  }
 }
+
+// ---------------------------------------------------------------------------
+// DKG Part 3
+// ---------------------------------------------------------------------------
 
 (KeyPackage, PublicKeyPackage) dkgPart3(
   Round1SecretPackage r1Secret,
@@ -392,70 +385,44 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   Map<Identifier, Round2Package> round2Pkgs, {
   List<Identifier> receiverIdentifiers = const [],
 }) {
-  if (round1Pkgs.length + receiverIdentifiers.length !=
-      r2Secret.maxSigners - 1) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
-  if (round1Pkgs.length != round2Pkgs.length) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
-  for (final id in round1Pkgs.keys) {
-    if (!round2Pkgs.containsKey(id)) {
-      throw IncorrectPackageException("incorrect package mapping");
-    }
-  }
+  final r1PkgsJson = _encodeR1PkgsJson(round1Pkgs);
+  final r2PkgsJson = _encodeR2PkgsJson(round2Pkgs);
+  final receiverIdsJson = _encodeIdentifierListJson(receiverIdentifiers);
 
-  var si = modNZero();
-
-  for (final entry in round2Pkgs.entries) {
-    final senderID = entry.key;
-    final pkg2 = entry.value;
-
-    final r1 = round1Pkgs[senderID]!;
-    final temp = ThresholdShare(
-      r2Secret.identifier,
-      pkg2.secretShare,
-      elemBaseMul(pkg2.secretShare),
-      r1.commitment,
+  final r1PkgsPtr = r1PkgsJson.toNativeUtf8();
+  final r2PkgsPtr = r2PkgsJson.toNativeUtf8();
+  final receiverIdsPtr = receiverIdsJson.toNativeUtf8();
+  try {
+    final data = callFfiData(
+      dkgPart3Ffi(
+        r1Secret.handle,
+        r2Secret.handle,
+        r1PkgsPtr,
+        r2PkgsPtr,
+        receiverIdsPtr,
+      ),
     );
-    temp.verify();
-    si = (si + pkg2.secretShare);
+
+    final parsed = jsonDecode(data) as Map<String, dynamic>;
+    final kp = KeyPackage.fromJson(
+      parsed['key_package'] as Map<String, dynamic>,
+    );
+    final pkp = PublicKeyPackage.fromJson(
+      parsed['public_key_package'] as Map<String, dynamic>,
+    );
+
+    return (kp, pkp);
+  } finally {
+    calloc.free(r1PkgsPtr);
+    calloc.free(r2PkgsPtr);
+    calloc.free(receiverIdsPtr);
   }
-
-  si = (si + r2Secret.secretShare);
-  final secretShare = si;
-
-  final verifyingShare = elemBaseMul(secretShare);
-
-  // Build commitment map from dealer round1 packages
-  final commitMap = <Identifier, VerifiableSecretSharingCommitment>{};
-  for (final entry in round1Pkgs.entries) {
-    commitMap[entry.key] = entry.value.commitment;
-  }
-  commitMap[r2Secret.identifier] = r2Secret.commitment;
-
-  // Build PublicKeyPackage with ALL participant IDs (dealers + receivers)
-  final group = sumCommitments(commitMap.values.toList());
-  final allIds = [...commitMap.keys, ...receiverIdentifiers]
-    ..sort((a, b) => a.s.compareTo(b.s));
-  final publicKeyPackage = pkpFromCommitment(allIds, group);
-
-  final keyPackage = KeyPackage(
-    r2Secret.identifier,
-    secretShare,
-    verifyingShare,
-    publicKeyPackage.verifyingKey,
-    r2Secret.minSigners,
-  );
-
-  return (keyPackage.intoEvenY(), publicKeyPackage.intoEvenY());
 }
 
-/// DKG Part 3 for a passive receiver (no secret polynomial contribution).
-///
-/// The receiver verifies shares from each dealer against their commitments,
-/// accumulates the shares (no self-share), and derives its KeyPackage and
-/// the shared PublicKeyPackage.
+// ---------------------------------------------------------------------------
+// DKG Part 3 Receive (passive)
+// ---------------------------------------------------------------------------
+
 (KeyPackage, PublicKeyPackage) dkgPart3Receive(
   Identifier myIdentifier,
   Map<Identifier, Round1Package> dealerRound1Pkgs,
@@ -464,80 +431,71 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   int maxSigners,
   List<Identifier> allParticipantIdentifiers,
 ) {
-  if (dealerRound1Pkgs.length != sharesForMe.length) {
-    throw IncorrectNumberOfPackagesException(
-      "dealer round1 packages and shares must have same length",
+  final myIdHex = _bigIntToHex64(myIdentifier.toScalar());
+  final dealerR1Json = _encodeR1PkgsJson(dealerRound1Pkgs);
+  final sharesJson = _encodeR2PkgsJson(sharesForMe);
+  final allIdsJson = _encodeIdentifierListJson(allParticipantIdentifiers);
+
+  final myIdPtr = myIdHex.toNativeUtf8();
+  final dealerR1Ptr = dealerR1Json.toNativeUtf8();
+  final sharesPtr = sharesJson.toNativeUtf8();
+  final allIdsPtr = allIdsJson.toNativeUtf8();
+  try {
+    final data = callFfiData(
+      dkgPart3ReceiveFfi(
+        myIdPtr,
+        dealerR1Ptr,
+        sharesPtr,
+        minSigners,
+        maxSigners,
+        allIdsPtr,
+      ),
     );
-  }
-  for (final id in dealerRound1Pkgs.keys) {
-    if (!sharesForMe.containsKey(id)) {
-      throw IncorrectPackageException("missing share from dealer $id");
-    }
-  }
 
-  // Verify each dealer's share against their commitment, then accumulate
-  var si = modNZero();
-  for (final entry in sharesForMe.entries) {
-    final dealerId = entry.key;
-    final pkg2 = entry.value;
-
-    final r1 = dealerRound1Pkgs[dealerId]!;
-    final temp = ThresholdShare(
-      myIdentifier,
-      pkg2.secretShare,
-      elemBaseMul(pkg2.secretShare),
-      r1.commitment,
+    final parsed = jsonDecode(data) as Map<String, dynamic>;
+    final kp = KeyPackage.fromJson(
+      parsed['key_package'] as Map<String, dynamic>,
     );
-    temp.verify();
-    si = (si + pkg2.secretShare);
+    final pkp = PublicKeyPackage.fromJson(
+      parsed['public_key_package'] as Map<String, dynamic>,
+    );
+
+    return (kp, pkp);
+  } finally {
+    calloc.free(myIdPtr);
+    calloc.free(dealerR1Ptr);
+    calloc.free(sharesPtr);
+    calloc.free(allIdsPtr);
   }
-
-  // Receiver has no self-share — secretShare is the sum of received shares
-  final secretShare = si;
-  final verifyingShare = elemBaseMul(secretShare);
-
-  // Build PublicKeyPackage from dealer commitments with ALL participant IDs
-  final dealerCommitments =
-      dealerRound1Pkgs.values.map((pkg) => pkg.commitment).toList();
-  final group = sumCommitments(dealerCommitments);
-
-  final sortedIds = List<Identifier>.from(allParticipantIdentifiers)
-    ..sort((a, b) => a.s.compareTo(b.s));
-  final publicKeyPackage = pkpFromCommitment(sortedIds, group);
-
-  final keyPackage = KeyPackage(
-    myIdentifier,
-    secretShare,
-    verifyingShare,
-    publicKeyPackage.verifyingKey,
-    minSigners,
-  );
-
-  return (keyPackage.intoEvenY(), publicKeyPackage.intoEvenY());
 }
+
+// ---------------------------------------------------------------------------
+// PKP helpers
+// ---------------------------------------------------------------------------
 
 PublicKeyPackage pkpFromDkgCommitments(
   Map<Identifier, VerifiableSecretSharingCommitment> commits,
 ) {
-  final ids = commits.keys.toList();
-  final list = commits.values.toList();
-
-  final group = sumCommitments(list);
-  ids.sort((a, b) => a.s.compareTo(b.s));
-  return pkpFromCommitment(ids, group);
+  // This requires point arithmetic (sum commitments + evaluate).
+  // All call sites go through Rust DKG functions. If called directly,
+  // we'd need to serialize and call through FFI.
+  throw UnimplementedError(
+    'pkpFromDkgCommitments — use dkgPart3 or dkgPart3Receive instead.',
+  );
 }
 
 PublicKeyPackage pkpFromCommitment(
   List<Identifier> ids,
   VerifiableSecretSharingCommitment commit,
 ) {
-  final vmap = <Identifier, VerifyingShare>{};
-  for (final id in ids) {
-    vmap[id] = commit.getVerifyingShare(id);
-  }
-  final vk = commit.toVerifyingKey();
-  return PublicKeyPackage(vmap, vk);
+  throw UnimplementedError(
+    'pkpFromCommitment — use dkgPart3 or dkgPart3Receive instead.',
+  );
 }
+
+// ---------------------------------------------------------------------------
+// Key Refresh
+// ---------------------------------------------------------------------------
 
 (Round1SecretPackage, Round1Package) dkgRefreshPart1(
   Identifier identifier,
@@ -545,89 +503,77 @@ PublicKeyPackage pkpFromCommitment(
   int minSigners, {
   List<int>? seed,
 }) {
-  validateNumOfSigners(minSigners, maxSigners);
+  final idHex = _bigIntToHex64(identifier.toScalar());
+  final idPtr = idHex.toNativeUtf8();
 
-  final refreshingKey = modNZero();
-  final coeffOnly = generateCoefficients(minSigners - 1, seed: seed);
-
-  final (coeffs, commitment) = generateSecretPolynomial(
-    refreshingKey,
-    maxSigners,
-    minSigners,
-    coeffOnly,
-  );
-
-  if (commitment.isEmpty) {
-    throw InvalidCommitVectorException("invalid commit vector");
+  Pointer<Uint8> seedPtr;
+  int seedLen;
+  if (seed != null && seed.isNotEmpty) {
+    seedPtr = toNativeBytes(seed);
+    seedLen = seed.length;
+  } else {
+    seedPtr = Pointer<Uint8>.fromAddress(0);
+    seedLen = 0;
   }
-  final trimmed = commitment.sublist(1);
-  final trimCommit = VerifiableSecretSharingCommitment(trimmed);
 
-  final verifyingKey = trimCommit.toVerifyingKey();
+  try {
+    final (data, handle) = callFfi(
+      dkgRefreshPart1Ffi(idPtr, maxSigners, minSigners, seedPtr, seedLen),
+    );
 
-  final sig = computeProofOfKnowledge(identifier, coeffs, verifyingKey);
+    final parsed = jsonDecode(data) as Map<String, dynamic>;
+    final r1Pkg = Round1Package.fromJson(
+      parsed['round1Package'] as Map<String, dynamic>,
+    );
 
-  final sec = Round1SecretPackage(
-    identifier,
-    coeffs,
-    trimCommit,
-    minSigners,
-    maxSigners,
-  );
-  final pub = Round1Package(trimCommit, sig, verifyingKey);
-  return (sec, pub);
+    // Extract coefficients returned by FFI (full polynomial including zero constant term)
+    final coeffsRaw = parsed['coefficients'] as List;
+    final coefficients = coeffsRaw
+        .map((e) => bytesToBigInt(Uint8List.fromList(hex.decode(e as String))))
+        .toList();
+
+    final r1Secret = Round1SecretPackage(
+      identifier,
+      coefficients,
+      r1Pkg.commitment,
+      minSigners,
+      maxSigners,
+      handle,
+    );
+
+    return (r1Secret, r1Pkg);
+  } finally {
+    calloc.free(idPtr);
+    if (seedLen > 0) calloc.free(seedPtr);
+  }
 }
 
 (Round2SecretPackage, Map<Identifier, Round2Package>) dkgRefreshPart2(
   Round1SecretPackage secretPkg,
   Map<Identifier, Round1Package> round1Pkgs,
 ) {
-  if (round1Pkgs.length != secretPkg.maxSigners - 1) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
+  final r1PkgsJson = _encodeR1PkgsJson(round1Pkgs);
+  final r1PkgsPtr = r1PkgsJson.toNativeUtf8();
+  try {
+    final (data, handle) = callFfi(
+      dkgRefreshPart2Ffi(secretPkg.handle, r1PkgsPtr),
+    );
 
-  final elemIdentity = secp256k1Curve.curve.infinity!;
-  final identity = elemIdentity;
+    final r2PkgsMap = _decodeR2PkgsJson(data);
 
-  final myCoeffs = <ECPoint>[identity, ...secretPkg.commitment.coeffs];
-  secretPkg = Round1SecretPackage(
-    secretPkg.identifier,
-    secretPkg.coefficients,
-    VerifiableSecretSharingCommitment(myCoeffs),
-    secretPkg.minSigners,
-    secretPkg.maxSigners,
-  );
-
-  final out = <Identifier, Round2Package>{};
-
-  for (final entry in round1Pkgs.entries) {
-    final senderID = entry.key;
-    final r1 = entry.value;
-
-    final peerCoeffs = <ECPoint>[identity, ...r1.commitment.coeffs];
-
-    if (peerCoeffs.length != secretPkg.minSigners) {
-      throw IncorrectNumberOfCommitmentsException(
-        "incorrect number of commitments",
-      );
-    }
-
-    final share = secretShareFromCoefficients(secretPkg.coefficients, senderID);
-    out[senderID] = Round2Package(share);
-  }
-
-  final fii = evaluatePolynomial(secretPkg.identifier, secretPkg.coefficients);
-
-  return (
-    Round2SecretPackage(
+    final r2Secret = Round2SecretPackage(
       secretPkg.identifier,
       secretPkg.commitment,
-      fii,
+      BigInt.zero, // managed by Rust
       secretPkg.minSigners,
       secretPkg.maxSigners,
-    ),
-    out,
-  );
+      handle,
+    );
+
+    return (r2Secret, r2PkgsMap);
+  } finally {
+    calloc.free(r1PkgsPtr);
+  }
 }
 
 (KeyPackage, PublicKeyPackage) dkgRefreshPart3(
@@ -637,84 +583,93 @@ PublicKeyPackage pkpFromCommitment(
   PublicKeyPackage oldPKP,
   KeyPackage oldKP,
 ) {
-  final newR1 = <Identifier, Round1Package>{};
-  final elemIdentity = secp256k1Curve.curve.infinity!;
-  final identity = elemIdentity;
+  final r1PkgsJson = _encodeR1PkgsJson(round1Pkgs);
+  final r2PkgsJson = _encodeR2PkgsJson(round2Pkgs);
+  final oldPkpJson = jsonEncode(oldPKP.toJson());
+  final oldKpJson = jsonEncode(oldKP.toJson());
 
-  for (final entry in round1Pkgs.entries) {
-    final senderID = entry.key;
-    final r1 = entry.value;
-    final coeffs = <ECPoint>[identity, ...r1.commitment.coeffs];
-    newR1[senderID] = Round1Package(VerifiableSecretSharingCommitment(coeffs),
-        r1.proofOfKnowledge, oldPKP.verifyingKey);
-  }
-
-  if (newR1.length != r2Secret.maxSigners - 1) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
-  if (newR1.length != round2Pkgs.length) {
-    throw IncorrectNumberOfPackagesException("incorrect number of packages");
-  }
-  for (final id in newR1.keys) {
-    if (!round2Pkgs.containsKey(id)) {
-      throw IncorrectPackageException("incorrect package mapping");
-    }
-  }
-
-  var si = modNZero();
-
-  for (final entry in round2Pkgs.entries) {
-    final senderID = entry.key;
-    final r2 = entry.value;
-
-    final r1 = newR1[senderID]!;
-    final temp = ThresholdShare(
-      r2Secret.identifier,
-      r2.secretShare,
-      elemBaseMul(r2.secretShare),
-      r1.commitment,
+  final r1PkgsPtr = r1PkgsJson.toNativeUtf8();
+  final r2PkgsPtr = r2PkgsJson.toNativeUtf8();
+  final oldPkpPtr = oldPkpJson.toNativeUtf8();
+  final oldKpPtr = oldKpJson.toNativeUtf8();
+  try {
+    final data = callFfiData(
+      dkgRefreshPart3Ffi(
+        r2Secret.handle,
+        r1PkgsPtr,
+        r2PkgsPtr,
+        oldPkpPtr,
+        oldKpPtr,
+      ),
     );
-    temp.verify();
-    si = (si + r2.secretShare);
+
+    final parsed = jsonDecode(data) as Map<String, dynamic>;
+    final kp = KeyPackage.fromJson(
+      parsed['key_package'] as Map<String, dynamic>,
+    );
+    final pkp = PublicKeyPackage.fromJson(
+      parsed['public_key_package'] as Map<String, dynamic>,
+    );
+
+    return (kp, pkp);
+  } finally {
+    calloc.free(r1PkgsPtr);
+    calloc.free(r2PkgsPtr);
+    calloc.free(oldPkpPtr);
+    calloc.free(oldKpPtr);
   }
+}
 
-  si = (si + r2Secret.secretShare);
+// ---------------------------------------------------------------------------
+// Internal JSON helpers
+// ---------------------------------------------------------------------------
 
-  final oldShare = oldKP.secretShare;
-  si = (si + oldShare);
-
-  final newSecretShare = si;
-  final newVerifying = elemBaseMul(newSecretShare);
-
-  final commitMap = <Identifier, VerifiableSecretSharingCommitment>{};
-  for (final entry in newR1.entries) {
-    commitMap[entry.key] = entry.value.commitment;
+String _bigIntToHex64(BigInt v) {
+  var h = v.toRadixString(16);
+  while (h.length < 64) {
+    h = '0$h';
   }
-  commitMap[r2Secret.identifier] = r2Secret.commitment;
+  return h;
+}
 
-  final zeroPKP = pkpFromDkgCommitments(commitMap);
+String _coeffsToJson(List<BigInt> coeffs) {
+  final arr = coeffs.map((c) => '"${_bigIntToHex64(c)}"').join(',');
+  return '[$arr]';
+}
 
-  final newVS = <Identifier, VerifyingShare>{};
-  for (final entry in zeroPKP.verifyingShares.entries) {
-    final id = entry.key;
-    final vsNew = entry.value;
-    final vsOld = oldPKP.verifyingShares[id];
-    if (vsOld == null) {
-      throw UnknownIdentifierException("unknown identifier");
-    }
-    final sum = elemAdd(vsNew, vsOld);
-    newVS[id] = sum;
+String _encodeR1PkgsJson(Map<Identifier, Round1Package> pkgs) {
+  final map = <String, dynamic>{};
+  for (final entry in pkgs.entries) {
+    final idHex = hex.encode(entry.key.serialize());
+    map[idHex] = entry.value.toJson();
   }
+  return jsonEncode(map);
+}
 
-  final pub = PublicKeyPackage(newVS, oldPKP.verifyingKey);
+String _encodeR2PkgsJson(Map<Identifier, Round2Package> pkgs) {
+  final map = <String, dynamic>{};
+  for (final entry in pkgs.entries) {
+    final idHex = hex.encode(entry.key.serialize());
+    map[idHex] = entry.value.toJson();
+  }
+  return jsonEncode(map);
+}
 
-  final kp = KeyPackage(
-    r2Secret.identifier,
-    newSecretShare,
-    newVerifying,
-    pub.verifyingKey,
-    r2Secret.minSigners,
-  );
+String _encodeIdentifierListJson(List<Identifier> ids) {
+  final list = ids.map((id) => hex.encode(id.serialize())).toList();
+  return jsonEncode(list);
+}
 
-  return (kp, pub);
+Map<Identifier, Round2Package> _decodeR2PkgsJson(String json) {
+  final parsed = jsonDecode(json) as Map<String, dynamic>;
+  final result = <Identifier, Round2Package>{};
+  for (final entry in parsed.entries) {
+    final id = Identifier.deserialize(
+      Uint8List.fromList(hex.decode(entry.key)),
+    );
+    result[id] = Round2Package.fromJson(
+      entry.value as Map<String, dynamic>,
+    );
+  }
+  return result;
 }

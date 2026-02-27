@@ -1,9 +1,12 @@
+import 'dart:ffi';
 import 'dart:typed_data';
-import 'package:pointycastle/ecc/api.dart';
+import 'package:convert/convert.dart';
+import 'package:ffi/ffi.dart';
+import 'package:threshold/core/dkg.dart';
 import 'package:threshold/core/utils.dart';
 import 'package:threshold/frost/signature.dart';
-import 'package:threshold/core/share.dart';
-import 'package:threshold/core/dkg.dart';
+import 'package:threshold/src/bindings.dart';
+import 'package:threshold/src/ffi_result.dart';
 import 'auth_message.dart';
 
 /// Single-key Schnorr signer for authentication.
@@ -12,15 +15,21 @@ import 'auth_message.dart';
 /// a single private key (not threshold). Used for authenticating
 /// gRPC requests before MPC operations.
 class AuthSigner {
-  final BigInt _privateKey;
-  final ECPoint _publicKey;
+  final Pointer<Void> _handle;
+  final String _publicKeyCompressedHex;
 
-  AuthSigner._(this._privateKey, this._publicKey);
+  AuthSigner._(this._handle, this._publicKeyCompressedHex);
 
   /// Creates an AuthSigner from a secret key scalar.
   factory AuthSigner.fromSecretKey(BigInt secretKey) {
-    final publicKey = elemBaseMul(secretKey);
-    return AuthSigner._(secretKey, publicKey);
+    final secretHex = _bigIntToHex64(secretKey);
+    final ptr = secretHex.toNativeUtf8();
+    try {
+      final (pkHex, handle) = callFfi(authSignerCreateFfi(ptr));
+      return AuthSigner._(handle, pkHex);
+    } finally {
+      calloc.free(ptr);
+    }
   }
 
   /// Creates an AuthSigner from a SecretKey object.
@@ -37,52 +46,37 @@ class AuthSigner {
     return AuthSigner.fromSecretKey(scalar);
   }
 
-  /// Returns the public key point.
-  ECPoint get publicKey => _publicKey;
-
   /// Returns the compressed public key bytes (33 bytes).
-  Uint8List get publicKeyCompressed => elemSerializeCompressed(_publicKey);
+  Uint8List get publicKeyCompressed =>
+      Uint8List.fromList(hex.decode(_publicKeyCompressedHex));
 
   /// Returns the x-only public key bytes (32 bytes) for BIP-340.
-  Uint8List get publicKeyXOnly => elemSerializeCompressed(_publicKey).sublist(1);
+  Uint8List get publicKeyXOnly =>
+      Uint8List.fromList(hex.decode(_publicKeyCompressedHex)).sublist(1);
 
   /// Signs a message using BIP-340 Schnorr signature scheme.
   ///
-  /// Returns a 64-byte signature (32-byte R x-coordinate + 32-byte s scalar).
+  /// Returns a Signature object.
   Signature sign(Uint8List message) {
-    // Ensure public key has even Y (BIP-340 requirement)
-    var privateKey = _privateKey;
-    var publicKey = _publicKey;
+    final msgPtr = toNativeBytes(message);
+    try {
+      final sigHex = callFfiData(
+        authSignerSignFfi(_handle, msgPtr, message.length),
+      );
+      // sigHex is 128 chars = 64 bytes (32 R x-only + 32 s)
+      final sigBytes = hex.decode(sigHex);
 
-    if (!publicKey.y!.toBigInteger()!.isEven) {
-      privateKey = secp256k1Curve.n - privateKey;
-      publicKey = elemBaseMul(privateKey);
+      // Reconstruct R as compressed point with 0x02 prefix (even Y)
+      final rXBytes = Uint8List(33);
+      rXBytes[0] = 0x02;
+      rXBytes.setRange(1, 33, sigBytes.sublist(0, 32));
+      final rHex = hex.encode(rXBytes);
+
+      final z = bytesToBigInt(Uint8List.fromList(sigBytes.sublist(32, 64)));
+      return Signature(rHex, z);
+    } finally {
+      calloc.free(msgPtr);
     }
-
-    // Generate deterministic nonce using RFC 6979 style approach
-    // k = H(d || m) where d is private key, m is message
-    final nonceInput = Uint8List(64);
-    nonceInput.setRange(0, 32, bigIntToBytes(privateKey));
-    nonceInput.setRange(32, 64, message);
-    final k = taggedHash('BIP0340/nonce', nonceInput);
-
-    // R = k * G
-    var R = elemBaseMul(k);
-    var kAdjusted = k;
-
-    // Ensure R has even Y
-    if (!R.y!.toBigInteger()!.isEven) {
-      kAdjusted = secp256k1Curve.n - k;
-      R = elemBaseMul(kAdjusted);
-    }
-
-    // e = H(R || P || m)
-    final challenge = computeChallenge(R, VerifyingKey(E: publicKey), message);
-
-    // s = k + e * d (mod n)
-    final s = (kAdjusted + (challenge * privateKey)) % secp256k1Curve.n;
-
-    return Signature(R, s);
   }
 
   /// Signs an AuthMessage and returns the serialized signature bytes.
@@ -92,8 +86,6 @@ class AuthSigner {
   }
 
   /// Creates a signature for a specific operation.
-  ///
-  /// This is a convenience method that builds the AuthMessage internally.
   Uint8List signOperation({
     required String operation,
     required String userIdHex,
@@ -109,39 +101,38 @@ class AuthSigner {
 }
 
 /// Verifies a BIP-340 Schnorr signature against a public key.
-///
-/// This is a standalone verification function that can be used
-/// without an AuthSigner instance.
 bool verifySchnorrSignature({
   required Uint8List publicKeyCompressed,
   required Uint8List message,
   required Uint8List signatureBytes,
 }) {
-  if (signatureBytes.length != 64) {
-    return false;
-  }
-  if (publicKeyCompressed.length != 33) {
-    return false;
-  }
+  if (signatureBytes.length != 64) return false;
+  if (publicKeyCompressed.length != 33) return false;
 
+  final pkHex = hex.encode(publicKeyCompressed);
+  final sigHex = hex.encode(signatureBytes);
+
+  final pkPtr = pkHex.toNativeUtf8();
+  final msgPtr = toNativeBytes(message);
+  final sigPtr = sigHex.toNativeUtf8();
   try {
-    // Parse signature
-    final rXBytes = Uint8List(33);
-    // Determine the prefix byte based on convention (assume even Y for x-only)
-    rXBytes[0] = 0x02;
-    rXBytes.setRange(1, 33, signatureBytes.sublist(0, 32));
-
-    final R = elemDeserializeCompressed(rXBytes);
-    final z = bytesToBigInt(signatureBytes.sublist(32, 64));
-
-    final signature = Signature(R, z);
-    final publicKey = elemDeserializeCompressed(publicKeyCompressed);
-    final verifyingKey = VerifyingKey(E: publicKey);
-
-    // This will throw if verification fails
-    signature.verify(verifyingKey, message);
-    return true;
-  } catch (e) {
+    final result = callFfiData(
+      verifySchnorrFfi(pkPtr, msgPtr, message.length, sigPtr),
+    );
+    return result == 'true';
+  } catch (_) {
     return false;
+  } finally {
+    calloc.free(pkPtr);
+    calloc.free(msgPtr);
+    calloc.free(sigPtr);
   }
+}
+
+String _bigIntToHex64(BigInt v) {
+  var h = v.toRadixString(16);
+  while (h.length < 64) {
+    h = '0$h';
+  }
+  return h;
 }

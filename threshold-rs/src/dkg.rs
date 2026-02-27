@@ -403,7 +403,7 @@ pub fn dkg_part3_receive(
 // ---------------------------------------------------------------------------
 
 /// Build a PublicKeyPackage from a summed commitment and the set of identifiers.
-fn pkp_from_commitment(
+pub fn pkp_from_commitment(
     ids: &[Identifier],
     commit: &VssCommitment,
 ) -> PublicKeyPackage {
@@ -416,6 +416,218 @@ fn pkp_from_commitment(
         verifying_shares: vmap,
         verifying_key: vk,
     }
+}
+
+/// Build a PublicKeyPackage from a map of per-participant commitments.
+///
+/// Sums the commitments, then evaluates at each participant's identifier.
+pub fn pkp_from_dkg_commitments(
+    commits: &BTreeMap<Identifier, VssCommitment>,
+) -> Result<PublicKeyPackage, Error> {
+    let ids: Vec<Identifier> = commits.keys().cloned().collect();
+    let list: Vec<VssCommitment> = commits.values().cloned().collect();
+    let group = vss::sum_commitments(&list)?;
+    let mut sorted_ids = ids;
+    sorted_ids.sort();
+    Ok(pkp_from_commitment(&sorted_ids, &group))
+}
+
+// ---------------------------------------------------------------------------
+// Key Refresh (matches Dart dkgRefreshPart1/2/3 in dkg.dart:542-720)
+// ---------------------------------------------------------------------------
+
+/// Key refresh round 1: generate a zero-secret polynomial for share refresh.
+///
+/// The constant term is zero (no net change to group key). Only higher
+/// coefficients are random. The identity point is stripped from the broadcast
+/// commitment (receivers must prepend it before verification).
+///
+/// - `identifier`: this participant's identifier.
+/// - `coefficients`: random coefficients (length = min_signers - 1).
+/// - Returns `(Round1SecretPackage, Round1Package)`.
+pub fn dkg_refresh_part1(
+    identifier: &Identifier,
+    max_signers: usize,
+    min_signers: usize,
+    coefficients: &[Scalar],
+    rng: &mut impl RngCore,
+) -> Result<(Round1SecretPackage, Round1Package), Error> {
+    validate_num_signers(min_signers, max_signers)?;
+
+    let refreshing_key = Scalar::ZERO;
+    let (coeffs, commitment_points) =
+        polynomial::generate_secret_polynomial(&refreshing_key, coefficients);
+
+    if commitment_points.is_empty() {
+        return Err(Error::InvalidCoefficients);
+    }
+
+    // Strip the identity-point first coefficient (constant term = 0 -> identity)
+    let trimmed = commitment_points[1..].to_vec();
+    let trim_commit = VssCommitment { coeffs: trimmed };
+
+    let vk = trim_commit.to_verifying_key();
+    let sig = compute_proof_of_knowledge(identifier, &coeffs, &vk, rng)?;
+
+    let secret_pkg = Round1SecretPackage {
+        identifier: identifier.clone(),
+        coefficients: coeffs,
+        commitment: trim_commit.clone(),
+        min_signers,
+        max_signers,
+    };
+    let pub_pkg = Round1Package {
+        commitment: trim_commit,
+        proof_of_knowledge: sig,
+        verifying_key: vk,
+    };
+    Ok((secret_pkg, pub_pkg))
+}
+
+/// Key refresh round 2: compute shares for each peer.
+///
+/// Prepends the identity point to each peer's commitment for verification,
+/// then evaluates our polynomial at each peer's identifier.
+pub fn dkg_refresh_part2(
+    secret_pkg: &Round1SecretPackage,
+    round1_pkgs: &BTreeMap<Identifier, Round1Package>,
+) -> Result<(Round2SecretPackage, BTreeMap<Identifier, Round2Package>), Error> {
+    if round1_pkgs.len() != secret_pkg.max_signers - 1 {
+        return Err(Error::IncorrectNumberOfPackages);
+    }
+
+    // Prepend identity to our own commitment
+    let mut my_coeffs = alloc::vec![ProjectivePoint::IDENTITY];
+    my_coeffs.extend_from_slice(&secret_pkg.commitment.coeffs);
+
+    let my_full_commit = VssCommitment { coeffs: my_coeffs };
+
+    let mut out = BTreeMap::new();
+
+    for (sender_id, r1) in round1_pkgs {
+        // Prepend identity to peer's commitment
+        let mut peer_coeffs = alloc::vec![ProjectivePoint::IDENTITY];
+        peer_coeffs.extend_from_slice(&r1.commitment.coeffs);
+
+        if peer_coeffs.len() != secret_pkg.min_signers {
+            return Err(Error::IncorrectNumberOfCommitments);
+        }
+
+        let share = polynomial::evaluate_polynomial(sender_id, &secret_pkg.coefficients);
+        out.insert(sender_id.clone(), Round2Package { secret_share: share });
+    }
+
+    let fii = polynomial::evaluate_polynomial(
+        &secret_pkg.identifier,
+        &secret_pkg.coefficients,
+    );
+
+    Ok((
+        Round2SecretPackage {
+            identifier: secret_pkg.identifier.clone(),
+            commitment: my_full_commit,
+            secret_share: fii,
+            min_signers: secret_pkg.min_signers,
+            max_signers: secret_pkg.max_signers,
+        },
+        out,
+    ))
+}
+
+/// Key refresh round 3: verify shares, combine with old key package.
+///
+/// Prepends identity to each peer's broadcast commitment, verifies received
+/// shares, accumulates refresh delta, and adds old secret share. Produces
+/// a new KeyPackage with updated shares but the same group public key.
+pub fn dkg_refresh_part3(
+    r2_secret: &Round2SecretPackage,
+    round1_pkgs: &BTreeMap<Identifier, Round1Package>,
+    round2_pkgs: &BTreeMap<Identifier, Round2Package>,
+    old_pkp: &PublicKeyPackage,
+    old_kp: &crate::keys::KeyPackage,
+) -> Result<(crate::keys::KeyPackage, PublicKeyPackage), Error> {
+    // Prepend identity to each peer's commitment
+    let mut new_r1: BTreeMap<Identifier, Round1Package> = BTreeMap::new();
+    for (sender_id, r1) in round1_pkgs {
+        let mut coeffs = alloc::vec![ProjectivePoint::IDENTITY];
+        coeffs.extend_from_slice(&r1.commitment.coeffs);
+        new_r1.insert(sender_id.clone(), Round1Package {
+            commitment: VssCommitment { coeffs },
+            proof_of_knowledge: r1.proof_of_knowledge.clone(),
+            verifying_key: old_pkp.verifying_key.clone(),
+        });
+    }
+
+    if new_r1.len() != r2_secret.max_signers - 1 {
+        return Err(Error::IncorrectNumberOfPackages);
+    }
+    if new_r1.len() != round2_pkgs.len() {
+        return Err(Error::IncorrectNumberOfPackages);
+    }
+    for id in new_r1.keys() {
+        if !round2_pkgs.contains_key(id) {
+            return Err(Error::IncorrectPackageMapping);
+        }
+    }
+
+    let mut si = Scalar::ZERO;
+
+    for (sender_id, r2) in round2_pkgs {
+        let r1 = new_r1.get(sender_id).ok_or(Error::UnknownIdentifier)?;
+
+        // Verify: share * G == commitment.getVerifyingShare(our_id)
+        let share_point = point::base_mul(&r2.secret_share);
+        let expected = r1.commitment.get_verifying_share(&r2_secret.identifier);
+        if !point::points_equal(&share_point, &expected) {
+            return Err(Error::InvalidSecretShare);
+        }
+
+        si = si + r2.secret_share;
+    }
+
+    // Add our own self-share
+    si = si + r2_secret.secret_share;
+
+    // Add old secret share
+    si = si + old_kp.secret_share;
+
+    let new_secret_share = si;
+    let new_verifying = point::base_mul(&new_secret_share);
+
+    // Build commitment map from the identity-prepended R1 packages
+    let mut commit_map: BTreeMap<Identifier, VssCommitment> = BTreeMap::new();
+    for (id, pkg) in &new_r1 {
+        commit_map.insert(id.clone(), pkg.commitment.clone());
+    }
+    commit_map.insert(r2_secret.identifier.clone(), r2_secret.commitment.clone());
+
+    let zero_pkp = pkp_from_dkg_commitments(&commit_map)?;
+
+    // Combine zero-refresh verifying shares with old verifying shares
+    let mut new_vs: BTreeMap<Identifier, ProjectivePoint> = BTreeMap::new();
+    for (id, vs_new) in &zero_pkp.verifying_shares {
+        let vs_old = old_pkp
+            .verifying_shares
+            .get(id)
+            .ok_or(Error::UnknownIdentifier)?;
+        let sum = point::point_add(vs_new, vs_old);
+        new_vs.insert(id.clone(), sum);
+    }
+
+    let pub_pkg = PublicKeyPackage {
+        verifying_shares: new_vs,
+        verifying_key: old_pkp.verifying_key.clone(),
+    };
+
+    let key_pkg = crate::keys::KeyPackage {
+        identifier: r2_secret.identifier.clone(),
+        secret_share: new_secret_share,
+        verifying_share: new_verifying,
+        verifying_key: pub_pkg.verifying_key.clone(),
+        min_signers: r2_secret.min_signers,
+    };
+
+    Ok((key_pkg, pub_pkg))
 }
 
 // ---------------------------------------------------------------------------

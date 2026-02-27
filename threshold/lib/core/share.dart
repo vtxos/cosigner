@@ -1,5 +1,5 @@
 import 'dart:typed_data';
-import 'package:pointycastle/ecc/api.dart';
+import 'package:convert/convert.dart';
 import 'package:threshold/core/commitment.dart';
 import 'package:threshold/core/errors.dart';
 import 'package:threshold/core/identifier.dart';
@@ -8,53 +8,59 @@ import 'package:threshold/core/dkg.dart';
 
 typedef SecretShare = BigInt;
 
+/// Compressed point hex string (66 chars for 33 bytes).
+typedef VerifyingShareHex = String;
+
 class VerifyingKey {
-  final ECPoint E;
+  /// Compressed point hex (e.g. "02abcd...").
+  final String E;
   VerifyingKey({required this.E});
 
   bool verify(Uint8List message, DKGSignature signature) {
-    final left = elemBaseMul(signature.Z);
-
-    final s = bytesToBigInt(message) % secp256k1Curve.n;
-    final temp = elemMul(E, s);
-
-    final right = elemAdd(signature.R, temp);
-
-    return left == right;
+    // In the FFI version, signature verification is handled by Rust.
+    throw UnimplementedError(
+      'VerifyingKey.verify is not available in FFI version. '
+      'Use Signature.verify or verifySchnorrSignature instead.',
+    );
   }
 
   bool get hasEvenY {
-    return E.y!.toBigInteger()!.isEven;
+    // Compressed point: first byte is 0x02 (even) or 0x03 (odd)
+    final firstByte = int.parse(E.substring(0, 2), radix: 16);
+    return firstByte == 0x02;
   }
 
   VerifyingKey intoEvenY({bool? isEven}) {
     final currentIsEven = isEven ?? hasEvenY;
     if (!currentIsEven) {
-      final n = secp256k1Curve.n;
-      // Negate E: -E = (n-1)*E
-      final negMultiplier = n - BigInt.one;
-      final newE = (E * negMultiplier)!;
-      return VerifyingKey(E: newE);
+      // Negate the point: flip the prefix byte and negate x (handled by Rust)
+      // For compressed points, negation flips 02<->03
+      final prefix = E.substring(0, 2) == '02' ? '03' : '02';
+      return VerifyingKey(E: '$prefix${E.substring(2)}');
     }
     return this;
   }
 
   factory VerifyingKey.fromJson(Map<String, dynamic> json) {
-    final bytes =
-        Uint8List.fromList((json['E'] as List).map((e) => e as int).toList());
-    final point = elemDeserializeCompressed(bytes);
-    return VerifyingKey(E: point);
+    if (json['E'] is List) {
+      // Old format: list of byte ints
+      final bytes =
+          Uint8List.fromList((json['E'] as List).map((e) => e as int).toList());
+      return VerifyingKey(E: hex.encode(bytes));
+    }
+    // New format: hex string
+    return VerifyingKey(E: json['E'] as String);
   }
 
   Map<String, dynamic> toJson() => {
-        'E': elemSerializeCompressed(E).toList(),
+        'E': hex.decode(E).toList(),
       };
 }
 
 class ThresholdShare {
   final Identifier identifier;
   final SecretShare secretShare;
-  final VerifyingShare verifyingShare;
+  final String verifyingShare; // compressed hex
   final VerifiableSecretSharingCommitment commitment;
 
   ThresholdShare(
@@ -64,7 +70,7 @@ class ThresholdShare {
     this.commitment,
   );
 
-  (VerifyingShare, VerifyingKey) verify() {
+  (String, VerifyingKey) verify() {
     final left = elemBaseMul(secretShare);
     final right = commitment.getVerifyingShare(identifier);
 
