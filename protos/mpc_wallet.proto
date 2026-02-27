@@ -36,8 +36,9 @@ service MPCWallet {
 
 message DKGStep1Request {
   bytes user_id = 1;
-  bytes identifier = 2;    
+  bytes identifier = 2;
   string round1_package = 3; // JSON
+  bool is_restore = 4; // If true, server reuses stored DKG secret instead of generating new one
 }
 
 message DKGStep1Response {

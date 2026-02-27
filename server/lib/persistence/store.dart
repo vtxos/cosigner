@@ -109,6 +109,16 @@ class PolicyStore extends GenericStore {
   Future<void> savePolicy(String userId, String jsonData) =>
       save(userId, jsonData);
   Future<String?> getPolicy(String userId) => get(userId);
+
+  Future<Map<String, String>> getAllPolicies() async {
+    final keys = await getAllKeys();
+    final result = <String, String>{};
+    for (final key in keys) {
+      final value = await get(key);
+      if (value != null) result[key] = value;
+    }
+    return result;
+  }
 }
 
 class UtxoStore extends GenericStore {

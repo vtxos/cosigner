@@ -90,6 +90,11 @@ class PolicyState {
   // when the wallet is a passive receiver in DKG).
   threshold.Identifier? userSigningIdentifier;
 
+  // The server's original DKG secret (hex-encoded 32-byte scalar).
+  // Persisted so the server can re-derive the same polynomial constant term
+  // during a wallet restore flow.
+  String? serverDkgSecretHex;
+
   // normal Policy
   final NormalPolicy normalPolicy;
   // protected Policies
@@ -98,7 +103,7 @@ class PolicyState {
   final spendingHistory = <SpendingEntry>[];
 
   PolicyState(this.userId, this.recoveryId, this.normalPolicy,
-      {this.userSigningIdentifier});
+      {this.userSigningIdentifier, this.serverDkgSecretHex});
 
   Map<String, dynamic> toJson() {
     return {
@@ -107,6 +112,8 @@ class PolicyState {
       if (userSigningIdentifier != null)
         'userSigningIdentifier':
             hex.encode(userSigningIdentifier!.serialize()),
+      if (serverDkgSecretHex != null)
+        'serverDkgSecretHex': serverDkgSecretHex,
       'normalPolicy': normalPolicy.toJson(),
       'protectedPolicies':
           protectedPolicies.map((k, v) => MapEntry(k, v.toJson())),
@@ -122,7 +129,8 @@ class PolicyState {
     }
     final s = PolicyState(json['userId'], json['recoveryId'],
         NormalPolicy.fromJson(json['normalPolicy']),
-        userSigningIdentifier: signingId);
+        userSigningIdentifier: signingId,
+        serverDkgSecretHex: json['serverDkgSecretHex'] as String?);
 
     if (json['protectedPolicies'] != null) {
       final Map<String, dynamic> map = json['protectedPolicies'];

@@ -165,6 +165,29 @@ class MPCWalletService extends MPCWalletServiceBase {
     });
   }
 
+  /// Find an existing policy by its recoveryId (hex of HW signer's verifying key).
+  /// Used during restore to locate the stored server DKG secret.
+  Future<PolicyState?> _findPolicyByRecoveryId(String recoveryIdHex) async {
+    return await _policyLock.synchronized(() async {
+      // Check in-memory cache first
+      for (final policy in _policies.values) {
+        if (policy.recoveryId == recoveryIdHex) return policy;
+      }
+      // Try loading all policies from store
+      final allPolicies = await policyStore.getAllPolicies();
+      for (final entry in allPolicies.entries) {
+        try {
+          final ps = PolicyState.fromJson(jsonDecode(entry.value));
+          _policies[entry.key] = ps;
+          if (ps.recoveryId == recoveryIdHex) return ps;
+        } catch (e) {
+          _log.warning('Error loading policy ${entry.key}: $e');
+        }
+      }
+      return null;
+    });
+  }
+
   Future<UtxoState> _getUtxoState(String userId) async {
     return await _utxoLock.synchronized(() async {
       if (!_utxos.containsKey(userId)) {
@@ -221,6 +244,13 @@ class MPCWalletService extends MPCWalletServiceBase {
 
     final session = await _getDKGSession(userIdHex);
     try {
+      // Reset stale session state when starting a restore (or fresh DKG)
+      // to avoid reusing old round1 packages or server secrets.
+      if (request.isRestore && session.serverRound1SecretPackage != null) {
+        _log.info('[$userIdHex] DKGStep1: Resetting stale session for restore');
+        session.reset();
+      }
+
       final identifier = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
 
@@ -237,8 +267,26 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       // Server Init for this session
       if (session.serverRound1SecretPackage == null) {
-        _log.info('[$userIdHex] Server: Generating DKG secrets...');
-        final secret = threshold.SecretKey(threshold.modNRandom());
+        threshold.SecretKey secret;
+
+        if (request.isRestore) {
+          // Restore mode: reuse stored DKG secret from existing policy
+          _log.info('[$userIdHex] Server: Restore mode — looking up stored DKG secret...');
+          final existingPolicy = await _findPolicyByRecoveryId(userIdHex);
+          if (existingPolicy == null) {
+            throw StateError('No existing policy found for recovery ID $userIdHex');
+          }
+          if (existingPolicy.serverDkgSecretHex == null) {
+            throw StateError('Existing policy has no stored DKG secret (created before restore support)');
+          }
+          final secretBytes = hex.decode(existingPolicy.serverDkgSecretHex!);
+          secret = threshold.SecretKey(threshold.bytesToBigInt(Uint8List.fromList(secretBytes)));
+          _log.info('[$userIdHex] Server: Restored DKG secret from policy');
+        } else {
+          _log.info('[$userIdHex] Server: Generating DKG secrets...');
+          secret = threshold.SecretKey(threshold.modNRandom());
+        }
+
         final coeffs = threshold.generateCoefficients(thresholdCount - 1);
         final (r1Secret, r1Public) = threshold.dkgPart1(
             totalParticipants, thresholdCount, secret, coeffs);
@@ -431,11 +479,29 @@ class MPCWalletService extends MPCWalletServiceBase {
           policyUserId = userIdHex;
         }
 
-        // fresh policy state
+        // Persist the server's DKG secret scalar for future restore
+        final serverDkgSecretHex = hex.encode(
+            threshold.bigIntToBytes(session.serverInternalSecret!.scalar));
+
         final userRecoveryIdHex = hex.encode(userRecoveryIdentifier!);
+
+        // Check if this is a restore — look for existing policy with same recoveryId
+        final existingPolicy = await _findPolicyByRecoveryId(userRecoveryIdHex);
+        List<SpendingEntry> preservedHistory = [];
+        if (existingPolicy != null) {
+          preservedHistory = List.from(existingPolicy.spendingHistory);
+          // Remove old policy entry (userId may have changed)
+          _policies.remove(existingPolicy.userId);
+          await policyStore.delete(existingPolicy.userId);
+          _log.info('[$userIdHex] Restore: removed old policy under ${existingPolicy.userId}');
+        }
+
+        // Create fresh policy state
         final policyState = await _newPolicyState(
             policyUserId, userRecoveryIdHex, normalPolicy,
             userSigningIdentifier: walletSigningIdentifier);
+        policyState.serverDkgSecretHex = serverDkgSecretHex;
+        policyState.spendingHistory.addAll(preservedHistory);
         _policies[policyUserId] = policyState;
 
         _log.info('[$userId] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
