@@ -335,9 +335,11 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
 
 (Round2SecretPackage, Map<Identifier, Round2Package>) dkgPart2(
   Round1SecretPackage secretPkg,
-  Map<Identifier, Round1Package> round1Pkgs,
-) {
-  if (round1Pkgs.length != secretPkg.maxSigners - 1) {
+  Map<Identifier, Round1Package> round1Pkgs, {
+  List<Identifier> receiverIdentifiers = const [],
+}) {
+  if (round1Pkgs.length + receiverIdentifiers.length !=
+      secretPkg.maxSigners - 1) {
     throw IncorrectNumberOfPackagesException("incorrect number of packages");
   }
   for (final p in round1Pkgs.values) {
@@ -349,6 +351,8 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   }
 
   final out = <Identifier, Round2Package>{};
+
+  // Compute shares for other dealers (verify proofs)
   for (final entry in round1Pkgs.entries) {
     final senderID = entry.key;
     final pkg = entry.value;
@@ -358,6 +362,13 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
 
     final share = secretShareFromCoefficients(secretPkg.coefficients, senderID);
     out[senderID] = Round2Package(share);
+  }
+
+  // Compute shares for passive receivers (no proof to verify)
+  for (final receiverId in receiverIdentifiers) {
+    final share =
+        secretShareFromCoefficients(secretPkg.coefficients, receiverId);
+    out[receiverId] = Round2Package(share);
   }
 
   final fii = evaluatePolynomial(secretPkg.identifier, secretPkg.coefficients);
@@ -378,9 +389,11 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
   Round1SecretPackage r1Secret,
   Round2SecretPackage r2Secret,
   Map<Identifier, Round1Package> round1Pkgs,
-  Map<Identifier, Round2Package> round2Pkgs,
-) {
-  if (round1Pkgs.length != r2Secret.maxSigners - 1) {
+  Map<Identifier, Round2Package> round2Pkgs, {
+  List<Identifier> receiverIdentifiers = const [],
+}) {
+  if (round1Pkgs.length + receiverIdentifiers.length !=
+      r2Secret.maxSigners - 1) {
     throw IncorrectNumberOfPackagesException("incorrect number of packages");
   }
   if (round1Pkgs.length != round2Pkgs.length) {
@@ -414,13 +427,18 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
 
   final verifyingShare = elemBaseMul(secretShare);
 
+  // Build commitment map from dealer round1 packages
   final commitMap = <Identifier, VerifiableSecretSharingCommitment>{};
   for (final entry in round1Pkgs.entries) {
     commitMap[entry.key] = entry.value.commitment;
   }
   commitMap[r2Secret.identifier] = r2Secret.commitment;
 
-  final publicKeyPackage = pkpFromDkgCommitments(commitMap);
+  // Build PublicKeyPackage with ALL participant IDs (dealers + receivers)
+  final group = sumCommitments(commitMap.values.toList());
+  final allIds = [...commitMap.keys, ...receiverIdentifiers]
+    ..sort((a, b) => a.s.compareTo(b.s));
+  final publicKeyPackage = pkpFromCommitment(allIds, group);
 
   final keyPackage = KeyPackage(
     r2Secret.identifier,
@@ -428,6 +446,71 @@ SecretShare secretShareFromCoefficients(List<BigInt> coeffs, Identifier peer) {
     verifyingShare,
     publicKeyPackage.verifyingKey,
     r2Secret.minSigners,
+  );
+
+  return (keyPackage.intoEvenY(), publicKeyPackage.intoEvenY());
+}
+
+/// DKG Part 3 for a passive receiver (no secret polynomial contribution).
+///
+/// The receiver verifies shares from each dealer against their commitments,
+/// accumulates the shares (no self-share), and derives its KeyPackage and
+/// the shared PublicKeyPackage.
+(KeyPackage, PublicKeyPackage) dkgPart3Receive(
+  Identifier myIdentifier,
+  Map<Identifier, Round1Package> dealerRound1Pkgs,
+  Map<Identifier, Round2Package> sharesForMe,
+  int minSigners,
+  int maxSigners,
+  List<Identifier> allParticipantIdentifiers,
+) {
+  if (dealerRound1Pkgs.length != sharesForMe.length) {
+    throw IncorrectNumberOfPackagesException(
+      "dealer round1 packages and shares must have same length",
+    );
+  }
+  for (final id in dealerRound1Pkgs.keys) {
+    if (!sharesForMe.containsKey(id)) {
+      throw IncorrectPackageException("missing share from dealer $id");
+    }
+  }
+
+  // Verify each dealer's share against their commitment, then accumulate
+  var si = modNZero();
+  for (final entry in sharesForMe.entries) {
+    final dealerId = entry.key;
+    final pkg2 = entry.value;
+
+    final r1 = dealerRound1Pkgs[dealerId]!;
+    final temp = ThresholdShare(
+      myIdentifier,
+      pkg2.secretShare,
+      elemBaseMul(pkg2.secretShare),
+      r1.commitment,
+    );
+    temp.verify();
+    si = (si + pkg2.secretShare);
+  }
+
+  // Receiver has no self-share — secretShare is the sum of received shares
+  final secretShare = si;
+  final verifyingShare = elemBaseMul(secretShare);
+
+  // Build PublicKeyPackage from dealer commitments with ALL participant IDs
+  final dealerCommitments =
+      dealerRound1Pkgs.values.map((pkg) => pkg.commitment).toList();
+  final group = sumCommitments(dealerCommitments);
+
+  final sortedIds = List<Identifier>.from(allParticipantIdentifiers)
+    ..sort((a, b) => a.s.compareTo(b.s));
+  final publicKeyPackage = pkpFromCommitment(sortedIds, group);
+
+  final keyPackage = KeyPackage(
+    myIdentifier,
+    secretShare,
+    verifyingShare,
+    publicKeyPackage.verifyingKey,
+    minSigners,
   );
 
   return (keyPackage.intoEvenY(), publicKeyPackage.intoEvenY());

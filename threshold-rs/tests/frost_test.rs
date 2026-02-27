@@ -492,7 +492,7 @@ fn run_full_dkg(
             .collect();
 
         let (r2_secret, r2_out) =
-            dkg::dkg_part2(secret_pkg, &others).expect("dkg_part2 failed");
+            dkg::dkg_part2(secret_pkg, &others, &[]).expect("dkg_part2 failed");
 
         r2_secrets.push(r2_secret);
         all_r2_packages.push(r2_out);
@@ -523,7 +523,7 @@ fn run_full_dkg(
         }
 
         let (kp, pkp) =
-            dkg::dkg_part3(&r1_secrets[i], r2_secret, &others_r1, &our_r2)
+            dkg::dkg_part3(&r1_secrets[i], r2_secret, &others_r1, &our_r2, &[])
                 .expect("dkg_part3 failed");
 
         key_packages.push(kp);

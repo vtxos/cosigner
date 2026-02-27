@@ -151,13 +151,15 @@ class MPCWalletService extends MPCWalletServiceBase {
   }
 
   Future<PolicyState> _newPolicyState(
-      String userId, String recoveryId, NormalPolicy policy) async {
+      String userId, String recoveryId, NormalPolicy policy,
+      {threshold.Identifier? userSigningIdentifier}) async {
     return await _policyLock.synchronized(() {
       if (_policies.containsKey(userId)) {
         //remove existing
         _policies.remove(userId);
       }
-      _policies[userId] = PolicyState(userId, recoveryId, policy);
+      _policies[userId] = PolicyState(userId, recoveryId, policy,
+          userSigningIdentifier: userSigningIdentifier);
       _log.info('[$userId] New Policy state created');
       return _policies[userId]!;
     });
@@ -209,11 +211,6 @@ class MPCWalletService extends MPCWalletServiceBase {
     };
   }
 
-  static String _userIdFromVerifyingKey(threshold.VerifyingKey verifyingKey) {
-    final bytes = threshold.elemSerializeCompressed(verifyingKey.E);
-    return hex.encode(bytes);
-  }
-
   // --- DKG ---
   @override
   Future<DKGStep1Response> dKGStep1(
@@ -226,10 +223,17 @@ class MPCWalletService extends MPCWalletServiceBase {
     try {
       final identifier = threshold.Identifier.deserialize(
           Uint8List.fromList(request.identifier));
-      _log.info(
-          '[$userIdHex] DKGStep1: Received PubPackage from ${hex.encode(userId)}');
 
-      session.round1Packages[identifier] = request.round1Package;
+      // Empty round1_package means this participant is a passive receiver
+      if (request.round1Package.isEmpty) {
+        _log.info(
+            '[$userIdHex] DKGStep1: Registered passive receiver ${_idToString(identifier)}');
+        session.receiverIdentifiers.add(identifier);
+      } else {
+        _log.info(
+            '[$userIdHex] DKGStep1: Received PubPackage from ${_idToString(identifier)}');
+        session.round1Packages[identifier] = request.round1Package;
+      }
 
       // Server Init for this session
       if (session.serverRound1SecretPackage == null) {
@@ -251,7 +255,9 @@ class MPCWalletService extends MPCWalletServiceBase {
             jsonEncode(r1Public.toJson());
       }
 
-      if (session.round1Packages.length == totalParticipants) {
+      if (session.round1Packages.length +
+              session.receiverIdentifiers.length ==
+          totalParticipants) {
         if (!session.completerStep1.isCompleted)
           session.completerStep1.complete();
       } else {
@@ -283,11 +289,10 @@ class MPCWalletService extends MPCWalletServiceBase {
 
       if (session.dkgRound2PackagesLocal.isEmpty) {
         _log.info('[$userIdHex] DKGStep2: Server computing shares...');
+        final serverIdentifier = threshold.Identifier.derive(session.serverId!);
         final round1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
-          final serverIdenfier = threshold.Identifier.derive(session.serverId!);
-
-          if (k != serverIdenfier) {
+          if (k != serverIdentifier) {
             round1Pkgs[k] = threshold.Round1Package.fromJson(jsonDecode(v));
           }
         });
@@ -296,8 +301,11 @@ class MPCWalletService extends MPCWalletServiceBase {
           throw StateError('Server secrets missing for session $userIdHex');
         }
 
-        final (serverRound2Secret, serverRound2Pkgs) =
-            threshold.dkgPart2(session.serverRound1SecretPackage!, round1Pkgs);
+        final (serverRound2Secret, serverRound2Pkgs) = threshold.dkgPart2(
+          session.serverRound1SecretPackage!,
+          round1Pkgs,
+          receiverIdentifiers: session.receiverIdentifiers.toList(),
+        );
 
         session.serverRound2Secret = serverRound2Secret;
         session.dkgRound2PackagesLocal.addAll(serverRound2Pkgs);
@@ -372,18 +380,17 @@ class MPCWalletService extends MPCWalletServiceBase {
       if (session.completerStep3.isCompleted) {
         _log.info('[$userIdHex] DKGStep3: Server computing KeyPackage...');
 
-        final userSigningIdentifier =
-            threshold.Identifier.derive(Uint8List.fromList(userId));
-
         Uint8List? userRecoveryIdentifier;
 
+        // Build round1 packages from other dealers (not server, not receivers)
         final allRound1Pkgs = <threshold.Identifier, threshold.Round1Package>{};
         session.round1Packages.forEach((k, v) {
           final decodedPkg = threshold.Round1Package.fromJson(jsonDecode(v));
           if (k != serverIdentifier) {
             allRound1Pkgs[k] = decodedPkg;
 
-            if (k != userSigningIdentifier && userRecoveryIdentifier == null) {
+            // First non-server dealer is the recovery identity (HW signer)
+            if (userRecoveryIdentifier == null) {
               userRecoveryIdentifier =
                   threshold.elemSerializeCompressed(decodedPkg.verifyingKey.E);
             }
@@ -395,10 +402,12 @@ class MPCWalletService extends MPCWalletServiceBase {
         allReceivedSharesPoints.addAll(session.dkgRound2PackagesReceived);
 
         final (keyPkg, pubKeyPkg) = threshold.dkgPart3(
-            session.serverRound1SecretPackage!,
-            session.serverRound2Secret!,
-            allRound1Pkgs,
-            allReceivedSharesPoints);
+          session.serverRound1SecretPackage!,
+          session.serverRound2Secret!,
+          allRound1Pkgs,
+          allReceivedSharesPoints,
+          receiverIdentifiers: session.receiverIdentifiers.toList(),
+        );
 
         final normalPolicy = NormalPolicy(
           id: "normal policies",
@@ -406,18 +415,35 @@ class MPCWalletService extends MPCWalletServiceBase {
           publicKeyPackage: pubKeyPkg,
         );
 
+        // Determine the wallet's userId and signing identifier.
+        // If there are passive receivers, the wallet's userId is its
+        // verifying share (compressed point). Otherwise, fall back to
+        // the DKG session key (backward-compatible with old 3-dealer DKG).
+        String policyUserId;
+        threshold.Identifier? walletSigningIdentifier;
+        if (session.receiverIdentifiers.isNotEmpty) {
+          final walletId = session.receiverIdentifiers.first;
+          walletSigningIdentifier = walletId;
+          final walletVs = pubKeyPkg.verifyingShares[walletId]!;
+          policyUserId =
+              hex.encode(threshold.elemSerializeCompressed(walletVs));
+        } else {
+          policyUserId = userIdHex;
+        }
+
         // fresh policy state
         final userRecoveryIdHex = hex.encode(userRecoveryIdentifier!);
-        final policyState =
-            await _newPolicyState(userIdHex, userRecoveryIdHex, normalPolicy);
-        _policies[userIdHex] = policyState;
+        final policyState = await _newPolicyState(
+            policyUserId, userRecoveryIdHex, normalPolicy,
+            userSigningIdentifier: walletSigningIdentifier);
+        _policies[policyUserId] = policyState;
 
         _log.info('[$userId] DKG Complete. PK: ${pubKeyPkg.verifyingKey.E}');
 
         // Persistence
         try {
           await policyStore.savePolicy(
-              userIdHex, jsonEncode(policyState.toJson()));
+              policyUserId, jsonEncode(policyState.toJson()));
           await dkgStore.saveSession(userIdHex, jsonEncode(session.toJson()));
           _log.info('[$userId] Saved DKG completion state.');
         } catch (e) {
@@ -543,7 +569,7 @@ class MPCWalletService extends MPCWalletServiceBase {
       final policyState = await _getPolicyState(userIdHex);
       _log.info('[$userId] SignStep1: Received from ${userIdHex}');
 
-      final userIdentifier =
+      final userIdentifier = policyState.userSigningIdentifier ??
           threshold.Identifier.derive(Uint8List.fromList(userId));
       var serverKeyPackage = policyState.normalPolicy.keyPackage;
 
@@ -644,7 +670,7 @@ class MPCWalletService extends MPCWalletServiceBase {
     try {
       final policyState = await _getPolicyState(userIdHex);
 
-      final userIdentifier =
+      final userIdentifier = policyState.userSigningIdentifier ??
           threshold.Identifier.derive(Uint8List.fromList(userId));
 
       var serverKeyPackage = policyState.normalPolicy.keyPackage;

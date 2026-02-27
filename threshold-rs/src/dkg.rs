@@ -202,13 +202,15 @@ pub fn dkg_part1(
 /// DKG round 2: verify others' round 1 packages and compute shares for each.
 ///
 /// - `secret_pkg`: our round 1 secret package.
-/// - `round1_pkgs`: round 1 packages from all other participants (keyed by their identifier).
+/// - `round1_pkgs`: round 1 packages from all other *dealer* participants.
+/// - `receiver_identifiers`: identifiers of passive receivers (no round 1 package).
 /// - Returns `(Round2SecretPackage, Map<Identifier, Round2Package>)`.
 pub fn dkg_part2(
     secret_pkg: &Round1SecretPackage,
     round1_pkgs: &BTreeMap<Identifier, Round1Package>,
+    receiver_identifiers: &[Identifier],
 ) -> Result<(Round2SecretPackage, BTreeMap<Identifier, Round2Package>), Error> {
-    if round1_pkgs.len() != secret_pkg.max_signers - 1 {
+    if round1_pkgs.len() + receiver_identifiers.len() != secret_pkg.max_signers - 1 {
         return Err(Error::IncorrectNumberOfPackages);
     }
     for pkg in round1_pkgs.values() {
@@ -218,12 +220,20 @@ pub fn dkg_part2(
     }
 
     let mut out = BTreeMap::new();
+
+    // Compute shares for other dealers (verify proofs)
     for (sender_id, pkg) in round1_pkgs {
         let vk = pkg.commitment.to_verifying_key();
         verify_proof_of_knowledge(sender_id, &vk, &pkg.proof_of_knowledge)?;
 
         let share = polynomial::evaluate_polynomial(sender_id, &secret_pkg.coefficients);
         out.insert(sender_id.clone(), Round2Package { secret_share: share });
+    }
+
+    // Compute shares for passive receivers (no proof to verify)
+    for receiver_id in receiver_identifiers {
+        let share = polynomial::evaluate_polynomial(receiver_id, &secret_pkg.coefficients);
+        out.insert(receiver_id.clone(), Round2Package { secret_share: share });
     }
 
     let fii = polynomial::evaluate_polynomial(
@@ -251,16 +261,18 @@ pub fn dkg_part2(
 ///
 /// - `_r1_secret`: round 1 secret package (kept for API compatibility with Dart).
 /// - `r2_secret`: round 2 secret package.
-/// - `round1_pkgs`: others' round 1 packages.
-/// - `round2_pkgs`: others' round 2 packages (shares addressed to us).
+/// - `round1_pkgs`: other dealers' round 1 packages.
+/// - `round2_pkgs`: other dealers' round 2 packages (shares addressed to us).
+/// - `receiver_identifiers`: identifiers of passive receivers (included in PKP).
 /// - Returns `(KeyPackage, PublicKeyPackage)` both normalized to even Y.
 pub fn dkg_part3(
     _r1_secret: &Round1SecretPackage,
     r2_secret: &Round2SecretPackage,
     round1_pkgs: &BTreeMap<Identifier, Round1Package>,
     round2_pkgs: &BTreeMap<Identifier, Round2Package>,
+    receiver_identifiers: &[Identifier],
 ) -> Result<(crate::keys::KeyPackage, PublicKeyPackage), Error> {
-    if round1_pkgs.len() != r2_secret.max_signers - 1 {
+    if round1_pkgs.len() + receiver_identifiers.len() != r2_secret.max_signers - 1 {
         return Err(Error::IncorrectNumberOfPackages);
     }
     if round1_pkgs.len() != round2_pkgs.len() {
@@ -294,14 +306,21 @@ pub fn dkg_part3(
     let secret_share = si;
     let verifying_share = point::base_mul(&secret_share);
 
-    // Build commitment map for PublicKeyPackage
+    // Build commitment map from dealer round 1 packages
     let mut commit_map: BTreeMap<Identifier, VssCommitment> = BTreeMap::new();
     for (id, pkg) in round1_pkgs {
         commit_map.insert(id.clone(), pkg.commitment.clone());
     }
     commit_map.insert(r2_secret.identifier.clone(), r2_secret.commitment.clone());
 
-    let public_key_package = pkp_from_dkg_commitments(&commit_map)?;
+    // Build PublicKeyPackage with ALL participant IDs (dealers + receivers)
+    let group = vss::sum_commitments(&commit_map.values().cloned().collect::<Vec<_>>())?;
+    let mut all_ids: Vec<Identifier> = commit_map.keys().cloned().collect();
+    for rid in receiver_identifiers {
+        all_ids.push(rid.clone());
+    }
+    all_ids.sort();
+    let public_key_package = pkp_from_commitment(&all_ids, &group);
 
     let key_package = crate::keys::KeyPackage {
         identifier: r2_secret.identifier.clone(),
@@ -314,19 +333,74 @@ pub fn dkg_part3(
     Ok((key_package.into_even_y(), public_key_package.into_even_y()))
 }
 
+/// DKG Part 3 for a passive receiver (no secret polynomial contribution).
+///
+/// The receiver verifies shares from each dealer against their commitments,
+/// accumulates the shares (no self-share), and derives its KeyPackage and
+/// the shared PublicKeyPackage.
+pub fn dkg_part3_receive(
+    my_identifier: &Identifier,
+    dealer_round1_pkgs: &BTreeMap<Identifier, Round1Package>,
+    shares_for_me: &BTreeMap<Identifier, Round2Package>,
+    min_signers: usize,
+    max_signers: usize,
+    all_participant_identifiers: &[Identifier],
+) -> Result<(crate::keys::KeyPackage, PublicKeyPackage), Error> {
+    if dealer_round1_pkgs.len() != shares_for_me.len() {
+        return Err(Error::IncorrectNumberOfPackages);
+    }
+    for id in dealer_round1_pkgs.keys() {
+        if !shares_for_me.contains_key(id) {
+            return Err(Error::IncorrectPackageMapping);
+        }
+    }
+
+    // Verify each dealer's share against their commitment, then accumulate
+    let mut si = Scalar::ZERO;
+    for (dealer_id, pkg2) in shares_for_me {
+        let r1 = dealer_round1_pkgs
+            .get(dealer_id)
+            .ok_or(Error::UnknownIdentifier)?;
+
+        let share_point = point::base_mul(&pkg2.secret_share);
+        let expected = r1.commitment.get_verifying_share(my_identifier);
+        if !point::points_equal(&share_point, &expected) {
+            return Err(Error::InvalidSecretShare);
+        }
+
+        si = si + pkg2.secret_share;
+    }
+
+    // Receiver has no self-share
+    let secret_share = si;
+    let verifying_share = point::base_mul(&secret_share);
+
+    // Build PublicKeyPackage from dealer commitments with ALL participant IDs
+    let dealer_commitments: Vec<VssCommitment> = dealer_round1_pkgs
+        .values()
+        .map(|pkg| pkg.commitment.clone())
+        .collect();
+    let group = vss::sum_commitments(&dealer_commitments)?;
+
+    let mut sorted_ids = all_participant_identifiers.to_vec();
+    sorted_ids.sort();
+    let public_key_package = pkp_from_commitment(&sorted_ids, &group);
+
+    let key_package = crate::keys::KeyPackage {
+        identifier: my_identifier.clone(),
+        secret_share,
+        verifying_share,
+        verifying_key: public_key_package.verifying_key.clone(),
+        min_signers,
+    };
+
+    let _ = max_signers; // used for API consistency
+    Ok((key_package.into_even_y(), public_key_package.into_even_y()))
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Build a PublicKeyPackage from the combined DKG commitments.
-fn pkp_from_dkg_commitments(
-    commits: &BTreeMap<Identifier, VssCommitment>,
-) -> Result<PublicKeyPackage, Error> {
-    let ids: Vec<Identifier> = commits.keys().cloned().collect();
-    let list: Vec<VssCommitment> = commits.values().cloned().collect();
-    let group = vss::sum_commitments(&list)?;
-    Ok(pkp_from_commitment(&ids, &group))
-}
 
 /// Build a PublicKeyPackage from a summed commitment and the set of identifiers.
 fn pkp_from_commitment(
