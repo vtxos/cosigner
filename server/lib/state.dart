@@ -24,6 +24,7 @@ class DKGSessionState {
 
   // DKG Data (Persisted)
   final round1Packages = <threshold.Identifier, String>{}; // Identifier -> JSON
+  final receiverIdentifiers = <threshold.Identifier>{}; // passive receivers
 
   Uint8List? serverId;
 
@@ -71,6 +72,7 @@ class DKGSessionState {
     completerStep2 = Completer<void>();
     completerStep3 = Completer<void>();
     round1Packages.clear();
+    receiverIdentifiers.clear();
     serverInternalSecret = null;
     serverRound1SecretPackage = null;
     serverRound2Secret = null;
@@ -84,6 +86,10 @@ class PolicyState {
   final String userId;
   final String recoveryId;
 
+  // The wallet's DKG identifier (may differ from Identifier.derive(userId)
+  // when the wallet is a passive receiver in DKG).
+  threshold.Identifier? userSigningIdentifier;
+
   // normal Policy
   final NormalPolicy normalPolicy;
   // protected Policies
@@ -91,12 +97,16 @@ class PolicyState {
 
   final spendingHistory = <SpendingEntry>[];
 
-  PolicyState(this.userId, this.recoveryId, this.normalPolicy);
+  PolicyState(this.userId, this.recoveryId, this.normalPolicy,
+      {this.userSigningIdentifier});
 
   Map<String, dynamic> toJson() {
     return {
       'userId': userId,
       'recoveryId': recoveryId,
+      if (userSigningIdentifier != null)
+        'userSigningIdentifier':
+            hex.encode(userSigningIdentifier!.serialize()),
       'normalPolicy': normalPolicy.toJson(),
       'protectedPolicies':
           protectedPolicies.map((k, v) => MapEntry(k, v.toJson())),
@@ -105,8 +115,14 @@ class PolicyState {
   }
 
   static PolicyState fromJson(Map<String, dynamic> json) {
+    threshold.Identifier? signingId;
+    if (json['userSigningIdentifier'] != null) {
+      signingId = threshold.Identifier.deserialize(
+          Uint8List.fromList(hex.decode(json['userSigningIdentifier'])));
+    }
     final s = PolicyState(json['userId'], json['recoveryId'],
-        NormalPolicy.fromJson(json['normalPolicy']));
+        NormalPolicy.fromJson(json['normalPolicy']),
+        userSigningIdentifier: signingId);
 
     if (json['protectedPolicies'] != null) {
       final Map<String, dynamic> map = json['protectedPolicies'];
