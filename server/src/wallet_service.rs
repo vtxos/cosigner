@@ -366,17 +366,23 @@ impl MpcWallet for WalletService {
                 }
                 let dkg_h = user.dkg_session.unwrap();
 
-                if req.is_restore && user.round1_secret.is_some() {
+                // Only reset for restore when a previous DKG step1 completed.
+                // Using step1.done (not round1_secret) avoids double-reset when
+                // two concurrent restore calls race: the first resets and creates
+                // fresh sync (done=false), so the second sees done=false and skips.
+                let stale_session = req.is_restore
+                    && user
+                        .dkg_sync
+                        .as_ref()
+                        .map_or(false, |(s1, _, _)| s1.done.load(Ordering::SeqCst));
+                if stale_session {
                     tracing::info!(
                         "[{user_id_hex}] DKGStep1: Resetting stale session for restore"
                     );
                     crypto_ops::dkg_session_reset(user, dkg_h)
                         .map_err(|e| Status::internal(format!("dkg_session_reset: {e}")))?;
-                    if let Some((s1, s2, s3)) = user.dkg_sync.as_mut() {
-                        s1.reset();
-                        s2.reset();
-                        s3.reset();
-                    }
+                    user.dkg_sync =
+                        Some((StepSync::new(), StepSync::new(), StepSync::new()));
                     user.round1_secret = None;
                     user.round2_secret = None;
                 }
@@ -832,11 +838,15 @@ impl MpcWallet for WalletService {
                                 if let Ok(pkg_val) =
                                     serde_json::from_str::<serde_json::Value>(pkg_str)
                                 {
-                                    if let Some(vk) = pkg_val["verifying_key"]
-                                        .as_str()
-                                        .or_else(|| pkg_val["verifyingKey"].as_str())
-                                    {
-                                        user_recovery_id_hex = Some(vk.to_string());
+                                    // verifyingKey is {"E": [byte, byte, ...]}
+                                    if let Some(e_arr) = pkg_val["verifyingKey"]["E"].as_array() {
+                                        let bytes: Vec<u8> = e_arr
+                                            .iter()
+                                            .filter_map(|v| v.as_u64().map(|n| n as u8))
+                                            .collect();
+                                        if !bytes.is_empty() {
+                                            user_recovery_id_hex = Some(hex::encode(&bytes));
+                                        }
                                     }
                                 }
                                 break;

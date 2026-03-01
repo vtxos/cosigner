@@ -1143,3 +1143,286 @@ mod random_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Restore (re-DKG) tests
+// ---------------------------------------------------------------------------
+
+/// Simulate the wallet restore flow: two dealers (HW signer + server) reuse
+/// their original DKG secrets with fresh random coefficients. A passive
+/// receiver (wallet) gets a new secret share via `dkg_part3_receive`.
+/// The group public key must be preserved, and signing must work after restore.
+#[test]
+fn test_restore_via_redkg_preserves_group_key_and_signing() {
+    let mut rng = OsRng;
+    let min_signers = 2;
+    let max_signers = 3;
+
+    // ---------------------------------------------------------------
+    // Phase 1: Initial DKG (HW signer + server as dealers, wallet as
+    // passive receiver)
+    // ---------------------------------------------------------------
+
+    // HW signer: random secret + coefficients
+    let hw_secret = random_scalar(&mut rng);
+    let hw_coeffs: Vec<Scalar> = (0..min_signers - 1)
+        .map(|_| random_scalar(&mut rng))
+        .collect();
+    let (hw_r1_secret, hw_r1_pub) =
+        dkg::dkg_part1(max_signers, min_signers, &hw_secret, &hw_coeffs, &mut rng)
+            .expect("hw dkg_part1");
+    let hw_id = hw_r1_secret.identifier.clone();
+
+    // Server: random secret + coefficients
+    let srv_secret = random_scalar(&mut rng);
+    let srv_coeffs: Vec<Scalar> = (0..min_signers - 1)
+        .map(|_| random_scalar(&mut rng))
+        .collect();
+    let (srv_r1_secret, srv_r1_pub) =
+        dkg::dkg_part1(max_signers, min_signers, &srv_secret, &srv_coeffs, &mut rng)
+            .expect("srv dkg_part1");
+    let srv_id = srv_r1_secret.identifier.clone();
+
+    // Wallet: passive receiver (deterministic identifier derived from HW VK)
+    let wallet_id = Identifier::derive(&hw_r1_pub.verifying_key.serialize())
+        .expect("wallet id derive");
+
+    // Round 2: HW signer
+    let hw_others_r1: BTreeMap<Identifier, Round1Package> =
+        [(srv_id.clone(), srv_r1_pub.clone())].into();
+    let (hw_r2_secret, hw_r2_out) =
+        dkg::dkg_part2(&hw_r1_secret, &hw_others_r1, &[wallet_id.clone()])
+            .expect("hw dkg_part2");
+
+    // Round 2: Server
+    let srv_others_r1: BTreeMap<Identifier, Round1Package> =
+        [(hw_id.clone(), hw_r1_pub.clone())].into();
+    let (srv_r2_secret, srv_r2_out) =
+        dkg::dkg_part2(&srv_r1_secret, &srv_others_r1, &[wallet_id.clone()])
+            .expect("srv dkg_part2");
+
+    // Round 3: HW signer finalizes
+    let hw_r2_for_me: BTreeMap<Identifier, Round2Package> =
+        [(srv_id.clone(), srv_r2_out.get(&hw_id).unwrap().clone())].into();
+    let (_hw_kp, _) = dkg::dkg_part3(
+        &hw_r1_secret,
+        &hw_r2_secret,
+        &[(srv_id.clone(), srv_r1_pub.clone())].into(),
+        &hw_r2_for_me,
+        &[wallet_id.clone()],
+    )
+    .expect("hw dkg_part3");
+
+    // Round 3: Server finalizes
+    let srv_r2_for_me: BTreeMap<Identifier, Round2Package> =
+        [(hw_id.clone(), hw_r2_out.get(&srv_id).unwrap().clone())].into();
+    let (srv_kp, _) = dkg::dkg_part3(
+        &srv_r1_secret,
+        &srv_r2_secret,
+        &[(hw_id.clone(), hw_r1_pub.clone())].into(),
+        &srv_r2_for_me,
+        &[wallet_id.clone()],
+    )
+    .expect("srv dkg_part3");
+
+    // Round 3: Wallet finalizes as passive receiver
+    let dealer_r1_for_wallet: BTreeMap<Identifier, Round1Package> = [
+        (hw_id.clone(), hw_r1_pub.clone()),
+        (srv_id.clone(), srv_r1_pub.clone()),
+    ]
+    .into();
+    let shares_for_wallet: BTreeMap<Identifier, Round2Package> = [
+        (hw_id.clone(), hw_r2_out.get(&wallet_id).unwrap().clone()),
+        (srv_id.clone(), srv_r2_out.get(&wallet_id).unwrap().clone()),
+    ]
+    .into();
+    let all_ids = vec![hw_id.clone(), srv_id.clone(), wallet_id.clone()];
+    let (wallet_kp, pubkeys) = dkg::dkg_part3_receive(
+        &wallet_id,
+        &dealer_r1_for_wallet,
+        &shares_for_wallet,
+        min_signers,
+        max_signers,
+        &all_ids,
+    )
+    .expect("wallet dkg_part3_receive");
+
+    let original_group_key = pubkeys.verifying_key.serialize();
+
+    // Verify signing works: wallet + server (2-of-3)
+    let message = b"pre-restore signing test";
+    {
+        let signers = [&wallet_kp, &srv_kp];
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for kp in &signers {
+            let nonce = new_nonce(&mut rng, &kp.secret_share);
+            commitments.insert(kp.identifier.clone(), nonce.commitments.clone());
+            nonces.insert(kp.identifier.clone(), nonce);
+        }
+        let signing_package = SigningPackage::new(commitments, message.to_vec());
+        let mut shares = BTreeMap::new();
+        for kp in &signers {
+            let nonce = nonces.get(&kp.identifier).unwrap();
+            let share = sign(&signing_package, nonce, kp).unwrap();
+            shares.insert(kp.identifier.clone(), share);
+        }
+        let sig = aggregate(&signing_package, &shares, &pubkeys).unwrap();
+        sig.verify(&pubkeys.verifying_key, message)
+            .expect("pre-restore signature failed");
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 2: Restore (re-DKG). HW signer + server reuse their
+    // original secrets with fresh coefficients. Wallet is passive.
+    // ---------------------------------------------------------------
+
+    // HW signer: same secret, fresh coefficients
+    let hw_restore_coeffs: Vec<Scalar> = (0..min_signers - 1)
+        .map(|_| random_scalar(&mut rng))
+        .collect();
+    let (hw2_r1_secret, hw2_r1_pub) =
+        dkg::dkg_part1(max_signers, min_signers, &hw_secret, &hw_restore_coeffs, &mut rng)
+            .expect("hw restore dkg_part1");
+    let hw2_id = hw2_r1_secret.identifier.clone();
+
+    // Server: same secret, fresh coefficients
+    let srv_restore_coeffs: Vec<Scalar> = (0..min_signers - 1)
+        .map(|_| random_scalar(&mut rng))
+        .collect();
+    let (srv2_r1_secret, srv2_r1_pub) =
+        dkg::dkg_part1(max_signers, min_signers, &srv_secret, &srv_restore_coeffs, &mut rng)
+            .expect("srv restore dkg_part1");
+    let srv2_id = srv2_r1_secret.identifier.clone();
+
+    // Wallet: new passive receiver ID derived from HW's (unchanged) VK
+    let wallet2_id = Identifier::derive(&hw2_r1_pub.verifying_key.serialize())
+        .expect("wallet2 id derive");
+
+    // The identifiers should be the same since secrets are the same
+    assert_eq!(hw_id, hw2_id, "HW identifier should be stable across restores");
+    assert_eq!(srv_id, srv2_id, "Server identifier should be stable across restores");
+    assert_eq!(wallet_id, wallet2_id, "Wallet identifier should be stable across restores");
+
+    // Round 2
+    let hw2_others_r1: BTreeMap<Identifier, Round1Package> =
+        [(srv2_id.clone(), srv2_r1_pub.clone())].into();
+    let (hw2_r2_secret, hw2_r2_out) =
+        dkg::dkg_part2(&hw2_r1_secret, &hw2_others_r1, &[wallet2_id.clone()])
+            .expect("hw restore dkg_part2");
+
+    let srv2_others_r1: BTreeMap<Identifier, Round1Package> =
+        [(hw2_id.clone(), hw2_r1_pub.clone())].into();
+    let (srv2_r2_secret, srv2_r2_out) =
+        dkg::dkg_part2(&srv2_r1_secret, &srv2_others_r1, &[wallet2_id.clone()])
+            .expect("srv restore dkg_part2");
+
+    // Round 3: dealers finalize
+    let hw2_r2_for_me: BTreeMap<Identifier, Round2Package> =
+        [(srv2_id.clone(), srv2_r2_out.get(&hw2_id).unwrap().clone())].into();
+    let (_hw2_kp, _) = dkg::dkg_part3(
+        &hw2_r1_secret,
+        &hw2_r2_secret,
+        &[(srv2_id.clone(), srv2_r1_pub.clone())].into(),
+        &hw2_r2_for_me,
+        &[wallet2_id.clone()],
+    )
+    .expect("hw restore dkg_part3");
+
+    let srv2_r2_for_me: BTreeMap<Identifier, Round2Package> =
+        [(hw2_id.clone(), hw2_r2_out.get(&srv2_id).unwrap().clone())].into();
+    let (srv2_kp, _) = dkg::dkg_part3(
+        &srv2_r1_secret,
+        &srv2_r2_secret,
+        &[(hw2_id.clone(), hw2_r1_pub.clone())].into(),
+        &srv2_r2_for_me,
+        &[wallet2_id.clone()],
+    )
+    .expect("srv restore dkg_part3");
+
+    // Round 3: wallet as passive receiver
+    let dealer_r1_for_wallet2: BTreeMap<Identifier, Round1Package> = [
+        (hw2_id.clone(), hw2_r1_pub.clone()),
+        (srv2_id.clone(), srv2_r1_pub.clone()),
+    ]
+    .into();
+    let shares_for_wallet2: BTreeMap<Identifier, Round2Package> = [
+        (hw2_id.clone(), hw2_r2_out.get(&wallet2_id).unwrap().clone()),
+        (srv2_id.clone(), srv2_r2_out.get(&wallet2_id).unwrap().clone()),
+    ]
+    .into();
+    let all_ids2 = vec![hw2_id.clone(), srv2_id.clone(), wallet2_id.clone()];
+    let (wallet2_kp, pubkeys2) = dkg::dkg_part3_receive(
+        &wallet2_id,
+        &dealer_r1_for_wallet2,
+        &shares_for_wallet2,
+        min_signers,
+        max_signers,
+        &all_ids2,
+    )
+    .expect("wallet restore dkg_part3_receive");
+
+    // ---------------------------------------------------------------
+    // Assertions
+    // ---------------------------------------------------------------
+
+    // Group public key MUST be preserved
+    assert_eq!(
+        original_group_key,
+        pubkeys2.verifying_key.serialize(),
+        "Group key must be preserved after restore"
+    );
+
+    // Secret shares should be DIFFERENT (fresh coefficients -> new polynomial)
+    assert_ne!(
+        scalar_to_bytes(&wallet_kp.secret_share),
+        scalar_to_bytes(&wallet2_kp.secret_share),
+        "Wallet secret share should change after restore"
+    );
+
+    // Signing with restored keys: wallet + server
+    let message2 = b"post-restore signing test";
+    {
+        let signers = [&wallet2_kp, &srv2_kp];
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for kp in &signers {
+            let nonce = new_nonce(&mut rng, &kp.secret_share);
+            commitments.insert(kp.identifier.clone(), nonce.commitments.clone());
+            nonces.insert(kp.identifier.clone(), nonce);
+        }
+        let signing_package = SigningPackage::new(commitments, message2.to_vec());
+        let mut shares = BTreeMap::new();
+        for kp in &signers {
+            let nonce = nonces.get(&kp.identifier).unwrap();
+            let share = sign(&signing_package, nonce, kp).unwrap();
+            shares.insert(kp.identifier.clone(), share);
+        }
+        let sig = aggregate(&signing_package, &shares, &pubkeys2).unwrap();
+        sig.verify(&pubkeys2.verifying_key, message2)
+            .expect("post-restore signature verification failed");
+    }
+
+    // Also verify HW + server can sign (different subset)
+    let message3 = b"post-restore hw+server signing";
+    {
+        let signers = [&_hw2_kp, &srv2_kp];
+        let mut nonces = BTreeMap::new();
+        let mut commitments = BTreeMap::new();
+        for kp in &signers {
+            let nonce = new_nonce(&mut rng, &kp.secret_share);
+            commitments.insert(kp.identifier.clone(), nonce.commitments.clone());
+            nonces.insert(kp.identifier.clone(), nonce);
+        }
+        let signing_package = SigningPackage::new(commitments, message3.to_vec());
+        let mut shares = BTreeMap::new();
+        for kp in &signers {
+            let nonce = nonces.get(&kp.identifier).unwrap();
+            let share = sign(&signing_package, nonce, kp).unwrap();
+            shares.insert(kp.identifier.clone(), share);
+        }
+        let sig = aggregate(&signing_package, &shares, &pubkeys2).unwrap();
+        sig.verify(&pubkeys2.verifying_key, message3)
+            .expect("post-restore hw+server signature failed");
+    }
+}
