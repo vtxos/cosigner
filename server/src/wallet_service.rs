@@ -1,0 +1,2412 @@
+//! Client-facing gRPC service implementing `mpc_wallet.proto`.
+//! This is the main service that replaces the Dart server.
+
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use rand::Rng;
+use tokio::sync::Notify;
+use tokio_stream::Stream;
+use tonic::{Request, Response, Status};
+
+use crate::auth::message::*;
+use crate::auth::AuthVerifier;
+use crate::bitcoin::{BitcoinHistoryService, BitcoinRpcClient};
+use crate::crypto_ops;
+use crate::persistence::PersistenceStore;
+use crate::policy::engine::PolicyEngine;
+use crate::policy::{
+    NormalPolicy, PolicyState, ProtectedPolicy, SpendingEntry,
+};
+use crate::wallet_proto::mpc_wallet_server::MpcWallet;
+use crate::wallet_proto::*;
+use crate::wasm_manager::{StepSync, WasmManager};
+
+const TOTAL_PARTICIPANTS: usize = 3;
+const THRESHOLD_COUNT: u32 = 2;
+
+pub struct WalletService {
+    pub wasm_manager: Arc<Mutex<WasmManager>>,
+    pub auth_verifier: Arc<AuthVerifier>,
+    pub persistence: Arc<PersistenceStore>,
+    pub bitcoin_rpc: Arc<BitcoinRpcClient>,
+    pub bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
+}
+
+impl WalletService {
+    pub fn new(
+        wasm_manager: Arc<Mutex<WasmManager>>,
+        auth_verifier: Arc<AuthVerifier>,
+        persistence: Arc<PersistenceStore>,
+        bitcoin_rpc: Arc<BitcoinRpcClient>,
+        bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
+    ) -> Self {
+        Self {
+            wasm_manager,
+            auth_verifier,
+            persistence,
+            bitcoin_rpc,
+            bitcoin_history,
+        }
+    }
+
+    fn user_id_hex(user_id: &[u8]) -> String {
+        hex::encode(user_id)
+    }
+
+    /// Verify single-key Schnorr auth. user_id bytes = compressed public key.
+    fn verify_auth(
+        &self,
+        user_id: &[u8],
+        signature: &[u8],
+        timestamp_ms: i64,
+        operation: &str,
+    ) -> Result<(), Status> {
+        let user_id_hex = Self::user_id_hex(user_id);
+        let pk_hex = hex::encode(user_id);
+        let sig_hex = hex::encode(signature);
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        self.auth_verifier
+            .verify_auth(user, &pk_hex, &sig_hex, operation, timestamp_ms, &user_id_hex)
+    }
+
+    /// Load policy state from UserInstance or persistence.
+    fn load_policy_state(
+        &self,
+        mgr: &mut WasmManager,
+        user_id_hex: &str,
+    ) -> Result<(), Status> {
+        let user = mgr
+            .get_or_create_user(user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        if user.policy_state.is_some() {
+            return Ok(());
+        }
+
+        // Try loading from persistence
+        let tree = self.persistence.tree("policies").map_err(|e| {
+            Status::internal(format!("persistence error: {e}"))
+        })?;
+        if let Ok(Some(json_str)) = tree.get(user_id_hex) {
+            match serde_json::from_str::<PolicyState>(&json_str) {
+                Ok(ps) => {
+                    user.policy_state = Some(ps);
+                    tracing::info!("[{user_id_hex}] Loaded policy from persistence");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!("[{user_id_hex}] Error parsing policy: {e}");
+                }
+            }
+        }
+
+        Err(Status::not_found(format!(
+            "No policy state found for user {user_id_hex}"
+        )))
+    }
+
+    /// Find a policy by recovery_id across all users.
+    fn find_policy_by_recovery_id(
+        &self,
+        mgr: &mut WasmManager,
+        recovery_id_hex: &str,
+    ) -> Result<Option<PolicyState>, Status> {
+        // Check in-memory first
+        for (_, user) in mgr.iter_users() {
+            if let Some(ps) = &user.policy_state {
+                if ps.recovery_id == recovery_id_hex {
+                    return Ok(Some(ps.clone()));
+                }
+            }
+        }
+
+        // Try loading all policies from persistence
+        let tree = self.persistence.tree("policies").map_err(|e| {
+            Status::internal(format!("persistence error: {e}"))
+        })?;
+        if let Ok(all) = tree.all() {
+            for (key, json_str) in all {
+                if let Ok(ps) = serde_json::from_str::<PolicyState>(&json_str) {
+                    if ps.recovery_id == recovery_id_hex {
+                        // Load into memory
+                        if let Ok(user) = mgr.get_or_create_user(&key) {
+                            user.policy_state = Some(ps.clone());
+                        }
+                        return Ok(Some(ps));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Save policy state to persistence.
+    fn persist_policy(&self, user_id_hex: &str, policy: &PolicyState) -> Result<(), Status> {
+        let json = serde_json::to_string(policy)
+            .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+        let tree = self.persistence.tree("policies").map_err(|e| {
+            Status::internal(format!("persistence error: {e}"))
+        })?;
+        tree.put(user_id_hex, &json)
+            .map_err(|e| Status::internal(format!("persistence write error: {e}")))?;
+        Ok(())
+    }
+
+    /// Parse the WASM round2 packages result into individual entries.
+    fn parse_round2_result(
+        json_str: &str,
+    ) -> Result<HashMap<String, String>, Status> {
+        let v: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| Status::internal(format!("bad round2 result: {e}")))?;
+        let obj = v.as_object().ok_or_else(|| {
+            Status::internal("expected round2 packages object")
+        })?;
+        let mut result = HashMap::new();
+        for (k, v) in obj {
+            result.insert(k.clone(), v.to_string());
+        }
+        Ok(result)
+    }
+
+    /// Extract secretShare hex from a key package JSON.
+    fn extract_secret_share(kp_json: &str) -> Result<String, Status> {
+        let v: serde_json::Value = serde_json::from_str(kp_json)
+            .map_err(|e| Status::internal(format!("bad key package JSON: {e}")))?;
+        v["secretShare"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Status::internal("missing secretShare in key package"))
+    }
+
+    /// Extract identifier hex from a key package JSON.
+    fn extract_identifier(kp_json: &str) -> Result<String, Status> {
+        let v: serde_json::Value = serde_json::from_str(kp_json)
+            .map_err(|e| Status::internal(format!("bad key package JSON: {e}")))?;
+        v["identifier"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Status::internal("missing identifier in key package"))
+    }
+
+    /// Extract verifyingKey hex from a public key package JSON.
+    fn extract_verifying_key(pkp_json: &str) -> Result<String, Status> {
+        let v: serde_json::Value = serde_json::from_str(pkp_json)
+            .map_err(|e| Status::internal(format!("bad public key package JSON: {e}")))?;
+        v["verifyingKey"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Status::internal("missing verifyingKey in public key package"))
+    }
+
+    /// Extract a verifying share for a specific identifier from public key package JSON.
+    fn extract_verifying_share(pkp_json: &str, id_hex: &str) -> Result<String, Status> {
+        let v: serde_json::Value = serde_json::from_str(pkp_json)
+            .map_err(|e| Status::internal(format!("bad public key package JSON: {e}")))?;
+        v["verifyingShares"][id_hex]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "missing verifying share for {id_hex}"
+                ))
+            })
+    }
+
+    /// Build signing package JSON from commitments (parsed) and message hex.
+    fn build_signing_package_json(
+        commitments_json: &str,
+        message_hex: &str,
+    ) -> Result<String, Status> {
+        // commitments_json from WASM is {"id": "comms_json_str", ...}
+        // We need to parse each inner value for the signing package
+        let comms_val: serde_json::Value = serde_json::from_str(commitments_json)
+            .map_err(|e| Status::internal(format!("bad commitments JSON: {e}")))?;
+        let comms_obj = comms_val
+            .as_object()
+            .ok_or_else(|| Status::internal("commitments not an object"))?;
+
+        let mut parsed_comms = serde_json::Map::new();
+        for (id, val) in comms_obj {
+            let inner_json = val
+                .as_str()
+                .ok_or_else(|| Status::internal("commitment value not a string"))?;
+            let parsed: serde_json::Value = serde_json::from_str(inner_json)
+                .map_err(|e| Status::internal(format!("bad inner commitment JSON: {e}")))?;
+            parsed_comms.insert(id.clone(), parsed);
+        }
+
+        let pkg = serde_json::json!({
+            "commitments": serde_json::Value::Object(parsed_comms),
+            "message": message_hex,
+        });
+        Ok(pkg.to_string())
+    }
+
+    /// Calculate spending amount from a transaction.
+    fn calculate_spent_amount(
+        &self,
+        mgr: &mut WasmManager,
+        full_tx: &[u8],
+        pkp_json: &str,
+        user_id_hex: &str,
+    ) -> Result<i64, Status> {
+        if full_tx.is_empty() {
+            return Ok(0);
+        }
+
+        let user = mgr
+            .get_or_create_user(user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        // Get tweaked public key package for P2TR script matching
+        let tweaked_pkp_json = crypto_ops::pub_key_package_tweak(user, pkp_json, None)
+            .map_err(|e| Status::internal(format!("tweak error: {e}")))?;
+
+        let vk_hex = Self::extract_verifying_key(&tweaked_pkp_json)?;
+
+        // Use bitcoin tx_parser
+        let script_hex = crate::bitcoin::tx_parser::derive_p2tr_script_hex(&vk_hex)
+            .map_err(|e| Status::internal(format!("P2TR derivation: {e}")))?;
+        let spent = crate::bitcoin::tx_parser::calculate_spent_amount(
+            full_tx,
+            &script_hex,
+            user.utxo_state.as_ref().map(|u| &u.utxos[..]).unwrap_or(&[]),
+        )
+        .map_err(|e| Status::internal(format!("tx parse: {e}")))?;
+
+        Ok(spent)
+    }
+
+    /// Evaluate policy for a transaction spending amount.
+    fn evaluate_policy_for_amount(
+        policy_state: &PolicyState,
+        spending_amount: i64,
+    ) -> Option<String> {
+        PolicyEngine::evaluate_policy(policy_state, spending_amount)
+    }
+
+    /// Generate a random base64url string for policy IDs.
+    fn random_base64(bytes: usize) -> String {
+        use base64::Engine;
+        let mut rng = rand::thread_rng();
+        let values: Vec<u8> = (0..bytes).map(|_| rng.gen()).collect();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&values)
+    }
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    /// Parse a JSON object of string-wrapped values into a HashMap.
+    /// Used for parsing WASM resource JSON responses where values are JSON strings.
+    fn parse_json_string_map(json: &str) -> Result<HashMap<String, String>, Status> {
+        let v: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| Status::internal(format!("bad JSON: {e}")))?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| Status::internal("expected JSON object"))?;
+        let mut result = HashMap::new();
+        for (k, v) in obj {
+            let s = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            result.insert(k.clone(), s);
+        }
+        Ok(result)
+    }
+}
+
+type ResponseStream =
+    Pin<Box<dyn Stream<Item = Result<TransactionNotification, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl MpcWallet for WalletService {
+    // -----------------------------------------------------------------------
+    // DKG
+    // -----------------------------------------------------------------------
+
+    async fn dkg_step1(
+        &self,
+        request: Request<DkgStep1Request>,
+    ) -> Result<Response<DkgStep1Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        let identifier_hex = hex::encode(&req.identifier);
+
+        tracing::info!("[{user_id_hex}] DKGStep1 from {identifier_hex}");
+
+        let step1_notify: Arc<Notify>;
+        let step1_done: Arc<std::sync::atomic::AtomicBool>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+
+            // Scope 1: Session setup + register participant
+            {
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+                if user.dkg_session.is_none() {
+                    let h = crypto_ops::dkg_session_create(user)
+                        .map_err(|e| Status::internal(format!("dkg_session_create: {e}")))?;
+                    user.dkg_session = Some(h);
+                    user.dkg_sync = Some((StepSync::new(), StepSync::new(), StepSync::new()));
+                }
+                let dkg_h = user.dkg_session.unwrap();
+
+                if req.is_restore && user.round1_secret.is_some() {
+                    tracing::info!(
+                        "[{user_id_hex}] DKGStep1: Resetting stale session for restore"
+                    );
+                    crypto_ops::dkg_session_reset(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("dkg_session_reset: {e}")))?;
+                    if let Some((s1, s2, s3)) = user.dkg_sync.as_mut() {
+                        s1.reset();
+                        s2.reset();
+                        s3.reset();
+                    }
+                    user.round1_secret = None;
+                    user.round2_secret = None;
+                }
+
+                if req.round1_package.is_empty() {
+                    tracing::info!(
+                        "[{user_id_hex}] DKGStep1: Registered passive receiver {identifier_hex}"
+                    );
+                    crypto_ops::dkg_session_insert_receiver_identifier(
+                        user,
+                        dkg_h,
+                        &identifier_hex,
+                    )
+                    .map_err(|e| Status::internal(format!("insert_receiver: {e}")))?;
+                } else {
+                    tracing::info!(
+                        "[{user_id_hex}] DKGStep1: Received round1 from {identifier_hex}"
+                    );
+                    crypto_ops::dkg_session_insert_round1_package(
+                        user,
+                        dkg_h,
+                        &identifier_hex,
+                        &req.round1_package,
+                    )
+                    .map_err(|e| Status::internal(format!("insert_round1: {e}")))?;
+                }
+            }
+
+            // Scope 2: Server init (if round1_secret not yet set)
+            let needs_init = {
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+                user.round1_secret.is_none()
+            };
+
+            if needs_init {
+                let secret_hex = if req.is_restore {
+                    tracing::info!(
+                        "[{user_id_hex}] Server: Restore — looking up stored DKG secret"
+                    );
+                    let existing =
+                        self.find_policy_by_recovery_id(&mut mgr, &user_id_hex)?;
+                    let policy = existing.ok_or_else(|| {
+                        Status::not_found(format!(
+                            "No policy for recovery ID {user_id_hex}"
+                        ))
+                    })?;
+                    policy.server_dkg_secret_hex.clone().ok_or_else(|| {
+                        Status::internal("Existing policy has no stored DKG secret")
+                    })?
+                } else {
+                    tracing::info!("[{user_id_hex}] Server: Generating DKG secrets");
+                    let user = mgr
+                        .get_or_create_user(&user_id_hex)
+                        .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+                    crypto_ops::mod_n_random(user)
+                        .map_err(|e| Status::internal(format!("mod_n_random: {e}")))?
+                };
+
+                // Scope 3: DKG part1 computation
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+                let mut seed = [0u8; 32];
+                rand::thread_rng().fill(&mut seed);
+                let coefficients_json =
+                    crypto_ops::generate_coefficients(user, THRESHOLD_COUNT - 1, &seed)
+                        .map_err(|e| {
+                            Status::internal(format!("generate_coefficients: {e}"))
+                        })?;
+
+                let result = crypto_ops::dkg_part1(
+                    user,
+                    TOTAL_PARTICIPANTS as u32,
+                    THRESHOLD_COUNT,
+                    &secret_hex,
+                    &coefficients_json,
+                )
+                .map_err(|e| Status::internal(format!("dkg_part1: {e}")))?;
+
+                let server_id_hex = crypto_ops::elem_base_mul(user, &secret_hex)
+                    .map_err(|e| Status::internal(format!("elem_base_mul: {e}")))?;
+                let server_id_bytes = hex::decode(&server_id_hex)
+                    .map_err(|e| Status::internal(format!("hex decode: {e}")))?;
+
+                let server_identifier_hex =
+                    crypto_ops::identifier_derive(user, &server_id_bytes)
+                        .map_err(|e| {
+                            Status::internal(format!("identifier_derive: {e}"))
+                        })?;
+
+                user.round1_secret = Some(result.secret_handle);
+                let dkg_h = user.dkg_session.unwrap();
+                crypto_ops::dkg_session_set_server_id(user, dkg_h, &server_id_hex)
+                    .map_err(|e| Status::internal(format!("set_server_id: {e}")))?;
+                crypto_ops::dkg_session_set_server_internal_secret_hex(
+                    user,
+                    dkg_h,
+                    &secret_hex,
+                )
+                .map_err(|e| Status::internal(format!("set_secret: {e}")))?;
+                crypto_ops::dkg_session_insert_round1_package(
+                    user,
+                    dkg_h,
+                    &server_identifier_hex,
+                    &result.round1_package_json,
+                )
+                .map_err(|e| Status::internal(format!("insert_round1: {e}")))?;
+            }
+
+            // Scope 4: Check if all participants ready
+            {
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+                let dkg_h = user.dkg_session.unwrap();
+                let total = crypto_ops::dkg_session_total_participants(user, dkg_h)
+                    .map_err(|e| Status::internal(format!("total_participants: {e}")))?;
+
+                if total as usize >= TOTAL_PARTICIPANTS {
+                    let (ref step1, _, _) = user
+                        .dkg_sync
+                        .as_ref()
+                        .ok_or_else(|| Status::internal("no dkg sync"))?;
+                    step1.done.store(true, Ordering::SeqCst);
+                    step1.complete.notify_waiters();
+                }
+
+                let (ref step1, _, _) = user
+                    .dkg_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no dkg sync"))?;
+                step1_notify = step1.complete.clone();
+                step1_done = step1.done.clone();
+            }
+        }
+
+        if !step1_done.load(Ordering::SeqCst) {
+            step1_notify.notified().await;
+        }
+
+        // Build response
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let dkg_h = user
+            .dkg_session
+            .ok_or_else(|| Status::internal("DKG session disappeared"))?;
+
+        let round1_json = crypto_ops::dkg_session_get_round1_packages_json(user, dkg_h)
+            .map_err(|e| Status::internal(format!("get_round1_packages: {e}")))?;
+        let pkgs = Self::parse_json_string_map(&round1_json)?;
+
+        let mut response = DkgStep1Response::default();
+        for (id_hex, pkg_json) in &pkgs {
+            response
+                .round1_packages
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+
+        Ok(Response::new(response))
+    }
+
+    async fn dkg_step2(
+        &self,
+        request: Request<DkgStep2Request>,
+    ) -> Result<Response<DkgStep2Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] DKGStep2");
+
+        // Wait for step1
+        let (step1_notify, step1_done) = {
+            let mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .iter_users()
+                .find(|(k, _)| *k == &user_id_hex)
+                .map(|(_, u)| u)
+                .ok_or_else(|| Status::internal("no user instance"))?;
+            let (ref step1, _, _) = user
+                .dkg_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no DKG sync"))?;
+            (step1.complete.clone(), step1.done.clone())
+        };
+
+        if !step1_done.load(Ordering::SeqCst) {
+            step1_notify.notified().await;
+        }
+
+        // Server round2 computation
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let dkg_h = user
+                .dkg_session
+                .ok_or_else(|| Status::internal("no DKG session"))?;
+
+            let server_id_hex = crypto_ops::dkg_session_get_server_id(user, dkg_h)
+                .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+            if server_id_hex.is_empty() {
+                return Err(Status::internal("server ID not initialized"));
+            }
+            let server_id_bytes = hex::decode(&server_id_hex)
+                .map_err(|e| Status::internal(format!("hex decode: {e}")))?;
+
+            let server_identifier_hex = crypto_ops::identifier_derive(user, &server_id_bytes)
+                .map_err(|e| Status::internal(format!("identifier_derive: {e}")))?;
+
+            let is_local_empty = crypto_ops::dkg_session_is_round2_local_empty(user, dkg_h)
+                .map_err(|e| Status::internal(format!("is_round2_local_empty: {e}")))?;
+
+            if is_local_empty {
+                tracing::info!("[{user_id_hex}] DKGStep2: Server computing round2");
+
+                let round1_pkgs_json =
+                    crypto_ops::dkg_session_get_round1_packages_excluding_json(
+                        user,
+                        dkg_h,
+                        &server_identifier_hex,
+                    )
+                    .map_err(|e| Status::internal(format!("get_round1_excluding: {e}")))?;
+                let receiver_ids_json =
+                    crypto_ops::dkg_session_get_receiver_ids_json(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_receiver_ids: {e}")))?;
+
+                let round1_secret = user
+                    .round1_secret
+                    .take()
+                    .ok_or_else(|| Status::internal("round1 secret missing"))?;
+
+                let result = crypto_ops::dkg_part2(
+                    user,
+                    round1_secret,
+                    &round1_pkgs_json,
+                    &receiver_ids_json,
+                )
+                .map_err(|e| Status::internal(format!("dkg_part2: {e}")))?;
+
+                user.round2_secret = Some(result.secret_handle);
+                let local_pkgs = Self::parse_round2_result(&result.round2_packages_json)?;
+                let local_json = serde_json::to_string(&local_pkgs)
+                    .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+                crypto_ops::dkg_session_set_round2_local_json(user, dkg_h, &local_json)
+                    .map_err(|e| Status::internal(format!("set_round2_local: {e}")))?;
+            }
+
+            let (_, ref step2, _) = user
+                .dkg_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no dkg sync"))?;
+            step2.done.store(true, Ordering::SeqCst);
+            step2.complete.notify_waiters();
+        }
+
+        // Build response
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let dkg_h = user
+            .dkg_session
+            .ok_or_else(|| Status::internal("DKG session disappeared"))?;
+
+        let round1_json = crypto_ops::dkg_session_get_round1_packages_json(user, dkg_h)
+            .map_err(|e| Status::internal(format!("get_round1_packages: {e}")))?;
+        let pkgs = Self::parse_json_string_map(&round1_json)?;
+
+        let mut response = DkgStep2Response::default();
+        for (id_hex, pkg_json) in &pkgs {
+            response
+                .all_round1_packages
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+
+        Ok(Response::new(response))
+    }
+
+    async fn dkg_step3(
+        &self,
+        request: Request<DkgStep3Request>,
+    ) -> Result<Response<DkgStep3Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        let sender_identifier_hex = hex::encode(&req.identifier);
+
+        tracing::info!("[{user_id_hex}] DKGStep3 from {sender_identifier_hex}");
+
+        // Wait for step2
+        let (step2_notify, step2_done) = {
+            let mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .iter_users()
+                .find(|(k, _)| *k == &user_id_hex)
+                .map(|(_, u)| u)
+                .ok_or_else(|| Status::internal("no user instance"))?;
+            let (_, ref step2, _) = user
+                .dkg_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no DKG sync"))?;
+            (step2.complete.clone(), step2.done.clone())
+        };
+
+        if !step2_done.load(Ordering::SeqCst) {
+            step2_notify.notified().await;
+        }
+
+        // Process round2 packages and compute server key
+        let step3_notify: Arc<Notify>;
+        let step3_done: Arc<std::sync::atomic::AtomicBool>;
+        let packages_for_me: HashMap<String, String>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let dkg_h = user
+                .dkg_session
+                .ok_or_else(|| Status::internal("no DKG session"))?;
+
+            let server_id_hex = crypto_ops::dkg_session_get_server_id(user, dkg_h)
+                .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+            let server_id_bytes = hex::decode(&server_id_hex)
+                .map_err(|e| Status::internal(format!("hex decode: {e}")))?;
+            let server_identifier_hex_local =
+                crypto_ops::identifier_derive(user, &server_id_bytes)
+                    .map_err(|e| Status::internal(format!("identifier_derive: {e}")))?;
+
+            // Store round2 packages from sender
+            for (recipient_hex, pkg_json) in &req.round2_packages_for_others {
+                if recipient_hex == &server_identifier_hex_local {
+                    crypto_ops::dkg_session_insert_round2_received(
+                        user,
+                        dkg_h,
+                        &sender_identifier_hex,
+                        pkg_json,
+                    )
+                    .map_err(|e| Status::internal(format!("insert_round2: {e}")))?;
+                }
+            }
+
+            // Insert all sender packages into relay
+            let sender_pkgs_json = serde_json::to_string(&req.round2_packages_for_others)
+                .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+            crypto_ops::dkg_session_insert_relay_packages(
+                user,
+                dkg_h,
+                &sender_identifier_hex,
+                &sender_pkgs_json,
+            )
+            .map_err(|e| Status::internal(format!("insert_relay: {e}")))?;
+
+            // Check completion
+            let relay_count = crypto_ops::dkg_session_relay_sender_count(user, dkg_h)
+                .map_err(|e| Status::internal(format!("relay_sender_count: {e}")))?;
+
+            if relay_count as usize >= TOTAL_PARTICIPANTS - 1 {
+                crypto_ops::dkg_session_insert_relay_from_local(
+                    user,
+                    dkg_h,
+                    &server_identifier_hex_local,
+                )
+                .map_err(|e| Status::internal(format!("insert_relay_from_local: {e}")))?;
+
+                let (_, _, ref step3) = user
+                    .dkg_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no dkg sync"))?;
+                step3.done.store(true, Ordering::SeqCst);
+                step3.complete.notify_waiters();
+            }
+
+            let (_, _, ref step3) = user
+                .dkg_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no dkg sync"))?;
+            step3_notify = step3.complete.clone();
+            step3_done = step3.done.clone();
+        }
+
+        // Wait for all participants to submit before fetching relay packages
+        if !step3_done.load(Ordering::SeqCst) {
+            step3_notify.notified().await;
+        }
+
+        // Now fetch relay packages (all participants have submitted)
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+            let dkg_h = user
+                .dkg_session
+                .ok_or_else(|| Status::internal("no DKG session"))?;
+            let relay_json = crypto_ops::dkg_session_get_relay_packages_for(
+                user,
+                dkg_h,
+                &sender_identifier_hex,
+            )
+            .map_err(|e| Status::internal(format!("get_relay_for: {e}")))?;
+            packages_for_me = Self::parse_json_string_map(&relay_json)?;
+        }
+
+        // Server key computation (once, when round2_secret is available)
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            if user.round2_secret.is_some() {
+                tracing::info!("[{user_id_hex}] DKGStep3: Server computing KeyPackage");
+
+                let dkg_h = user.dkg_session.unwrap();
+
+                let server_id_hex = crypto_ops::dkg_session_get_server_id(user, dkg_h)
+                    .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+                let server_id_bytes = hex::decode(&server_id_hex)
+                    .map_err(|e| Status::internal(format!("hex decode: {e}")))?;
+                let server_identifier_hex_local =
+                    crypto_ops::identifier_derive(user, &server_id_bytes)
+                        .map_err(|e| Status::internal(format!("identifier_derive: {e}")))?;
+
+                // Extract recovery ID from first non-server dealer's round1 package
+                let round1_all_json =
+                    crypto_ops::dkg_session_get_round1_packages_json(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_round1: {e}")))?;
+                let round1_all: serde_json::Value = serde_json::from_str(&round1_all_json)
+                    .map_err(|e| Status::internal(format!("parse round1: {e}")))?;
+
+                let mut user_recovery_id_hex: Option<String> = None;
+                if let Some(obj) = round1_all.as_object() {
+                    for (id_hex, pkg_val_raw) in obj {
+                        if id_hex != &server_identifier_hex_local {
+                            let is_recv =
+                                crypto_ops::dkg_session_is_receiver(user, dkg_h, id_hex)
+                                    .map_err(|e| {
+                                        Status::internal(format!("is_receiver: {e}"))
+                                    })?;
+                            if !is_recv {
+                                // pkg_val_raw is a string-wrapped JSON; parse inner
+                                let pkg_str =
+                                    pkg_val_raw.as_str().unwrap_or("{}");
+                                if let Ok(pkg_val) =
+                                    serde_json::from_str::<serde_json::Value>(pkg_str)
+                                {
+                                    if let Some(vk) = pkg_val["verifying_key"]
+                                        .as_str()
+                                        .or_else(|| pkg_val["verifyingKey"].as_str())
+                                    {
+                                        user_recovery_id_hex = Some(vk.to_string());
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                let round1_pkgs_json =
+                    crypto_ops::dkg_session_get_round1_packages_excluding_json(
+                        user,
+                        dkg_h,
+                        &server_identifier_hex_local,
+                    )
+                    .map_err(|e| Status::internal(format!("get_round1_excluding: {e}")))?;
+                let round2_received_json =
+                    crypto_ops::dkg_session_get_round2_received_json(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_round2: {e}")))?;
+                let receiver_ids_json =
+                    crypto_ops::dkg_session_get_receiver_ids_json(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_receiver_ids: {e}")))?;
+
+                let round2_secret = user.round2_secret.take().unwrap();
+                let result = crypto_ops::dkg_part3(
+                    user,
+                    round2_secret,
+                    &round1_pkgs_json,
+                    &round2_received_json,
+                    &receiver_ids_json,
+                )
+                .map_err(|e| Status::internal(format!("dkg_part3: {e}")))?;
+
+                // Determine policy user ID
+                let dkg_h = user.dkg_session.unwrap();
+                let receiver_ids_json_raw =
+                    crypto_ops::dkg_session_get_receiver_ids_json(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_receiver_ids: {e}")))?;
+                let receiver_ids: Vec<String> =
+                    serde_json::from_str(&receiver_ids_json_raw).unwrap_or_default();
+
+                let policy_user_id: String;
+                let user_signing_identifier_hex: Option<String>;
+
+                if !receiver_ids.is_empty() {
+                    let receiver_id_hex = &receiver_ids[0];
+                    let vs_hex = Self::extract_verifying_share(
+                        &result.public_key_package_json,
+                        receiver_id_hex,
+                    )?;
+                    policy_user_id = vs_hex;
+                    user_signing_identifier_hex = Some(receiver_id_hex.clone());
+                } else {
+                    policy_user_id = user_id_hex.clone();
+                    user_signing_identifier_hex = None;
+                }
+
+                let server_dkg_secret_hex =
+                    crypto_ops::dkg_session_get_server_internal_secret_hex(user, dkg_h)
+                        .map_err(|e| Status::internal(format!("get_secret: {e}")))?;
+                let recovery_id = user_recovery_id_hex.unwrap_or_default();
+
+                // Check for restore — preserve spending history
+                let mut preserved_history = Vec::new();
+                for (_, u) in mgr.iter_users() {
+                    if let Some(ps) = &u.policy_state {
+                        if ps.recovery_id == recovery_id {
+                            preserved_history = ps.spending_history.clone();
+                            break;
+                        }
+                    }
+                }
+                if preserved_history.is_empty() {
+                    if let Ok(tree) = self.persistence.tree("policies") {
+                        if let Ok(all) = tree.all() {
+                            for (key, v) in &all {
+                                if let Ok(ps) = serde_json::from_str::<PolicyState>(v) {
+                                    if ps.recovery_id == recovery_id {
+                                        preserved_history = ps.spending_history.clone();
+                                        let _ = tree.delete(key);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let normal_policy = NormalPolicy {
+                    id: "normal policies".to_string(),
+                    key_package_json: result.key_package_json,
+                    public_key_package_json: result.public_key_package_json,
+                };
+
+                let policy_state = PolicyState {
+                    user_id: policy_user_id.clone(),
+                    recovery_id,
+                    user_signing_identifier_hex,
+                    server_dkg_secret_hex: Some(server_dkg_secret_hex),
+                    normal_policy,
+                    protected_policies: HashMap::new(),
+                    spending_history: preserved_history,
+                };
+
+                let _ = self.persist_policy(&policy_user_id, &policy_state);
+
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+                user.policy_state = Some(policy_state);
+
+                tracing::info!("[{user_id_hex}] DKG Complete");
+            }
+        }
+
+        let mut response = DkgStep3Response::default();
+        for (id_hex, pkg_json) in &packages_for_me {
+            response
+                .round2_packages_for_me
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+
+        Ok(Response::new(response))
+    }
+
+    // -----------------------------------------------------------------------
+    // Signing
+    // -----------------------------------------------------------------------
+
+    async fn sign_step1(
+        &self,
+        request: Request<SignStep1Request>,
+    ) -> Result<Response<SignStep1Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] SignStep1");
+
+        // Verify authentication
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SIGN_STEP1)?;
+
+        let step1_notify: Arc<Notify>;
+        let step1_done: Arc<std::sync::atomic::AtomicBool>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let policy_state = user
+                .policy_state
+                .as_ref()
+                .ok_or_else(|| Status::not_found("no policy state"))?
+                .clone();
+
+            let user_identifier_hex = policy_state
+                .user_signing_identifier_hex
+                .clone()
+                .unwrap_or_else(|| {
+                    crypto_ops::identifier_derive(user, &req.user_id).unwrap_or_default()
+                });
+
+            let mut server_kp_json = policy_state.normal_policy.key_package_json.clone();
+            let pkp_json = policy_state.normal_policy.public_key_package_json.clone();
+
+            // Policy evaluation
+            let spent_amount = self
+                .calculate_spent_amount(&mut mgr, &req.full_transaction, &pkp_json, &user_id_hex)
+                .unwrap_or(0);
+
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+            let policy_state = user.policy_state.as_ref().unwrap();
+
+            let selected_policy_id =
+                Self::evaluate_policy_for_amount(policy_state, spent_amount);
+
+            if let Some(ref policy_id) = selected_policy_id {
+                if let Some(pp) = policy_state.protected_policies.get(policy_id) {
+                    server_kp_json = pp.key_package_json.clone();
+                    tracing::info!(
+                        "[{user_id_hex}] SignStep1: Using Protected Policy {policy_id}"
+                    );
+                }
+            } else {
+                tracing::info!("[{user_id_hex}] SignStep1: Using Normal Policy");
+            }
+
+            // Reset any stale signing session from a previous (possibly failed) attempt.
+            // This mirrors the Dart server's `session.reset()` in signStep2's catch block,
+            // ensuring each sign_step1 starts with a clean slate.
+            if let Some(h) = user.signing_session {
+                crypto_ops::signing_session_reset(user, h)
+                    .map_err(|e| Status::internal(format!("signing_session_reset: {e}")))?;
+                if let Some((ref mut s1, ref mut s2)) = user.signing_sync {
+                    s1.reset();
+                    s2.reset();
+                }
+                user.signing_nonce = None;
+            }
+
+            // Get or create signing session
+            if user.signing_session.is_none() {
+                let h = crypto_ops::signing_session_create(user)
+                    .map_err(|e| Status::internal(format!("signing_session_create: {e}")))?;
+                user.signing_session = Some(h);
+                user.signing_sync = Some((StepSync::new(), StepSync::new()));
+            }
+            let sign_h = user.signing_session.unwrap();
+
+            crypto_ops::signing_session_set_user_hiding_hex(
+                user,
+                sign_h,
+                &hex::encode(&req.hiding_commitment),
+            )
+            .map_err(|e| Status::internal(format!("set_hiding: {e}")))?;
+            crypto_ops::signing_session_set_user_binding_hex(
+                user,
+                sign_h,
+                &hex::encode(&req.binding_commitment),
+            )
+            .map_err(|e| Status::internal(format!("set_binding: {e}")))?;
+
+            if let Some(ref policy_id) = selected_policy_id {
+                crypto_ops::signing_session_set_current_policy_id(user, sign_h, policy_id)
+                    .map_err(|e| Status::internal(format!("set_policy_id: {e}")))?;
+            }
+            crypto_ops::signing_session_set_pending_amount(user, sign_h, spent_amount)
+                .map_err(|e| Status::internal(format!("set_pending: {e}")))?;
+
+            if !req.message_to_sign.is_empty() {
+                let has_msg = crypto_ops::signing_session_has_message(user, sign_h)
+                    .map_err(|e| Status::internal(format!("has_message: {e}")))?;
+                if !has_msg {
+                    crypto_ops::signing_session_set_message_to_sign(
+                        user,
+                        sign_h,
+                        &hex::encode(&req.message_to_sign),
+                    )
+                    .map_err(|e| Status::internal(format!("set_message: {e}")))?;
+                }
+            }
+
+            // Server nonce generation (once)
+            if user.signing_nonce.is_none() {
+                tracing::info!("[{user_id_hex}] SignStep1: Server generating nonce");
+                let secret_share_hex = Self::extract_secret_share(&server_kp_json)?;
+                let nonce_result = crypto_ops::new_nonce(user, &secret_share_hex)
+                    .map_err(|e| Status::internal(format!("new_nonce: {e}")))?;
+
+                user.signing_nonce = Some(nonce_result.nonce_handle);
+                let sign_h = user.signing_session.unwrap();
+                crypto_ops::signing_session_set_server_commitments_json(
+                    user,
+                    sign_h,
+                    &nonce_result.commitments_json,
+                )
+                .map_err(|e| Status::internal(format!("set_server_comms: {e}")))?;
+            }
+
+            let sign_h = user.signing_session.unwrap();
+            let server_identifier_hex = Self::extract_identifier(&server_kp_json)?;
+
+            let user_hiding = crypto_ops::signing_session_get_user_hiding_hex(user, sign_h)
+                .map_err(|e| Status::internal(format!("get_hiding: {e}")))?;
+            let has_server_comms =
+                crypto_ops::signing_session_has_server_commitments(user, sign_h)
+                    .map_err(|e| Status::internal(format!("has_server_comms: {e}")))?;
+
+            if !user_hiding.is_empty() && has_server_comms {
+                let user_binding =
+                    crypto_ops::signing_session_get_user_binding_hex(user, sign_h)
+                        .map_err(|e| Status::internal(format!("get_binding: {e}")))?;
+                let user_comms_json = serde_json::json!({
+                    "hiding": user_hiding,
+                    "binding": user_binding,
+                })
+                .to_string();
+
+                let server_comms =
+                    crypto_ops::signing_session_get_server_commitments_json(user, sign_h)
+                        .map_err(|e| Status::internal(format!("get_server_comms: {e}")))?;
+
+                crypto_ops::signing_session_insert_commitment(
+                    user,
+                    sign_h,
+                    &server_identifier_hex,
+                    &server_comms,
+                )
+                .map_err(|e| Status::internal(format!("insert_commit: {e}")))?;
+                crypto_ops::signing_session_insert_commitment(
+                    user,
+                    sign_h,
+                    &user_identifier_hex,
+                    &user_comms_json,
+                )
+                .map_err(|e| Status::internal(format!("insert_commit: {e}")))?;
+
+                let (ref step1, _) = user
+                    .signing_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no signing sync"))?;
+                step1.done.store(true, Ordering::SeqCst);
+                step1.complete.notify_waiters();
+            }
+
+            let (ref step1, _) = user
+                .signing_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no signing sync"))?;
+            step1_notify = step1.complete.clone();
+            step1_done = step1.done.clone();
+        }
+
+        if !step1_done.load(Ordering::SeqCst) {
+            step1_notify.notified().await;
+        }
+
+        // Build response
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let sign_h = user
+            .signing_session
+            .ok_or_else(|| Status::internal("signing session disappeared"))?;
+
+        let comms_json = crypto_ops::signing_session_get_commitments_json(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_commitments: {e}")))?;
+        let comms_map = Self::parse_json_string_map(&comms_json)?;
+
+        let mut response = SignStep1Response::default();
+        for (id_hex, comms_json_str) in &comms_map {
+            let comms_val: serde_json::Value = serde_json::from_str(comms_json_str)
+                .map_err(|e| Status::internal(format!("bad commitments JSON: {e}")))?;
+            let hiding_hex = comms_val["hiding"]
+                .as_str()
+                .ok_or_else(|| Status::internal("missing hiding"))?;
+            let binding_hex = comms_val["binding"]
+                .as_str()
+                .ok_or_else(|| Status::internal("missing binding"))?;
+
+            let hiding_bytes = hex::decode(hiding_hex)
+                .map_err(|e| Status::internal(format!("hex decode hiding: {e}")))?;
+            let binding_bytes = hex::decode(binding_hex)
+                .map_err(|e| Status::internal(format!("hex decode binding: {e}")))?;
+
+            response.commitments.insert(
+                id_hex.clone(),
+                sign_step1_response::Commitment {
+                    hiding: hiding_bytes,
+                    binding: binding_bytes,
+                },
+            );
+        }
+
+        let msg_hex = crypto_ops::signing_session_get_message_to_sign(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_message: {e}")))?;
+        response.message_to_sign = if msg_hex.is_empty() {
+            vec![]
+        } else {
+            hex::decode(&msg_hex).unwrap_or_default()
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn sign_step2(
+        &self,
+        request: Request<SignStep2Request>,
+    ) -> Result<Response<SignStep2Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] SignStep2");
+
+        // Verify authentication
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SIGN_STEP2)?;
+
+        let step2_notify: Arc<Notify>;
+        let step2_done: Arc<std::sync::atomic::AtomicBool>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let policy_state = user
+                .policy_state
+                .as_ref()
+                .ok_or_else(|| Status::not_found("no policy state"))?
+                .clone();
+
+            let user_identifier_hex = policy_state
+                .user_signing_identifier_hex
+                .clone()
+                .unwrap_or_else(|| {
+                    crypto_ops::identifier_derive(user, &req.user_id).unwrap_or_default()
+                });
+
+            let mut server_kp_json = policy_state.normal_policy.key_package_json.clone();
+
+            let sign_h = user
+                .signing_session
+                .ok_or_else(|| Status::internal("no signing session"))?;
+
+            let current_policy_id =
+                crypto_ops::signing_session_get_current_policy_id(user, sign_h)
+                    .map_err(|e| Status::internal(format!("get_policy_id: {e}")))?;
+
+            if !current_policy_id.is_empty() {
+                if let Some(pp) = policy_state.protected_policies.get(&current_policy_id) {
+                    server_kp_json = pp.key_package_json.clone();
+                }
+            }
+
+            let server_identifier_hex = Self::extract_identifier(&server_kp_json)?;
+
+            // Store user's signature share
+            let share_hex = hex::encode(&req.signature_share);
+            crypto_ops::signing_session_insert_share(
+                user,
+                sign_h,
+                &user_identifier_hex,
+                &share_hex,
+            )
+            .map_err(|e| Status::internal(format!("insert_share: {e}")))?;
+
+            // Server signing (once)
+            let has_server_share =
+                crypto_ops::signing_session_has_share(user, sign_h, &server_identifier_hex)
+                    .map_err(|e| Status::internal(format!("has_share: {e}")))?;
+
+            if !has_server_share && user.signing_nonce.is_some() {
+                tracing::info!("[{user_id_hex}] SignStep2: Server computing share");
+
+                let comms_json =
+                    crypto_ops::signing_session_get_commitments_json(user, sign_h)
+                        .map_err(|e| Status::internal(format!("get_commitments: {e}")))?;
+                let msg_hex =
+                    crypto_ops::signing_session_get_message_to_sign(user, sign_h)
+                        .map_err(|e| Status::internal(format!("get_message: {e}")))?;
+
+                let signing_pkg_json = Self::build_signing_package_json(&comms_json, &msg_hex)?;
+
+                // Tweak server key for Taproot key path spending
+                let tweaked_kp_json =
+                    crypto_ops::key_package_tweak(user, &server_kp_json, None)
+                        .map_err(|e| Status::internal(format!("key_package_tweak: {e}")))?;
+
+                let nonce = user.signing_nonce.take().unwrap();
+                let server_share_hex =
+                    crypto_ops::frost_sign(user, &signing_pkg_json, nonce, &tweaked_kp_json)
+                        .map_err(|e| Status::internal(format!("frost_sign: {e}")))?;
+
+                let sign_h = user.signing_session.unwrap();
+                crypto_ops::signing_session_insert_share(
+                    user,
+                    sign_h,
+                    &server_identifier_hex,
+                    &server_share_hex,
+                )
+                .map_err(|e| Status::internal(format!("insert_share: {e}")))?;
+            }
+
+            let sign_h = user.signing_session.unwrap();
+            let share_count = crypto_ops::signing_session_share_count(user, sign_h)
+                .map_err(|e| Status::internal(format!("share_count: {e}")))?;
+
+            if share_count >= THRESHOLD_COUNT {
+                let (_, ref step2) = user
+                    .signing_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no signing sync"))?;
+                step2.done.store(true, Ordering::SeqCst);
+                step2.complete.notify_waiters();
+            }
+
+            let (_, ref step2) = user
+                .signing_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no signing sync"))?;
+            step2_notify = step2.complete.clone();
+            step2_done = step2.done.clone();
+        }
+
+        if !step2_done.load(Ordering::SeqCst) {
+            step2_notify.notified().await;
+        }
+
+        // Aggregate
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        let policy_state = user
+            .policy_state
+            .as_ref()
+            .ok_or_else(|| Status::not_found("no policy state"))?
+            .clone();
+
+        let mut server_pkp_json = policy_state.normal_policy.public_key_package_json.clone();
+
+        let sign_h = user
+            .signing_session
+            .ok_or_else(|| Status::internal("no signing session"))?;
+
+        let current_policy_id =
+            crypto_ops::signing_session_get_current_policy_id(user, sign_h)
+                .map_err(|e| Status::internal(format!("get_policy_id: {e}")))?;
+
+        if !current_policy_id.is_empty() {
+            if let Some(pp) = policy_state.protected_policies.get(&current_policy_id) {
+                server_pkp_json = pp.public_key_package_json.clone();
+            }
+        }
+
+        let comms_json = crypto_ops::signing_session_get_commitments_json(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_commitments: {e}")))?;
+        let msg_hex = crypto_ops::signing_session_get_message_to_sign(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_message: {e}")))?;
+
+        let signing_pkg_json = Self::build_signing_package_json(&comms_json, &msg_hex)?;
+
+        let shares_json = crypto_ops::signing_session_get_shares_json(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_shares: {e}")))?;
+        let pending = crypto_ops::signing_session_get_pending_amount(user, sign_h)
+            .map_err(|e| Status::internal(format!("get_pending: {e}")))?;
+
+        // Tweak public package for aggregation
+        let tweaked_pkp_json = crypto_ops::pub_key_package_tweak(user, &server_pkp_json, None)
+            .map_err(|e| Status::internal(format!("pub_key_package_tweak: {e}")))?;
+
+        let agg_result_json = crypto_ops::frost_aggregate(
+            user,
+            &signing_pkg_json,
+            &shares_json,
+            &tweaked_pkp_json,
+        )
+        .map_err(|e| Status::internal(format!("frost_aggregate: {e}")))?;
+
+        let agg_val: serde_json::Value = serde_json::from_str(&agg_result_json)
+            .map_err(|e| Status::internal(format!("parse aggregate: {e}")))?;
+        let r_hex = agg_val["R"]
+            .as_str()
+            .ok_or_else(|| Status::internal("missing R"))?;
+        let z_hex = agg_val["Z"]
+            .as_str()
+            .ok_or_else(|| Status::internal("missing Z"))?;
+        let r_bytes =
+            hex::decode(r_hex).map_err(|e| Status::internal(format!("hex decode R: {e}")))?;
+        let z_bytes =
+            hex::decode(z_hex).map_err(|e| Status::internal(format!("hex decode Z: {e}")))?;
+
+        tracing::info!("[{user_id_hex}] SignStep2: Aggregated");
+
+        // Record spending
+        if pending > 0 {
+            if let Some(ps) = user.policy_state.as_mut() {
+                ps.spending_history.push(SpendingEntry {
+                    timestamp_ms: Self::now_ms(),
+                    amount_sats: pending,
+                });
+                let _ = self.persist_policy(&user_id_hex, ps);
+            }
+        }
+
+        // Reset session
+        let sign_h = user.signing_session.unwrap();
+        crypto_ops::signing_session_reset(user, sign_h)
+            .map_err(|e| Status::internal(format!("signing_session_reset: {e}")))?;
+        if let Some((ref mut s1, ref mut s2)) = user.signing_sync {
+            s1.reset();
+            s2.reset();
+        }
+        user.signing_nonce = None;
+
+        Ok(Response::new(SignStep2Response {
+            r_point: r_bytes,
+            z_scalar: z_bytes,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Refresh
+    // -----------------------------------------------------------------------
+
+    async fn refresh_step1(
+        &self,
+        request: Request<RefreshStep1Request>,
+    ) -> Result<Response<RefreshStep1Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] RefreshStep1");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_REFRESH_STEP1,
+        )?;
+
+        let step1_notify: Arc<Notify>;
+        let step1_done: Arc<std::sync::atomic::AtomicBool>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let policy_state = user
+                .policy_state
+                .as_ref()
+                .ok_or_else(|| Status::not_found("no policy state"))?
+                .clone();
+
+            let user_identifier_hex = policy_state
+                .user_signing_identifier_hex
+                .clone()
+                .unwrap_or_else(|| {
+                    crypto_ops::identifier_derive(user, &req.user_id).unwrap_or_default()
+                });
+
+            // Auto-reset if previous refresh completed
+            let prev_done = user
+                .refresh_sync
+                .as_ref()
+                .map_or(false, |(_, _, step3)| step3.done.load(Ordering::SeqCst));
+
+            if prev_done {
+                tracing::info!("[{user_id_hex}] RefreshStep1: Resetting previous session");
+                if let Some(h) = user.refresh_session {
+                    crypto_ops::refresh_session_reset(user, h)
+                        .map_err(|e| Status::internal(format!("refresh_reset: {e}")))?;
+                }
+                if let Some((s1, s2, s3)) = user.refresh_sync.as_mut() {
+                    s1.reset();
+                    s2.reset();
+                    s3.reset();
+                }
+                user.round1_secret = None;
+                user.round2_secret = None;
+            }
+
+            if user.refresh_session.is_none() {
+                let h = crypto_ops::refresh_session_create(user)
+                    .map_err(|e| Status::internal(format!("refresh_session_create: {e}")))?;
+                user.refresh_session = Some(h);
+                user.refresh_sync =
+                    Some((StepSync::new(), StepSync::new(), StepSync::new()));
+            }
+            let refresh_h = user.refresh_session.unwrap();
+
+            crypto_ops::refresh_session_insert_round1_package(
+                user,
+                refresh_h,
+                &user_identifier_hex,
+                &req.round1_package,
+            )
+            .map_err(|e| Status::internal(format!("insert_round1: {e}")))?;
+
+            // Server init (once)
+            if user.round1_secret.is_none() {
+                tracing::info!("[{user_id_hex}] Server: Generating Refresh secrets");
+
+                let server_identifier_hex =
+                    Self::extract_identifier(&policy_state.normal_policy.key_package_json)?;
+                let server_id_hex = Self::extract_verifying_key(
+                    &policy_state.normal_policy.public_key_package_json,
+                )?;
+                let server_id_bytes = hex::decode(&server_id_hex)
+                    .map_err(|e| Status::internal(format!("hex decode: {e}")))?;
+
+                let refresh_h = user.refresh_session.unwrap();
+                crypto_ops::refresh_session_set_server_id(
+                    user,
+                    refresh_h,
+                    &hex::encode(&server_id_bytes),
+                )
+                .map_err(|e| Status::internal(format!("set_server_id: {e}")))?;
+                crypto_ops::refresh_session_set_server_identifier_hex(
+                    user,
+                    refresh_h,
+                    &server_identifier_hex,
+                )
+                .map_err(|e| Status::internal(format!("set_server_id_hex: {e}")))?;
+
+                let result = crypto_ops::dkg_refresh_part1(
+                    user,
+                    &server_identifier_hex,
+                    2,
+                    THRESHOLD_COUNT,
+                    &[],
+                )
+                .map_err(|e| Status::internal(format!("dkg_refresh_part1: {e}")))?;
+
+                user.round1_secret = Some(result.secret_handle);
+
+                let refresh_h = user.refresh_session.unwrap();
+                let creation_ms =
+                    crypto_ops::refresh_session_get_refresh_creation_time_ms(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_creation_time: {e}")))?;
+                if creation_ms == 0 {
+                    crypto_ops::refresh_session_set_refresh_creation_time_ms(
+                        user,
+                        refresh_h,
+                        Self::now_ms(),
+                    )
+                    .map_err(|e| Status::internal(format!("set_creation_time: {e}")))?;
+                    crypto_ops::refresh_session_set_refresh_id(
+                        user,
+                        refresh_h,
+                        &Self::random_base64(32),
+                    )
+                    .map_err(|e| Status::internal(format!("set_refresh_id: {e}")))?;
+                    crypto_ops::refresh_session_set_refresh_threshold_amount(
+                        user,
+                        refresh_h,
+                        req.threshold_amount,
+                    )
+                    .map_err(|e| Status::internal(format!("set_threshold: {e}")))?;
+                    crypto_ops::refresh_session_set_refresh_interval(
+                        user,
+                        refresh_h,
+                        req.interval,
+                    )
+                    .map_err(|e| Status::internal(format!("set_interval: {e}")))?;
+                }
+
+                crypto_ops::refresh_session_insert_round1_package(
+                    user,
+                    refresh_h,
+                    &server_identifier_hex,
+                    &result.round1_package_json,
+                )
+                .map_err(|e| Status::internal(format!("insert_round1: {e}")))?;
+            }
+
+            let refresh_h = user.refresh_session.unwrap();
+            let round1_count = crypto_ops::refresh_session_round1_count(user, refresh_h)
+                .map_err(|e| Status::internal(format!("round1_count: {e}")))?;
+
+            if round1_count >= 2 {
+                let (ref step1, _, _) = user
+                    .refresh_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no refresh sync"))?;
+                step1.done.store(true, Ordering::SeqCst);
+                step1.complete.notify_waiters();
+            }
+
+            let (ref step1, _, _) = user
+                .refresh_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no refresh sync"))?;
+            step1_notify = step1.complete.clone();
+            step1_done = step1.done.clone();
+        }
+
+        if !step1_done.load(Ordering::SeqCst) {
+            step1_notify.notified().await;
+        }
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let refresh_h = user
+            .refresh_session
+            .ok_or_else(|| Status::internal("refresh session disappeared"))?;
+
+        let round1_json =
+            crypto_ops::refresh_session_get_round1_packages_json(user, refresh_h)
+                .map_err(|e| Status::internal(format!("get_round1: {e}")))?;
+        let pkgs = Self::parse_json_string_map(&round1_json)?;
+
+        let mut response = RefreshStep1Response::default();
+        for (id_hex, pkg_json) in &pkgs {
+            response
+                .round1_packages
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+        response.start_time =
+            crypto_ops::refresh_session_get_refresh_creation_time_ms(user, refresh_h)
+                .map_err(|e| Status::internal(format!("get_creation_time: {e}")))?;
+        response.policy_id = crypto_ops::refresh_session_get_refresh_id(user, refresh_h)
+            .map_err(|e| Status::internal(format!("get_refresh_id: {e}")))?;
+
+        Ok(Response::new(response))
+    }
+
+    async fn refresh_step2(
+        &self,
+        request: Request<RefreshStep2Request>,
+    ) -> Result<Response<RefreshStep2Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] RefreshStep2");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_REFRESH_STEP2,
+        )?;
+
+        // Wait for step1
+        let (step1_notify, step1_done) = {
+            let mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .iter_users()
+                .find(|(k, _)| *k == &user_id_hex)
+                .map(|(_, u)| u)
+                .ok_or_else(|| Status::internal("no user instance"))?;
+            let (ref step1, _, _) = user
+                .refresh_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no refresh sync"))?;
+            (step1.complete.clone(), step1.done.clone())
+        };
+
+        if !step1_done.load(Ordering::SeqCst) {
+            step1_notify.notified().await;
+        }
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let refresh_h = user
+                .refresh_session
+                .ok_or_else(|| Status::internal("no refresh session"))?;
+
+            let server_identifier_hex =
+                crypto_ops::refresh_session_get_server_identifier_hex(user, refresh_h)
+                    .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+            if server_identifier_hex.is_empty() {
+                return Err(Status::internal("server identifier not set"));
+            }
+
+            let is_local_empty =
+                crypto_ops::refresh_session_is_round2_local_empty(user, refresh_h)
+                    .map_err(|e| Status::internal(format!("is_local_empty: {e}")))?;
+
+            if is_local_empty {
+                tracing::info!("[{user_id_hex}] RefreshStep2: Server computing round2");
+
+                let round1_pkgs_json =
+                    crypto_ops::refresh_session_get_round1_packages_excluding_json(
+                        user,
+                        refresh_h,
+                        &server_identifier_hex,
+                    )
+                    .map_err(|e| Status::internal(format!("get_round1_excluding: {e}")))?;
+
+                let round1_secret = user
+                    .round1_secret
+                    .take()
+                    .ok_or_else(|| Status::internal("round1 secret missing"))?;
+
+                let result =
+                    crypto_ops::dkg_refresh_part2(user, round1_secret, &round1_pkgs_json)
+                        .map_err(|e| Status::internal(format!("dkg_refresh_part2: {e}")))?;
+
+                user.round2_secret = Some(result.secret_handle);
+                let local_pkgs = Self::parse_round2_result(&result.round2_packages_json)?;
+                let local_json = serde_json::to_string(&local_pkgs)
+                    .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+                let refresh_h = user.refresh_session.unwrap();
+                crypto_ops::refresh_session_set_round2_local_json(
+                    user,
+                    refresh_h,
+                    &local_json,
+                )
+                .map_err(|e| Status::internal(format!("set_round2_local: {e}")))?;
+            }
+
+            let (_, ref step2, _) = user
+                .refresh_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no refresh sync"))?;
+            step2.done.store(true, Ordering::SeqCst);
+            step2.complete.notify_waiters();
+        }
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let refresh_h = user
+            .refresh_session
+            .ok_or_else(|| Status::internal("refresh session disappeared"))?;
+
+        let round1_json =
+            crypto_ops::refresh_session_get_round1_packages_json(user, refresh_h)
+                .map_err(|e| Status::internal(format!("get_round1: {e}")))?;
+        let pkgs = Self::parse_json_string_map(&round1_json)?;
+
+        let mut response = RefreshStep2Response::default();
+        for (id_hex, pkg_json) in &pkgs {
+            response
+                .all_round1_packages
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+
+        Ok(Response::new(response))
+    }
+
+    async fn refresh_step3(
+        &self,
+        request: Request<RefreshStep3Request>,
+    ) -> Result<Response<RefreshStep3Response>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] RefreshStep3");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_REFRESH_STEP3,
+        )?;
+
+        // Wait for step2
+        let (step2_notify, step2_done) = {
+            let mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .iter_users()
+                .find(|(k, _)| *k == &user_id_hex)
+                .map(|(_, u)| u)
+                .ok_or_else(|| Status::internal("no user instance"))?;
+            let (_, ref step2, _) = user
+                .refresh_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no refresh sync"))?;
+            (step2.complete.clone(), step2.done.clone())
+        };
+
+        if !step2_done.load(Ordering::SeqCst) {
+            step2_notify.notified().await;
+        }
+
+        let step3_notify: Arc<Notify>;
+        let step3_done: Arc<std::sync::atomic::AtomicBool>;
+        let packages_for_me: HashMap<String, String>;
+
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let policy_state = user
+                .policy_state
+                .as_ref()
+                .ok_or_else(|| Status::not_found("no policy state"))?
+                .clone();
+
+            let user_identifier_hex = policy_state
+                .user_signing_identifier_hex
+                .clone()
+                .unwrap_or_else(|| {
+                    crypto_ops::identifier_derive(user, &req.user_id).unwrap_or_default()
+                });
+
+            let refresh_h = user
+                .refresh_session
+                .ok_or_else(|| Status::internal("no refresh session"))?;
+
+            let server_identifier_hex =
+                crypto_ops::refresh_session_get_server_identifier_hex(user, refresh_h)
+                    .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+
+            // Store round2 packages from user
+            for (recipient_hex, pkg_json) in &req.round2_packages_for_others {
+                if recipient_hex == &server_identifier_hex {
+                    crypto_ops::refresh_session_insert_round2_received(
+                        user,
+                        refresh_h,
+                        &user_identifier_hex,
+                        pkg_json,
+                    )
+                    .map_err(|e| Status::internal(format!("insert_round2: {e}")))?;
+                }
+            }
+
+            // Insert into relay
+            let sender_pkgs_json = serde_json::to_string(&req.round2_packages_for_others)
+                .map_err(|e| Status::internal(format!("serialize: {e}")))?;
+            crypto_ops::refresh_session_insert_relay_packages(
+                user,
+                refresh_h,
+                &user_identifier_hex,
+                &sender_pkgs_json,
+            )
+            .map_err(|e| Status::internal(format!("insert_relay: {e}")))?;
+
+            // n=2 for refresh
+            let relay_count =
+                crypto_ops::refresh_session_relay_sender_count(user, refresh_h)
+                    .map_err(|e| Status::internal(format!("relay_count: {e}")))?;
+
+            if relay_count >= 1 {
+                crypto_ops::refresh_session_insert_relay_from_local(
+                    user,
+                    refresh_h,
+                    &server_identifier_hex,
+                )
+                .map_err(|e| Status::internal(format!("insert_relay_from_local: {e}")))?;
+
+                let (_, _, ref step3) = user
+                    .refresh_sync
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("no refresh sync"))?;
+                step3.done.store(true, Ordering::SeqCst);
+                step3.complete.notify_waiters();
+            }
+
+            let (_, _, ref step3) = user
+                .refresh_sync
+                .as_ref()
+                .ok_or_else(|| Status::internal("no refresh sync"))?;
+            step3_notify = step3.complete.clone();
+            step3_done = step3.done.clone();
+
+            // Build packages for the requester
+            let relay_json = crypto_ops::refresh_session_get_relay_packages_for(
+                user,
+                refresh_h,
+                &user_identifier_hex,
+            )
+            .map_err(|e| Status::internal(format!("get_relay_for: {e}")))?;
+            packages_for_me = Self::parse_json_string_map(&relay_json)?;
+        }
+
+        if !step3_done.load(Ordering::SeqCst) {
+            step3_notify.notified().await;
+        }
+
+        // Server key computation
+        {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            if user.round2_secret.is_some() {
+                tracing::info!("[{user_id_hex}] RefreshStep3: Server computing new key");
+
+                let policy_state = user
+                    .policy_state
+                    .as_ref()
+                    .ok_or_else(|| Status::not_found("no policy state"))?
+                    .clone();
+
+                let refresh_h = user.refresh_session.unwrap();
+                let server_identifier_hex =
+                    crypto_ops::refresh_session_get_server_identifier_hex(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_server_id: {e}")))?;
+
+                let round1_pkgs_json =
+                    crypto_ops::refresh_session_get_round1_packages_excluding_json(
+                        user,
+                        refresh_h,
+                        &server_identifier_hex,
+                    )
+                    .map_err(|e| Status::internal(format!("get_round1_excluding: {e}")))?;
+                let round2_received_json =
+                    crypto_ops::refresh_session_get_round2_received_json(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_round2: {e}")))?;
+
+                let old_pkp_json =
+                    policy_state.normal_policy.public_key_package_json.clone();
+                let old_kp_json = policy_state.normal_policy.key_package_json.clone();
+
+                let round2_secret = user.round2_secret.take().unwrap();
+                let result = crypto_ops::dkg_refresh_part3(
+                    user,
+                    round2_secret,
+                    &round1_pkgs_json,
+                    &round2_received_json,
+                    &old_pkp_json,
+                    &old_kp_json,
+                )
+                .map_err(|e| Status::internal(format!("dkg_refresh_part3: {e}")))?;
+
+                // Verify group key invariant
+                let old_vk = Self::extract_verifying_key(&old_pkp_json)?;
+                let new_vk =
+                    Self::extract_verifying_key(&result.public_key_package_json)?;
+                if old_vk != new_vk {
+                    tracing::error!(
+                        "[{user_id_hex}] CRITICAL: Group key changed during refresh!"
+                    );
+                    return Err(Status::internal(
+                        "Protocol violation: Group key changed during refresh",
+                    ));
+                }
+
+                let refresh_h = user.refresh_session.unwrap();
+                let refresh_id =
+                    crypto_ops::refresh_session_get_refresh_id(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_refresh_id: {e}")))?;
+                let refresh_threshold =
+                    crypto_ops::refresh_session_get_refresh_threshold_amount(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_threshold: {e}")))?;
+                let refresh_creation_ms =
+                    crypto_ops::refresh_session_get_refresh_creation_time_ms(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_creation_time: {e}")))?;
+                let refresh_interval =
+                    crypto_ops::refresh_session_get_refresh_interval(user, refresh_h)
+                        .map_err(|e| Status::internal(format!("get_interval: {e}")))?;
+
+                let new_policy = ProtectedPolicy {
+                    id: refresh_id,
+                    threshold_sats: refresh_threshold,
+                    start_time_ms: refresh_creation_ms,
+                    interval_seconds: refresh_interval,
+                    key_package_json: result.key_package_json,
+                    public_key_package_json: result.public_key_package_json,
+                };
+
+                if let Some(ps) = user.policy_state.as_mut() {
+                    ps.protected_policies
+                        .insert(new_policy.id.clone(), new_policy);
+                    let _ = self.persist_policy(&user_id_hex, ps);
+                }
+
+                tracing::info!("[{user_id_hex}] RefreshStep3: New policy created");
+            }
+        }
+
+        let mut response = RefreshStep3Response::default();
+        for (id_hex, pkg_json) in &packages_for_me {
+            response
+                .round2_packages_for_me
+                .insert(id_hex.clone(), pkg_json.clone());
+        }
+
+        Ok(Response::new(response))
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy
+    // -----------------------------------------------------------------------
+
+    async fn create_spending_policy(
+        &self,
+        _request: Request<CreateSpendingPolicyRequest>,
+    ) -> Result<Response<CreateSpendingPolicyResponse>, Status> {
+        Err(Status::unimplemented(
+            "Use Refresh flow to create spending policies",
+        ))
+    }
+
+    async fn get_policy_id(
+        &self,
+        request: Request<GetPolicyIdRequest>,
+    ) -> Result<Response<GetPolicyIdResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] GetPolicyId");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_GET_POLICY_ID,
+        )?;
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+        let pkp_json = {
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+            user.policy_state
+                .as_ref()
+                .unwrap()
+                .normal_policy
+                .public_key_package_json
+                .clone()
+        };
+
+        let spent_amount = self
+            .calculate_spent_amount(&mut mgr, &req.tx_message, &pkp_json, &user_id_hex)
+            .unwrap_or(0);
+
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let policy_state = user.policy_state.as_ref().unwrap();
+        let policy_id =
+            Self::evaluate_policy_for_amount(policy_state, spent_amount).unwrap_or_default();
+
+        Ok(Response::new(GetPolicyIdResponse { policy_id }))
+    }
+
+    async fn update_policy(
+        &self,
+        request: Request<UpdatePolicyRequest>,
+    ) -> Result<Response<UpdatePolicyResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] UpdatePolicy: policy={}", req.policy_id);
+
+        self.auth_verifier
+            .validate_request_timing(req.timestamp_ms, &user_id_hex, OP_UPDATE_POLICY)?;
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        // Extract owned values from policy_state before mutable borrow
+        let (vk_hex, existing) = {
+            let policy_state = user
+                .policy_state
+                .as_ref()
+                .ok_or_else(|| Status::not_found("no policy state"))?;
+
+            if !policy_state.protected_policies.contains_key(&req.policy_id) {
+                return Err(Status::not_found(format!(
+                    "Policy {} not found",
+                    req.policy_id
+                )));
+            }
+
+            let vk = Self::extract_verifying_key(
+                &policy_state.normal_policy.public_key_package_json,
+            )?;
+            let existing = policy_state
+                .protected_policies
+                .get(&req.policy_id)
+                .unwrap()
+                .clone();
+            (vk, existing)
+        };
+
+        // Verify FROST signature
+        let message = build_update_policy_message(
+            &req.policy_id,
+            req.threshold_sats,
+            req.interval_seconds,
+            req.timestamp_ms,
+            &user_id_hex,
+        );
+
+        let r_hex = hex::encode(&req.frost_signature_r);
+        let z_hex = hex::encode(&req.frost_signature_z);
+        let sig_hex = format!("{}:{}", r_hex, z_hex);
+
+        let is_valid = crypto_ops::verify_schnorr_signature(user, &vk_hex, &message, &sig_hex)
+            .map_err(|e| Status::internal(format!("verify error: {e}")))?;
+        if !is_valid {
+            return Err(Status::unauthenticated("Invalid recovery signature"));
+        }
+        let updated = ProtectedPolicy {
+            id: existing.id,
+            threshold_sats: req.threshold_sats,
+            start_time_ms: existing.start_time_ms,
+            interval_seconds: req.interval_seconds,
+            key_package_json: existing.key_package_json,
+            public_key_package_json: existing.public_key_package_json,
+        };
+
+        if let Some(ps) = user.policy_state.as_mut() {
+            ps.protected_policies.insert(updated.id.clone(), updated);
+            self.persist_policy(&user_id_hex, ps)?;
+        }
+
+        tracing::info!("[{user_id_hex}] UpdatePolicy: success");
+        Ok(Response::new(UpdatePolicyResponse { success: true }))
+    }
+
+    async fn delete_policy(
+        &self,
+        request: Request<DeletePolicyRequest>,
+    ) -> Result<Response<DeletePolicyResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] DeletePolicy: policy={}", req.policy_id);
+
+        self.auth_verifier
+            .validate_request_timing(req.timestamp_ms, &user_id_hex, OP_DELETE_POLICY)?;
+
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+        let user = mgr
+            .get_or_create_user(&user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+        let policy_state = user
+            .policy_state
+            .as_ref()
+            .ok_or_else(|| Status::not_found("no policy state"))?;
+
+        if !policy_state.protected_policies.contains_key(&req.policy_id) {
+            return Err(Status::not_found(format!(
+                "Policy {} not found",
+                req.policy_id
+            )));
+        }
+
+        let message = build_delete_policy_message(&req.policy_id, req.timestamp_ms, &user_id_hex);
+
+        let r_hex = hex::encode(&req.frost_signature_r);
+        let z_hex = hex::encode(&req.frost_signature_z);
+        let sig_hex = format!("{}:{}", r_hex, z_hex);
+
+        let vk_hex =
+            Self::extract_verifying_key(&policy_state.normal_policy.public_key_package_json)?;
+
+        let is_valid = crypto_ops::verify_schnorr_signature(user, &vk_hex, &message, &sig_hex)
+            .map_err(|e| Status::internal(format!("verify error: {e}")))?;
+        if !is_valid {
+            return Err(Status::unauthenticated("Invalid recovery signature"));
+        }
+
+        if let Some(ps) = user.policy_state.as_mut() {
+            ps.protected_policies.remove(&req.policy_id);
+            self.persist_policy(&user_id_hex, ps)?;
+        }
+
+        tracing::info!("[{user_id_hex}] DeletePolicy: success");
+        Ok(Response::new(DeletePolicyResponse { success: true }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Bitcoin
+    // -----------------------------------------------------------------------
+
+    async fn broadcast_transaction(
+        &self,
+        request: Request<BroadcastTransactionRequest>,
+    ) -> Result<Response<BroadcastTransactionResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] BroadcastTransaction");
+
+        let tx_id = self
+            .bitcoin_rpc
+            .send_raw_transaction(&req.tx_hex)
+            .await
+            .map_err(|e| Status::internal(format!("broadcast error: {e}")))?;
+
+        tracing::info!("[{user_id_hex}] Broadcast txid: {tx_id}");
+
+        Ok(Response::new(BroadcastTransactionResponse { tx_id }))
+    }
+
+    async fn fetch_history(
+        &self,
+        request: Request<FetchHistoryRequest>,
+    ) -> Result<Response<FetchHistoryResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] FetchHistory");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_FETCH_HISTORY,
+        )?;
+
+        // Pre-compute tweaked pubkeys for all policies while holding the lock
+        let (policy_state_clone, tweaked_map) = {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let ps = user
+                .policy_state
+                .clone()
+                .ok_or_else(|| Status::not_found("no policy state"))?;
+
+            let mut map = std::collections::HashMap::new();
+
+            // Normal policy
+            let tweaked = crypto_ops::pub_key_package_tweak(
+                user,
+                &ps.normal_policy.public_key_package_json,
+                None,
+            )
+            .map_err(|e| Status::internal(format!("tweak error: {e}")))?;
+            let vk = Self::extract_verifying_key(&tweaked)?;
+            map.insert(ps.normal_policy.public_key_package_json.clone(), vk);
+
+            // Protected policies
+            for pp in ps.protected_policies.values() {
+                let tweaked = crypto_ops::pub_key_package_tweak(
+                    user,
+                    &pp.public_key_package_json,
+                    None,
+                )
+                .map_err(|e| Status::internal(format!("tweak error: {e}")))?;
+                let vk = Self::extract_verifying_key(&tweaked)?;
+                map.insert(pp.public_key_package_json.clone(), vk);
+            }
+
+            (ps, map)
+        };
+        // Lock dropped
+
+        let tweaked_fn = move |pkp_json: &str| -> Result<String, String> {
+            tweaked_map
+                .get(pkp_json)
+                .cloned()
+                .ok_or_else(|| format!("no tweaked key for pkp"))
+        };
+
+        let bh = self.bitcoin_history.lock().await;
+        let utxos = bh
+            .get_utxos(&policy_state_clone, &tweaked_fn)
+            .await
+            .map_err(|e| Status::internal(format!("electrum error: {e}")))?;
+
+        let response_utxos: Vec<UtxoInfo> = utxos
+            .into_iter()
+            .map(|u| UtxoInfo {
+                tx_hash: u.tx_hash,
+                vout: u.vout as i32,
+                amount: u.amount_sats,
+            })
+            .collect();
+
+        Ok(Response::new(FetchHistoryResponse {
+            utxos: response_utxos,
+        }))
+    }
+
+    async fn fetch_recent_transactions(
+        &self,
+        request: Request<FetchRecentTransactionsRequest>,
+    ) -> Result<Response<FetchRecentTransactionsResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] FetchRecentTransactions");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_FETCH_RECENT_TXS,
+        )?;
+
+        // Pre-compute tweaked pubkeys while holding the lock
+        let (policy_state_clone, tweaked_map) = {
+            let mut mgr = self.wasm_manager.lock().unwrap();
+            self.load_policy_state(&mut mgr, &user_id_hex)?;
+
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+
+            let ps = user
+                .policy_state
+                .clone()
+                .ok_or_else(|| Status::not_found("no policy state"))?;
+
+            let mut map = std::collections::HashMap::new();
+
+            let tweaked = crypto_ops::pub_key_package_tweak(
+                user,
+                &ps.normal_policy.public_key_package_json,
+                None,
+            )
+            .map_err(|e| Status::internal(format!("tweak error: {e}")))?;
+            let vk = Self::extract_verifying_key(&tweaked)?;
+            map.insert(ps.normal_policy.public_key_package_json.clone(), vk);
+
+            for pp in ps.protected_policies.values() {
+                let tweaked = crypto_ops::pub_key_package_tweak(
+                    user,
+                    &pp.public_key_package_json,
+                    None,
+                )
+                .map_err(|e| Status::internal(format!("tweak error: {e}")))?;
+                let vk = Self::extract_verifying_key(&tweaked)?;
+                map.insert(pp.public_key_package_json.clone(), vk);
+            }
+
+            (ps, map)
+        };
+
+        let tweaked_fn = move |pkp_json: &str| -> Result<String, String> {
+            tweaked_map
+                .get(pkp_json)
+                .cloned()
+                .ok_or_else(|| format!("no tweaked key for pkp"))
+        };
+
+        let bh = self.bitcoin_history.lock().await;
+        let txs = bh
+            .get_recent_transactions(&policy_state_clone, &tweaked_fn)
+            .await
+            .map_err(|e| Status::internal(format!("electrum error: {e}")))?;
+
+        let response_txs: Vec<TransactionSummary> = txs
+            .into_iter()
+            .map(|t| TransactionSummary {
+                tx_hash: t.tx_hash,
+                amount_sats: t.amount_sats,
+                timestamp: t.timestamp as i64,
+                is_pending: t.is_pending,
+            })
+            .collect();
+
+        Ok(Response::new(FetchRecentTransactionsResponse {
+            transactions: response_txs,
+        }))
+    }
+
+    type SubscribeToHistoryStream = ResponseStream;
+
+    async fn subscribe_to_history(
+        &self,
+        request: Request<SubscribeToHistoryRequest>,
+    ) -> Result<Response<Self::SubscribeToHistoryStream>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+
+        tracing::info!("[{user_id_hex}] SubscribeToHistory");
+
+        self.verify_auth(
+            &req.user_id,
+            &req.signature,
+            req.timestamp_ms,
+            OP_SUBSCRIBE_HISTORY,
+        )?;
+
+        // Create a notification stream channel
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+        // Keep sender alive until client disconnects
+        tokio::spawn(async move {
+            let _ = tx;
+            tokio::signal::ctrl_c().await.ok();
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(
+            Box::pin(stream) as Self::SubscribeToHistoryStream
+        ))
+    }
+}
