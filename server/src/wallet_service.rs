@@ -2115,7 +2115,7 @@ impl MpcWallet for WalletService {
 
         let r_hex = hex::encode(&req.frost_signature_r);
         let z_hex = hex::encode(&req.frost_signature_z);
-        let sig_hex = format!("{}:{}", r_hex, z_hex);
+        let sig_hex = format!("{}{}", r_hex, z_hex);
 
         let is_valid = crypto_ops::verify_schnorr_signature(user, &vk_hex, &message, &sig_hex)
             .map_err(|e| Status::internal(format!("verify error: {e}")))?;
@@ -2175,7 +2175,7 @@ impl MpcWallet for WalletService {
 
         let r_hex = hex::encode(&req.frost_signature_r);
         let z_hex = hex::encode(&req.frost_signature_z);
-        let sig_hex = format!("{}:{}", r_hex, z_hex);
+        let sig_hex = format!("{}{}", r_hex, z_hex);
 
         let vk_hex =
             Self::extract_verifying_key(&policy_state.normal_policy.public_key_package_json)?;
