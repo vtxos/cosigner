@@ -83,6 +83,10 @@ pub struct UserInstance {
     /// Refresh step sync: (step1, step2, step3).
     pub refresh_sync: Option<(StepSync, StepSync, StepSync)>,
 
+    // --- Signing mode ---
+    /// If true, the current signing session uses script-path (no tweak).
+    pub script_path_spend: bool,
+
     // --- Persistent state (stays host-side for now) ---
     pub policy_state: Option<PolicyState>,
     pub utxo_state: Option<UtxoState>,
@@ -150,6 +154,7 @@ impl WasmManager {
                     dkg_sync: None,
                     signing_sync: None,
                     refresh_sync: None,
+                    script_path_spend: false,
                     policy_state: None,
                     utxo_state: None,
                 },

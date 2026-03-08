@@ -54,6 +54,20 @@ pub fn h5(input: &[u8]) -> [u8; 32] {
     hash_to_array(&[CONTEXT_STRING, b"com", input])
 }
 
+/// BIP-340 tagged hash returning raw bytes (NOT reduced mod n).
+/// Used for TapLeaf/TapBranch hashes where the result is a hash, not a scalar.
+pub fn tagged_hash_raw(tag: &str, msg: &[u8]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(tag.as_bytes());
+    let mut hasher = Sha256::new();
+    hasher.update(&tag_hash);
+    hasher.update(&tag_hash);
+    hasher.update(msg);
+    let hash = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
+
 /// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg) mod n.
 pub fn tagged_hash(tag: &str, msg: &[u8]) -> Scalar {
     let tag_hash = Sha256::digest(tag.as_bytes());

@@ -30,6 +30,27 @@ service MPCWallet {
   rpc FetchHistory (FetchHistoryRequest) returns (FetchHistoryResponse);
   rpc FetchRecentTransactions (FetchRecentTransactionsRequest) returns (FetchRecentTransactionsResponse);
   rpc SubscribeToHistory (SubscribeToHistoryRequest) returns (stream TransactionNotification);
+
+  // Ark Protocol
+  rpc GetArkInfo (GetArkInfoRequest) returns (GetArkInfoResponse);
+  rpc GetArkAddress (GetArkAddressRequest) returns (GetArkAddressResponse);
+  rpc GetBoardingAddress (GetBoardingAddressRequest) returns (GetBoardingAddressResponse);
+  rpc ListVtxos (ListVtxosRequest) returns (ListVtxosResponse);
+  rpc SendVtxo (SendVtxoRequest) returns (SendVtxoResponse);
+  rpc RedeemVtxo (RedeemVtxoRequest) returns (RedeemVtxoResponse);
+
+  // Ark Settle (boarding): board on-chain UTXOs into Ark VTXOs.
+  // Stateful: call multiple times to drive the batch protocol.
+  // Phase 1: call with no signed_messages → returns SIGNING_REQUIRED + intent sighashes
+  // Phase 2: call with FROST signatures → registers intent, waits for batch
+  // Phase 3: poll → returns SIGNING_REQUIRED for commitment/forfeit, or SETTLED
+  rpc Settle (SettleRequest) returns (SettleResponse);
+
+  // Ark SettleDelegate: settle existing VTXOs using the delegate pattern.
+  // Only 2 rounds (vs 4 for boarding):
+  // Phase 1: call with no signed_messages → returns SIGNING_REQUIRED + all sighashes
+  // Phase 2: call with FROST signatures → server drives batch autonomously → SETTLED
+  rpc SettleDelegate (SettleDelegateRequest) returns (SettleDelegateResponse);
 }
 
 // DKG Messages
@@ -75,6 +96,7 @@ message SignStep1Request {
   bytes signature = 5; // Schnorr signature over auth message for authentication
   bytes full_transaction = 6;
   int64 timestamp_ms = 7; // Unix timestamp in milliseconds for replay protection
+  bool script_path_spend = 8; // If true, skip taproot tweak (script-path signing)
 }
 
 
@@ -253,5 +275,160 @@ message TransactionNotification {
     // Sending the relevant UTXOs involved (newly created ones owned by wallet)
     repeated UtxoInfo added_utxos = 3;
     repeated UtxoInfo spent_utxos = 4; // Inputs that consumed our UTXOs
+}
+
+// Ark Protocol Messages
+
+message GetArkInfoRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+}
+
+message GetArkInfoResponse {
+    string signer_pubkey = 1;
+    string forfeit_pubkey = 2;
+    string network = 3;
+    int64 session_duration = 4;
+    int64 unilateral_exit_delay = 5;
+    int64 boarding_exit_delay = 6;
+    int64 vtxo_min_amount = 7;
+    int64 dust = 8;
+}
+
+message GetArkAddressRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+}
+
+message GetArkAddressResponse {
+    string ark_address = 1;
+}
+
+message GetBoardingAddressRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+}
+
+message GetBoardingAddressResponse {
+    string boarding_address = 1;
+}
+
+message VtxoInfo {
+    string txid = 1;
+    uint32 vout = 2;
+    uint64 amount = 3;
+    int64 created_at = 4;
+    int64 expires_at = 5;
+    string status = 6; // "confirmed", "pending", "spent", "expired"
+    bool is_preconfirmed = 7;
+}
+
+message ListVtxosRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+}
+
+message ListVtxosResponse {
+    repeated VtxoInfo vtxos = 1;
+    uint64 total_balance = 2;
+}
+
+message SendVtxoRequest {
+    bytes user_id = 1;
+    string recipient_ark_address = 2;
+    uint64 amount = 3;
+    bytes signature = 4;
+    int64 timestamp_ms = 5;
+    // FROST signatures for previously requested sighashes (phase 2)
+    repeated bytes signed_messages = 6;
+}
+
+message SendVtxoResponse {
+    enum Status {
+        SIGNING_REQUIRED = 0;
+        SETTLED = 1;
+        ERROR = 2;
+    }
+    Status status = 1;
+    // Sighashes that need FROST signing (when SIGNING_REQUIRED)
+    repeated bytes messages_to_sign = 2;
+    // Always true for send (script-path spend, no taproot tweak)
+    bool script_path_spend = 3;
+    // Ark txid when SETTLED
+    string ark_txid = 4;
+    // Error message when ERROR
+    string error_message = 5;
+}
+
+message RedeemVtxoRequest {
+    bytes user_id = 1;
+    string on_chain_address = 2;
+    uint64 amount = 3;
+    bytes signature = 4;
+    int64 timestamp_ms = 5;
+}
+
+message RedeemVtxoResponse {
+    bool success = 1;
+    string txid = 2;
+}
+
+// Settle Messages
+
+message SettleRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+    // FROST signatures for previously requested sighashes (phase 2+)
+    repeated bytes signed_messages = 4;
+}
+
+message SettleResponse {
+    enum Status {
+        SIGNING_REQUIRED = 0;
+        WAITING_FOR_BATCH = 1;
+        SETTLED = 2;
+        ERROR = 3;
+    }
+    Status status = 1;
+    // Sighashes that need FROST signing (when SIGNING_REQUIRED)
+    repeated bytes messages_to_sign = 2;
+    // Whether these sighashes are script-path spends (no taproot tweak)
+    bool script_path_spend = 3;
+    // Commitment txid when SETTLED
+    string commitment_txid = 4;
+    // Error message when ERROR
+    string error_message = 5;
+}
+
+// SettleDelegate Messages
+
+message SettleDelegateRequest {
+    bytes user_id = 1;
+    bytes signature = 2;
+    int64 timestamp_ms = 3;
+    // FROST signatures for previously requested sighashes (phase 2)
+    repeated bytes signed_messages = 4;
+}
+
+message SettleDelegateResponse {
+    enum Status {
+        SIGNING_REQUIRED = 0;
+        SETTLED = 1;
+        ERROR = 2;
+    }
+    Status status = 1;
+    // Sighashes that need FROST signing (when SIGNING_REQUIRED)
+    repeated bytes messages_to_sign = 2;
+    // Always true for delegate (script-path spend, no taproot tweak)
+    bool script_path_spend = 3;
+    // Commitment txid when SETTLED
+    string commitment_txid = 4;
+    // Error message when ERROR
+    string error_message = 5;
 }
 

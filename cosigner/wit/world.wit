@@ -269,6 +269,26 @@ interface types {
             message: list<u8>, sig-hex: string)
             -> result<bool, threshold-error>;
 
+        // ----- Ark Protocol -----
+
+        /// Compute the default VTXO script pubkey for the given keys and exit delay.
+        /// Returns hex-encoded 34-byte script pubkey.
+        ark-default-vtxo-script-pubkey: func(server-pk-hex: string,
+            owner-pk-hex: string, exit-delay: u32)
+            -> result<string, threshold-error>;
+
+        /// Get forfeit (cooperative) spend info for a default Ark VTXO.
+        /// Returns JSON: {"script_hex": "...", "control_block_hex": "..."}
+        ark-forfeit-spend-info: func(server-pk-hex: string,
+            owner-pk-hex: string, exit-delay: u32)
+            -> result<string, threshold-error>;
+
+        /// Get exit (unilateral) spend info for a default Ark VTXO.
+        /// Returns JSON: {"script_hex": "...", "control_block_hex": "..."}
+        ark-exit-spend-info: func(server-pk-hex: string,
+            owner-pk-hex: string, exit-delay: u32)
+            -> result<string, threshold-error>;
+
         // ----- Utils -----
 
         /// Derive an identifier from arbitrary bytes (SHA-256).

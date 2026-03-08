@@ -34,6 +34,15 @@ pub struct WalletService {
     pub persistence: Arc<PersistenceStore>,
     pub bitcoin_rpc: Arc<BitcoinRpcClient>,
     pub bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
+    pub asp_client: Option<Arc<tokio::sync::Mutex<ark::client::AspClient>>>,
+    /// Active settle sessions (boarding): user_id -> (session, boarding_amount_sats).
+    pub settle_sessions: tokio::sync::Mutex<HashMap<String, (ark::client::batch::SettleSession, u64, u32)>>,
+    /// Active delegate settle sessions: user_id -> session.
+    pub delegate_sessions: tokio::sync::Mutex<HashMap<String, ark::client::batch::DelegateSettleSession>>,
+    /// Active send sessions: user_id -> session.
+    pub send_sessions: tokio::sync::Mutex<HashMap<String, ark::client::send::SendSession>>,
+    /// Simple in-memory VTXO store: user_id -> list of (txid, vout, amount_sats, exit_delay).
+    pub vtxo_store: tokio::sync::Mutex<HashMap<String, Vec<(String, u32, u64, u32)>>>,
 }
 
 impl WalletService {
@@ -43,6 +52,7 @@ impl WalletService {
         persistence: Arc<PersistenceStore>,
         bitcoin_rpc: Arc<BitcoinRpcClient>,
         bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
+        asp_client: Option<ark::client::AspClient>,
     ) -> Self {
         Self {
             wasm_manager,
@@ -50,7 +60,78 @@ impl WalletService {
             persistence,
             bitcoin_rpc,
             bitcoin_history,
+            asp_client: asp_client.map(|c| Arc::new(tokio::sync::Mutex::new(c))),
+            settle_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            delegate_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            send_sessions: tokio::sync::Mutex::new(HashMap::new()),
+            vtxo_store: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get the ASP client or return UNAVAILABLE.
+    fn require_asp(&self) -> Result<&Arc<tokio::sync::Mutex<ark::client::AspClient>>, Status> {
+        self.asp_client
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("ASP not configured (set ASP_URL env var)"))
+    }
+
+    /// Get the user's group x-only public key (64 hex chars) for Ark address derivation.
+    ///
+    /// This is the untweaked group verifying key from the normal policy's public key package.
+    /// The compressed public key is 33 bytes (66 hex); we strip the leading parity byte to
+    /// get the 32-byte x-only representation.
+    fn get_user_xonly_pubkey(&self, user_id_hex: &str) -> Result<String, Status> {
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        self.load_policy_state(&mut mgr, user_id_hex)?;
+        let user = mgr
+            .get_or_create_user(user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let ps = user
+            .policy_state
+            .as_ref()
+            .ok_or_else(|| Status::not_found("no policy state"))?;
+        let vk_hex = Self::extract_verifying_key(&ps.normal_policy.public_key_package_json)?;
+        // vk_hex is a 66-char compressed pubkey (02/03 prefix + 32 bytes).
+        // Extract x-only (last 64 chars).
+        if vk_hex.len() == 66 {
+            Ok(vk_hex[2..].to_string())
+        } else if vk_hex.len() == 64 {
+            Ok(vk_hex)
+        } else {
+            Err(Status::internal(format!(
+                "unexpected verifying key length: {}",
+                vk_hex.len()
+            )))
+        }
+    }
+
+    /// Get both the user's x-only pubkey and the server's DKG secret hex.
+    fn get_user_ark_keys(&self, user_id_hex: &str) -> Result<(String, String), Status> {
+        let mut mgr = self.wasm_manager.lock().unwrap();
+        self.load_policy_state(&mut mgr, user_id_hex)?;
+        let user = mgr
+            .get_or_create_user(user_id_hex)
+            .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+        let ps = user
+            .policy_state
+            .as_ref()
+            .ok_or_else(|| Status::not_found("no policy state"))?;
+        let vk_hex = Self::extract_verifying_key(&ps.normal_policy.public_key_package_json)?;
+        let xonly = if vk_hex.len() == 66 {
+            vk_hex[2..].to_string()
+        } else if vk_hex.len() == 64 {
+            vk_hex
+        } else {
+            return Err(Status::internal(format!(
+                "unexpected verifying key length: {}",
+                vk_hex.len()
+            )));
+        };
+        let dkg_secret = ps
+            .server_dkg_secret_hex
+            .clone()
+            .ok_or_else(|| Status::internal("missing server_dkg_secret_hex"))?;
+        Ok((xonly, dkg_secret))
     }
 
     fn user_id_hex(user_id: &[u8]) -> String {
@@ -1080,6 +1161,11 @@ impl MpcWallet for WalletService {
             crypto_ops::signing_session_set_pending_amount(user, sign_h, spent_amount)
                 .map_err(|e| Status::internal(format!("set_pending: {e}")))?;
 
+            // Store script-path flag for SignStep2
+            if req.script_path_spend {
+                user.script_path_spend = true;
+            }
+
             if !req.message_to_sign.is_empty() {
                 let has_msg = crypto_ops::signing_session_has_message(user, sign_h)
                     .map_err(|e| Status::internal(format!("has_message: {e}")))?;
@@ -1296,14 +1382,17 @@ impl MpcWallet for WalletService {
 
                 let signing_pkg_json = Self::build_signing_package_json(&comms_json, &msg_hex)?;
 
-                // Tweak server key for Taproot key path spending
-                let tweaked_kp_json =
+                // Tweak server key for Taproot key path spending (skip for script-path)
+                let sign_kp_json = if user.script_path_spend {
+                    server_kp_json.clone()
+                } else {
                     crypto_ops::key_package_tweak(user, &server_kp_json, None)
-                        .map_err(|e| Status::internal(format!("key_package_tweak: {e}")))?;
+                        .map_err(|e| Status::internal(format!("key_package_tweak: {e}")))?
+                };
 
                 let nonce = user.signing_nonce.take().unwrap();
                 let server_share_hex =
-                    crypto_ops::frost_sign(user, &signing_pkg_json, nonce, &tweaked_kp_json)
+                    crypto_ops::frost_sign(user, &signing_pkg_json, nonce, &sign_kp_json)
                         .map_err(|e| Status::internal(format!("frost_sign: {e}")))?;
 
                 let sign_h = user.signing_session.unwrap();
@@ -1381,15 +1470,19 @@ impl MpcWallet for WalletService {
         let pending = crypto_ops::signing_session_get_pending_amount(user, sign_h)
             .map_err(|e| Status::internal(format!("get_pending: {e}")))?;
 
-        // Tweak public package for aggregation
-        let tweaked_pkp_json = crypto_ops::pub_key_package_tweak(user, &server_pkp_json, None)
-            .map_err(|e| Status::internal(format!("pub_key_package_tweak: {e}")))?;
+        // Tweak public package for aggregation (skip for script-path)
+        let agg_pkp_json = if user.script_path_spend {
+            server_pkp_json.clone()
+        } else {
+            crypto_ops::pub_key_package_tweak(user, &server_pkp_json, None)
+                .map_err(|e| Status::internal(format!("pub_key_package_tweak: {e}")))?
+        };
 
         let agg_result_json = crypto_ops::frost_aggregate(
             user,
             &signing_pkg_json,
             &shares_json,
-            &tweaked_pkp_json,
+            &agg_pkp_json,
         )
         .map_err(|e| Status::internal(format!("frost_aggregate: {e}")))?;
 
@@ -1428,6 +1521,7 @@ impl MpcWallet for WalletService {
             s2.reset();
         }
         user.signing_nonce = None;
+        user.script_path_spend = false;
 
         Ok(Response::new(SignStep2Response {
             r_point: r_bytes,
@@ -2418,5 +2512,669 @@ impl MpcWallet for WalletService {
         Ok(Response::new(
             Box::pin(stream) as Self::SubscribeToHistoryStream
         ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Ark
+    // -----------------------------------------------------------------------
+
+    async fn get_ark_info(
+        &self,
+        request: Request<GetArkInfoRequest>,
+    ) -> Result<Response<GetArkInfoResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] GetArkInfo");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_GET_ARK_INFO)?;
+
+        let asp = self.require_asp()?;
+        let info = asp.lock().await.get_info().await
+            .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?;
+
+        Ok(Response::new(GetArkInfoResponse {
+            signer_pubkey: info.signer_pubkey,
+            forfeit_pubkey: info.forfeit_pubkey,
+            network: info.network,
+            session_duration: info.session_duration,
+            unilateral_exit_delay: info.unilateral_exit_delay,
+            boarding_exit_delay: info.boarding_exit_delay,
+            vtxo_min_amount: info.vtxo_min_amount,
+            dust: info.dust,
+        }))
+    }
+
+    async fn get_ark_address(
+        &self,
+        request: Request<GetArkAddressRequest>,
+    ) -> Result<Response<GetArkAddressResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] GetArkAddress");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_GET_ARK_ADDRESS)?;
+
+        let asp = self.require_asp()?;
+        let mut asp_guard = asp.lock().await;
+
+        // Ensure we have ASP info cached
+        let info = match &asp_guard.info {
+            Some(i) => i.clone(),
+            None => asp_guard.get_info().await
+                .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+        };
+        drop(asp_guard);
+
+        // Get the user's group x-only pubkey from policy state
+        let owner_pk_hex = self.get_user_xonly_pubkey(&user_id_hex)?;
+
+        let network = ark::client::parse_network(&info.network)
+            .map_err(|e| Status::internal(e))?;
+
+        let exit_delay = info.unilateral_exit_delay as u32;
+        let ark_addr = ark::client::ark_address(
+            &owner_pk_hex,
+            &info.signer_pubkey,
+            exit_delay,
+            network,
+        ).map_err(|e| Status::internal(format!("ark_address: {e}")))?;
+
+        Ok(Response::new(GetArkAddressResponse {
+            ark_address: ark_addr,
+        }))
+    }
+
+    async fn get_boarding_address(
+        &self,
+        request: Request<GetBoardingAddressRequest>,
+    ) -> Result<Response<GetBoardingAddressResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] GetBoardingAddress");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_GET_BOARDING_ADDRESS)?;
+
+        let asp = self.require_asp()?;
+        let mut asp_guard = asp.lock().await;
+
+        let info = match &asp_guard.info {
+            Some(i) => i.clone(),
+            None => asp_guard.get_info().await
+                .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+        };
+        drop(asp_guard);
+
+        let owner_pk_hex = self.get_user_xonly_pubkey(&user_id_hex)?;
+
+        let network = ark::client::parse_network(&info.network)
+            .map_err(|e| Status::internal(e))?;
+
+        let exit_delay = info.boarding_exit_delay as u32;
+        let boarding_addr = ark::client::boarding_address(
+            &owner_pk_hex,
+            &info.signer_pubkey,
+            exit_delay,
+            network,
+        ).map_err(|e| Status::internal(format!("boarding_address: {e}")))?;
+
+        Ok(Response::new(GetBoardingAddressResponse {
+            boarding_address: boarding_addr,
+        }))
+    }
+
+    async fn list_vtxos(
+        &self,
+        request: Request<ListVtxosRequest>,
+    ) -> Result<Response<ListVtxosResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] ListVtxos");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_LIST_VTXOS)?;
+
+        self.require_asp()?;
+
+        let store = self.vtxo_store.lock().await;
+        let user_vtxos = store.get(&user_id_hex);
+        let mut vtxos = Vec::new();
+        let mut total_balance: u64 = 0;
+        if let Some(entries) = user_vtxos {
+            for (txid, vout, amount, _exit_delay) in entries.iter() {
+                total_balance += amount;
+                vtxos.push(VtxoInfo {
+                    txid: txid.clone(),
+                    vout: *vout,
+                    amount: *amount,
+                    created_at: 0,
+                    expires_at: 0,
+                    status: "confirmed".to_string(),
+                    is_preconfirmed: false,
+                });
+            }
+        }
+
+        Ok(Response::new(ListVtxosResponse {
+            vtxos,
+            total_balance,
+        }))
+    }
+
+    async fn send_vtxo(
+        &self,
+        request: Request<SendVtxoRequest>,
+    ) -> Result<Response<SendVtxoResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!(
+            "[{user_id_hex}] SendVtxo to={} amount={}",
+            req.recipient_ark_address, req.amount
+        );
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SEND_VTXO)?;
+
+        let asp_arc = self.require_asp()?.clone();
+        let has_signatures = !req.signed_messages.is_empty();
+
+        // Check for existing send session.
+        let mut sessions = self.send_sessions.lock().await;
+        let existing = sessions.remove(&user_id_hex);
+        drop(sessions);
+
+        match (existing, has_signatures) {
+            // Phase 1: No session -> build transactions, return sighashes
+            (None, false) => {
+                let (owner_pk_hex, _dkg_secret_hex) = self.get_user_ark_keys(&user_id_hex)?;
+
+                let mut asp = asp_arc.lock().await;
+                let info = match &asp.info {
+                    Some(i) => i.clone(),
+                    None => asp.get_info().await
+                        .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+                };
+                drop(asp);
+
+                // Gather user's confirmed VTXOs for coin selection.
+                let store = self.vtxo_store.lock().await;
+                let user_vtxos = store.get(&user_id_hex).cloned().unwrap_or_default();
+                drop(store);
+
+                if user_vtxos.is_empty() {
+                    return Err(Status::failed_precondition("no VTXOs available for sending"));
+                }
+
+                // Simple coin selection: use all VTXOs.
+                let total_available: u64 = user_vtxos.iter().map(|(_, _, a, _)| a).sum();
+                if total_available < req.amount {
+                    return Err(Status::failed_precondition(format!(
+                        "insufficient balance: have {} sats, need {} sats",
+                        total_available, req.amount
+                    )));
+                }
+
+                let vtxo_inputs: Vec<ark::client::send::SendVtxoInput> = user_vtxos
+                    .iter()
+                    .map(|(txid, vout, amount, _)| ark::client::send::SendVtxoInput {
+                        txid: txid.clone(),
+                        vout: *vout,
+                        amount_sats: *amount,
+                    })
+                    .collect();
+
+                // Use the exit_delay from the first VTXO (all VTXOs in a send
+                // should have the same type: boarding or refreshed).
+                let exit_delay = user_vtxos.first().map(|(_, _, _, d)| *d)
+                    .unwrap_or(info.unilateral_exit_delay as u32);
+
+                // Build change address (send change back to self).
+                let network = ark::client::parse_network(&info.network)
+                    .map_err(|e| Status::internal(e))?;
+                let change_addr = if total_available > req.amount {
+                    let addr = ark::client::ark_address(
+                        &owner_pk_hex, &info.signer_pubkey, exit_delay, network,
+                    ).map_err(|e| Status::internal(format!("ark_address: {e}")))?;
+                    Some(addr)
+                } else {
+                    None
+                };
+
+                let (session, sighashes) = ark::client::send::SendSession::build(
+                    &owner_pk_hex,
+                    &vtxo_inputs,
+                    &req.recipient_ark_address,
+                    req.amount,
+                    change_addr.as_deref(),
+                    exit_delay,
+                    &info,
+                ).map_err(|e| Status::internal(format!("SendSession::build: {e}")))?;
+
+                let mut sessions = self.send_sessions.lock().await;
+                sessions.insert(user_id_hex, session);
+
+                Ok(Response::new(SendVtxoResponse {
+                    status: send_vtxo_response::Status::SigningRequired as i32,
+                    messages_to_sign: sighashes.iter().map(|s| s.to_vec()).collect(),
+                    script_path_spend: true,
+                    ark_txid: String::new(),
+                    error_message: String::new(),
+                }))
+            }
+
+            // Phase 2: Has session + signatures -> sign + submit to ASP
+            (Some(mut session), true) => {
+                let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    let mut arr = [0u8; 64];
+                    arr.copy_from_slice(s);
+                    arr
+                }).collect();
+
+                session.sign_with_frost(signatures)
+                    .map_err(|e| Status::internal(format!("sign_with_frost: {e}")))?;
+
+                let mut asp = asp_arc.lock().await;
+                let ark_txid = session.submit(&mut asp).await
+                    .map_err(|e| Status::internal(format!("submit: {e}")))?;
+
+                // Update VTXO store: mark old VTXOs spent.
+                // The sender's VTXOs are consumed; change VTXO (if any) will be
+                // confirmed when the recipient settles via delegate pattern.
+                let mut store = self.vtxo_store.lock().await;
+                store.remove(&user_id_hex);
+                tracing::info!(
+                    "[{user_id_hex}] SendVtxo: sent, ark_txid={ark_txid}"
+                );
+
+                Ok(Response::new(SendVtxoResponse {
+                    status: send_vtxo_response::Status::Settled as i32,
+                    messages_to_sign: vec![],
+                    script_path_spend: false,
+                    ark_txid,
+                    error_message: String::new(),
+                }))
+            }
+
+            // Session exists but no signatures -> error
+            (Some(session), false) => {
+                let mut sessions = self.send_sessions.lock().await;
+                sessions.insert(user_id_hex, session);
+                Err(Status::failed_precondition("send session exists; provide signatures"))
+            }
+
+            // No session but has signatures -> error
+            (None, true) => {
+                Err(Status::failed_precondition("no active send session"))
+            }
+        }
+    }
+
+    async fn redeem_vtxo(
+        &self,
+        request: Request<RedeemVtxoRequest>,
+    ) -> Result<Response<RedeemVtxoResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] RedeemVtxo to={} amount={}", req.on_chain_address, req.amount);
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_REDEEM_VTXO)?;
+
+        self.require_asp()?;
+        Err(Status::unimplemented("RedeemVtxo not yet implemented"))
+    }
+
+    async fn settle(
+        &self,
+        request: Request<SettleRequest>,
+    ) -> Result<Response<SettleResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] Settle");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SETTLE)?;
+
+        let asp_arc = self.require_asp()?.clone();
+        let has_signatures = !req.signed_messages.is_empty();
+
+        // Check for existing session
+        let mut sessions = self.settle_sessions.lock().await;
+        let existing = sessions.remove(&user_id_hex);
+        drop(sessions);
+
+        match (existing, has_signatures) {
+            // Phase 1: No session, no signatures -> create session, return intent sighashes
+            (None, false) => {
+                let (owner_pk_hex, dkg_secret_hex) = self.get_user_ark_keys(&user_id_hex)?;
+
+                let mut asp = asp_arc.lock().await;
+                let info = match &asp.info {
+                    Some(i) => i.clone(),
+                    None => asp.get_info().await
+                        .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+                };
+                drop(asp);
+
+                let network = ark::client::parse_network(&info.network)
+                    .map_err(|e| Status::internal(e))?;
+                let exit_delay = info.boarding_exit_delay as u32;
+                let boarding_addr = ark::client::boarding_address(
+                    &owner_pk_hex, &info.signer_pubkey, exit_delay, network,
+                ).map_err(|e| Status::internal(format!("boarding_address: {e}")))?;
+
+                // Scan for UTXOs at boarding address
+                let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = boarding_addr.parse()
+                    .map_err(|e| Status::internal(format!("parse addr: {e}")))?;
+                let addr = addr.require_network(network)
+                    .map_err(|e| Status::internal(format!("network mismatch: {e}")))?;
+                let script_hex = hex::encode(addr.script_pubkey().as_bytes());
+                let script_hash = crate::bitcoin::tx_parser::derive_script_hash(&script_hex)
+                    .map_err(|e| Status::internal(format!("script_hash: {e}")))?;
+
+                let history = self.bitcoin_history.lock().await;
+                let utxos = history.list_unspent_by_script_hash(&script_hash).await
+                    .map_err(|e| Status::internal(format!("list_unspent: {e}")))?;
+                drop(history);
+
+                if utxos.is_empty() {
+                    return Err(Status::failed_precondition("no UTXOs at boarding address"));
+                }
+
+                let utxo = &utxos[0];
+                tracing::info!(
+                    "[{user_id_hex}] Settle: boarding UTXO {}:{} amount={}",
+                    utxo.tx_hash, utxo.vout, utxo.amount_sats
+                );
+
+                let boarding_amount = utxo.amount_sats as u64;
+                let (session, sighashes) = ark::client::batch::SettleSession::new_boarding(
+                    &owner_pk_hex, &info.signer_pubkey, &info.forfeit_pubkey,
+                    &boarding_addr,
+                    &utxo.tx_hash, utxo.vout, boarding_amount,
+                    exit_delay, &info.network, &dkg_secret_hex,
+                ).map_err(|e| Status::internal(format!("SettleSession: {e}")))?;
+
+                // Store session with boarding amount
+                let mut sessions = self.settle_sessions.lock().await;
+                sessions.insert(user_id_hex, (session, boarding_amount, exit_delay));
+
+                Ok(Response::new(SettleResponse {
+                    status: settle_response::Status::SigningRequired as i32,
+                    messages_to_sign: sighashes.iter().map(|s| s.to_vec()).collect(),
+                    script_path_spend: true,
+                    commitment_txid: String::new(),
+                    error_message: String::new(),
+                }))
+            }
+
+            // Phase 2/3: Has session + signatures -> register intent or submit commitment sigs
+            (Some((mut session, boarding_amount, exit_delay)), true) => {
+                let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    let mut arr = [0u8; 64];
+                    arr.copy_from_slice(s);
+                    arr
+                }).collect();
+
+                let mut asp = asp_arc.lock().await;
+
+                // Determine phase from the session state by trying register first
+                match session.register_with_signatures(&mut asp, signatures.clone()).await {
+                    Ok(()) => {
+                        tracing::info!("[{user_id_hex}] Settle: intent registered, driving batch");
+                        // Drive until we need more signatures or settle
+                        loop {
+                            match session.drive(&mut asp).await {
+                                Ok(ark::client::batch::SettleAction::WaitingForBatch) => continue,
+                                Ok(ark::client::batch::SettleAction::NeedSignatures { sighashes }) => {
+                                    drop(asp);
+                                    let mut sessions = self.settle_sessions.lock().await;
+                                    sessions.insert(user_id_hex, (session, boarding_amount, exit_delay));
+                                    return Ok(Response::new(SettleResponse {
+                                        status: settle_response::Status::SigningRequired as i32,
+                                        messages_to_sign: sighashes.iter().map(|s| s.to_vec()).collect(),
+                                        script_path_spend: true,
+                                        commitment_txid: String::new(),
+                                        error_message: String::new(),
+                                    }));
+                                }
+                                Ok(ark::client::batch::SettleAction::Settled { commitment_txid, vtxo_outpoint }) => {
+                                    // Record VTXO using tree leaf outpoint (not commitment txid).
+                                    let (vtxo_txid, vtxo_vout) = vtxo_outpoint
+                                        .unwrap_or_else(|| (commitment_txid.clone(), 0));
+                                    let mut store = self.vtxo_store.lock().await;
+                                    store.entry(user_id_hex.clone())
+                                        .or_default()
+                                        .push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
+                                    tracing::info!("[{user_id_hex}] Settle: VTXO recorded vtxo_txid={vtxo_txid}:{vtxo_vout} amount={boarding_amount}");
+                                    return Ok(Response::new(SettleResponse {
+                                        status: settle_response::Status::Settled as i32,
+                                        messages_to_sign: vec![],
+                                        script_path_spend: false,
+                                        commitment_txid,
+                                        error_message: String::new(),
+                                    }));
+                                }
+                                Err(e) => {
+                                    return Err(Status::internal(format!("drive error: {e}")));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) if e.contains("wrong phase") => {
+                        // Must be AwaitingCommitmentSignatures
+                        session.submit_commitment_signatures(&mut asp, signatures).await
+                            .map_err(|e| Status::internal(format!("submit_commitment_sigs: {e}")))?;
+
+                        tracing::info!("[{user_id_hex}] Settle: commitment sigs submitted, driving to finalize");
+                        loop {
+                            match session.drive(&mut asp).await {
+                                Ok(ark::client::batch::SettleAction::WaitingForBatch) => continue,
+                                Ok(ark::client::batch::SettleAction::Settled { commitment_txid, vtxo_outpoint }) => {
+                                    // Record VTXO using tree leaf outpoint (not commitment txid).
+                                    let (vtxo_txid, vtxo_vout) = vtxo_outpoint
+                                        .unwrap_or_else(|| (commitment_txid.clone(), 0));
+                                    let mut store = self.vtxo_store.lock().await;
+                                    store.entry(user_id_hex.clone())
+                                        .or_default()
+                                        .push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
+                                    tracing::info!("[{user_id_hex}] Settle: VTXO recorded vtxo_txid={vtxo_txid}:{vtxo_vout} amount={boarding_amount}");
+                                    return Ok(Response::new(SettleResponse {
+                                        status: settle_response::Status::Settled as i32,
+                                        messages_to_sign: vec![],
+                                        script_path_spend: false,
+                                        commitment_txid,
+                                        error_message: String::new(),
+                                    }));
+                                }
+                                Ok(ark::client::batch::SettleAction::NeedSignatures { sighashes }) => {
+                                    drop(asp);
+                                    let mut sessions = self.settle_sessions.lock().await;
+                                    sessions.insert(user_id_hex, (session, boarding_amount, exit_delay));
+                                    return Ok(Response::new(SettleResponse {
+                                        status: settle_response::Status::SigningRequired as i32,
+                                        messages_to_sign: sighashes.iter().map(|s| s.to_vec()).collect(),
+                                        script_path_spend: true,
+                                        commitment_txid: String::new(),
+                                        error_message: String::new(),
+                                    }));
+                                }
+                                Err(e) => {
+                                    return Err(Status::internal(format!("drive error: {e}")));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!("register error: {e}")));
+                    }
+                }
+            }
+
+            // Session exists but no signatures -> poll
+            (Some((session, boarding_amount, exit_delay)), false) => {
+                // Put it back, nothing to do without signatures
+                let mut sessions = self.settle_sessions.lock().await;
+                sessions.insert(user_id_hex, (session, boarding_amount, exit_delay));
+                Ok(Response::new(SettleResponse {
+                    status: settle_response::Status::WaitingForBatch as i32,
+                    messages_to_sign: vec![],
+                    script_path_spend: false,
+                    commitment_txid: String::new(),
+                    error_message: String::new(),
+                }))
+            }
+
+            // No session but has signatures -> error
+            (None, true) => {
+                Err(Status::failed_precondition("no active settle session"))
+            }
+        }
+    }
+
+    async fn settle_delegate(
+        &self,
+        request: Request<SettleDelegateRequest>,
+    ) -> Result<Response<SettleDelegateResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] SettleDelegate");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SETTLE_DELEGATE)?;
+
+        let asp_arc = self.require_asp()?.clone();
+        let has_signatures = !req.signed_messages.is_empty();
+
+        // Check for existing delegate session.
+        let mut sessions = self.delegate_sessions.lock().await;
+        let existing = sessions.remove(&user_id_hex);
+        drop(sessions);
+
+        match (existing, has_signatures) {
+            // Phase 1: No session -> generate delegate, return sighashes
+            (None, false) => {
+                let (owner_pk_hex, dkg_secret_hex) = self.get_user_ark_keys(&user_id_hex)?;
+
+                let mut asp = asp_arc.lock().await;
+                let info = match &asp.info {
+                    Some(i) => i.clone(),
+                    None => asp.get_info().await
+                        .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+                };
+                drop(asp);
+
+                // Gather user's confirmed VTXOs.
+                let store = self.vtxo_store.lock().await;
+                let user_vtxos = store.get(&user_id_hex)
+                    .cloned()
+                    .unwrap_or_default();
+                drop(store);
+
+                if user_vtxos.is_empty() {
+                    return Err(Status::failed_precondition("no VTXOs to settle"));
+                }
+
+                let vtxo_inputs: Vec<ark::client::batch::DelegateVtxoInput> = user_vtxos
+                    .iter()
+                    .map(|(txid, vout, amount, _)| ark::client::batch::DelegateVtxoInput {
+                        txid: txid.clone(),
+                        vout: *vout,
+                        amount_sats: *amount,
+                        is_swept: false,
+                    })
+                    .collect();
+
+                let total_amount: u64 = user_vtxos.iter().map(|(_, _, a, _)| a).sum();
+
+                // Output: settle all to self (same ark address = refresh).
+                let network = ark::client::parse_network(&info.network)
+                    .map_err(|e| Status::internal(e))?;
+                let exit_delay = info.unilateral_exit_delay as u32;
+                let ark_addr = ark::client::ark_address(
+                    &owner_pk_hex, &info.signer_pubkey, exit_delay, network,
+                ).map_err(|e| Status::internal(format!("ark_address: {e}")))?;
+
+                let outputs = vec![ark::client::batch::DelegateOutput {
+                    ark_address: ark_addr,
+                    amount_sats: total_amount,
+                }];
+
+                // Derive forfeit address from ASP forfeit pubkey.
+                let forfeit_pk = ark::client::address::parse_xonly_pubkey(&info.forfeit_pubkey)
+                    .map_err(|e| Status::internal(format!("forfeit_pubkey: {e}")))?;
+                let secp = bitcoin::key::Secp256k1::new();
+                let (forfeit_xonly, _) = forfeit_pk.inner.x_only_public_key();
+                let forfeit_addr = bitcoin::Address::p2tr(&secp, forfeit_xonly, None, network);
+
+                let (session, sighashes) = ark::client::batch::DelegateSettleSession::generate_delegate(
+                    &owner_pk_hex,
+                    &info.signer_pubkey,
+                    &info.forfeit_pubkey,
+                    &dkg_secret_hex,
+                    &vtxo_inputs,
+                    &outputs,
+                    &forfeit_addr.to_string(),
+                    info.dust as u64,
+                    exit_delay,
+                    &info.network,
+                ).map_err(|e| Status::internal(format!("generate_delegate: {e}")))?;
+
+                let mut sessions = self.delegate_sessions.lock().await;
+                sessions.insert(user_id_hex, session);
+
+                Ok(Response::new(SettleDelegateResponse {
+                    status: settle_delegate_response::Status::SigningRequired as i32,
+                    messages_to_sign: sighashes.iter().map(|s| s.to_vec()).collect(),
+                    script_path_spend: true,
+                    commitment_txid: String::new(),
+                    error_message: String::new(),
+                }))
+            }
+
+            // Phase 2: Has session + signatures -> sign + settle autonomously
+            (Some(mut session), true) => {
+                let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    let mut arr = [0u8; 64];
+                    arr.copy_from_slice(s);
+                    arr
+                }).collect();
+
+                session.sign_with_frost(signatures)
+                    .map_err(|e| Status::internal(format!("sign_with_frost: {e}")))?;
+
+                let mut asp = asp_arc.lock().await;
+                let (commitment_txid, vtxo_outpoint) = session.settle(&mut asp).await
+                    .map_err(|e| Status::internal(format!("settle: {e}")))?;
+
+                // Get info for exit_delay.
+                let delegate_info = match &asp.info {
+                    Some(i) => i.clone(),
+                    None => asp.get_info().await
+                        .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+                };
+
+                // Update VTXO store: mark old VTXOs spent, add new one.
+                let (vtxo_txid, vtxo_vout) = vtxo_outpoint
+                    .unwrap_or_else(|| (commitment_txid.clone(), 0));
+                let mut store = self.vtxo_store.lock().await;
+                let old_vtxos = store.remove(&user_id_hex).unwrap_or_default();
+                let total_amount: u64 = old_vtxos.iter().map(|(_, _, a, _)| a).sum();
+                // Delegate-settled VTXOs use unilateral_exit_delay (refreshed).
+                let new_exit_delay = delegate_info.unilateral_exit_delay as u32;
+                store.entry(user_id_hex.clone())
+                    .or_default()
+                    .push((vtxo_txid.clone(), vtxo_vout, total_amount, new_exit_delay));
+                tracing::info!(
+                    "[{user_id_hex}] SettleDelegate: settled, new VTXO txid={vtxo_txid}:{vtxo_vout} amount={total_amount}"
+                );
+
+                Ok(Response::new(SettleDelegateResponse {
+                    status: settle_delegate_response::Status::Settled as i32,
+                    messages_to_sign: vec![],
+                    script_path_spend: false,
+                    commitment_txid,
+                    error_message: String::new(),
+                }))
+            }
+
+            // Session exists but no signatures -> error
+            (Some(session), false) => {
+                let mut sessions = self.delegate_sessions.lock().await;
+                sessions.insert(user_id_hex, session);
+                Err(Status::failed_precondition("delegate session exists; provide signatures"))
+            }
+
+            // No session but has signatures -> error
+            (None, true) => {
+                Err(Status::failed_precondition("no active delegate session"))
+            }
+        }
     }
 }

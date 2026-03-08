@@ -18,6 +18,14 @@ pub const OP_FETCH_RECENT_TXS: &str = "FETCH_RECENT_TXS";
 pub const OP_SUBSCRIBE_HISTORY: &str = "SUBSCRIBE_HISTORY";
 pub const OP_UPDATE_POLICY: &str = "UPDATE_POLICY";
 pub const OP_DELETE_POLICY: &str = "DELETE_POLICY";
+pub const OP_GET_ARK_INFO: &str = "GET_ARK_INFO";
+pub const OP_GET_ARK_ADDRESS: &str = "GET_ARK_ADDRESS";
+pub const OP_GET_BOARDING_ADDRESS: &str = "GET_BOARDING_ADDRESS";
+pub const OP_LIST_VTXOS: &str = "LIST_VTXOS";
+pub const OP_SEND_VTXO: &str = "SEND_VTXO";
+pub const OP_REDEEM_VTXO: &str = "REDEEM_VTXO";
+pub const OP_SETTLE: &str = "SETTLE";
+pub const OP_SETTLE_DELEGATE: &str = "SETTLE_DELEGATE";
 
 const RECOVERY_PREFIX: &str = "MPC_WALLET_RECOVERY_V1";
 

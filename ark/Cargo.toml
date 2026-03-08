@@ -1,0 +1,29 @@
+[package]
+name = "ark"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ark"
+
+[dependencies]
+threshold = { path = "../threshold" }
+
+# Optional deps for the `client` feature (ASP communication + ark-core types)
+ark-core = { version = "0.8", optional = true }
+bitcoin = { version = "0.32", features = ["serde"], optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+rand = { version = "0.8", optional = true }
+tokio-stream = { version = "0.1", optional = true }
+
+[features]
+default = []
+std = ["threshold/std"]
+client = ["std", "ark-core", "bitcoin", "tokio", "tonic", "prost", "serde", "serde_json", "tonic-build", "rand", "tokio-stream"]
+
+[build-dependencies]
+tonic-build = { version = "0.12", optional = true }

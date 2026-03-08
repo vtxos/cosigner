@@ -85,6 +85,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create auth verifier
     let auth_verifier = Arc::new(auth::AuthVerifier::new());
 
+    // Connect to ASP (Ark Service Provider) if configured
+    let asp_client = if !cfg.asp_url.is_empty() {
+        tracing::info!("Connecting to ASP at {}", cfg.asp_url);
+        match ark::client::AspClient::connect(&cfg.asp_url).await {
+            Ok(client) => {
+                tracing::info!("Connected to ASP");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to ASP: {e} (Ark RPCs will be unavailable)");
+                None
+            }
+        }
+    } else {
+        tracing::info!("ASP_URL not set, Ark RPCs disabled");
+        None
+    };
+
     // Create wallet service
     let service = wallet_service::WalletService::new(
         manager,
@@ -92,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         persistence,
         bitcoin_rpc,
         bitcoin_history,
+        asp_client,
     );
 
     let addr = format!("0.0.0.0:{}", args.port).parse()?;

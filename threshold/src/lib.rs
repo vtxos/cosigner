@@ -20,5 +20,6 @@ pub mod random;
 pub mod scalar;
 pub mod signature;
 pub mod signing;
+pub mod taptree;
 pub mod tweak;
 pub mod vss;
