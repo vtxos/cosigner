@@ -40,7 +40,7 @@ pub struct WalletService {
     /// Active delegate settle sessions: user_id -> session.
     pub delegate_sessions: tokio::sync::Mutex<HashMap<String, ark::client::batch::DelegateSettleSession>>,
     /// Active send sessions: user_id -> session.
-    pub send_sessions: tokio::sync::Mutex<HashMap<String, ark::client::send::SendSession>>,
+    pub send_sessions: tokio::sync::Mutex<HashMap<String, (ark::client::send::SendSession, u32)>>,
     /// Simple in-memory VTXO store: user_id -> list of (txid, vout, amount_sats, exit_delay).
     pub vtxo_store: tokio::sync::Mutex<HashMap<String, Vec<(String, u32, u64, u32)>>>,
 }
@@ -2693,6 +2693,10 @@ impl MpcWallet for WalletService {
                 let user_vtxos = store.get(&user_id_hex).cloned().unwrap_or_default();
                 drop(store);
 
+                tracing::info!(
+                    "[{user_id_hex}] SendVtxo: spending VTXOs: {:?}",
+                    user_vtxos
+                );
                 if user_vtxos.is_empty() {
                     return Err(Status::failed_precondition("no VTXOs available for sending"));
                 }
@@ -2721,11 +2725,13 @@ impl MpcWallet for WalletService {
                     .unwrap_or(info.unilateral_exit_delay as u32);
 
                 // Build change address (send change back to self).
+                // Always use unilateral_exit_delay for change, like the reference client.
                 let network = ark::client::parse_network(&info.network)
                     .map_err(|e| Status::internal(e))?;
+                let change_exit_delay = info.unilateral_exit_delay as u32;
                 let change_addr = if total_available > req.amount {
                     let addr = ark::client::ark_address(
-                        &owner_pk_hex, &info.signer_pubkey, exit_delay, network,
+                        &owner_pk_hex, &info.signer_pubkey, change_exit_delay, network,
                     ).map_err(|e| Status::internal(format!("ark_address: {e}")))?;
                     Some(addr)
                 } else {
@@ -2743,7 +2749,7 @@ impl MpcWallet for WalletService {
                 ).map_err(|e| Status::internal(format!("SendSession::build: {e}")))?;
 
                 let mut sessions = self.send_sessions.lock().await;
-                sessions.insert(user_id_hex, session);
+                sessions.insert(user_id_hex, (session, change_exit_delay));
 
                 Ok(Response::new(SendVtxoResponse {
                     status: send_vtxo_response::Status::SigningRequired as i32,
@@ -2755,7 +2761,7 @@ impl MpcWallet for WalletService {
             }
 
             // Phase 2: Has session + signatures -> sign + submit to ASP
-            (Some(mut session), true) => {
+            (Some((mut session, change_exit_delay)), true) => {
                 let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
                     let mut arr = [0u8; 64];
                     arr.copy_from_slice(s);
@@ -2769,11 +2775,18 @@ impl MpcWallet for WalletService {
                 let ark_txid = session.submit(&mut asp).await
                     .map_err(|e| Status::internal(format!("submit: {e}")))?;
 
-                // Update VTXO store: mark old VTXOs spent.
-                // The sender's VTXOs are consumed; change VTXO (if any) will be
-                // confirmed when the recipient settles via delegate pattern.
+                // Update VTXO store: replace spent VTXOs with change (if any).
+                let change = session.change_vtxo();
                 let mut store = self.vtxo_store.lock().await;
                 store.remove(&user_id_hex);
+                if let Some((change_txid, change_vout, change_amount)) = change {
+                    tracing::info!(
+                        "[{user_id_hex}] SendVtxo: change VTXO txid={}, vout={}, amount={}, exit_delay={}",
+                        change_txid, change_vout, change_amount, change_exit_delay
+                    );
+                    store.entry(user_id_hex.clone()).or_default()
+                        .push((change_txid, change_vout, change_amount, change_exit_delay));
+                }
                 tracing::info!(
                     "[{user_id_hex}] SendVtxo: sent, ark_txid={ark_txid}"
                 );
@@ -2788,9 +2801,9 @@ impl MpcWallet for WalletService {
             }
 
             // Session exists but no signatures -> error
-            (Some(session), false) => {
+            (Some((session, ed)), false) => {
                 let mut sessions = self.send_sessions.lock().await;
-                sessions.insert(user_id_hex, session);
+                sessions.insert(user_id_hex, (session, ed));
                 Err(Status::failed_precondition("send session exists; provide signatures"))
             }
 

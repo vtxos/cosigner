@@ -317,6 +317,28 @@ impl SendSession {
         self.phase = SendPhase::Done;
         Ok(ark_txid)
     }
+
+    /// Returns the change VTXO outpoint `(txid, vout, amount_sats)` if the
+    /// ark tx has a change output.
+    /// Output order: [recipient(s)..., change, anchor]. The anchor output
+    /// (0-value) is always last, so change is second-to-last when present.
+    /// Call after `submit()`.
+    pub fn change_vtxo(&self) -> Option<(String, u32, u64)> {
+        let outputs = &self.ark_tx.unsigned_tx.output;
+        // At minimum: 1 recipient + 1 anchor = 2 outputs (no change).
+        // With change: 1 recipient + 1 change + 1 anchor = 3+ outputs.
+        if outputs.len() < 3 {
+            return None;
+        }
+        let txid = self.ark_tx.unsigned_tx.compute_txid().to_string();
+        // Change is second-to-last (before anchor)
+        let change_idx = outputs.len() - 2;
+        let amount = outputs[change_idx].value.to_sat();
+        if amount == 0 {
+            return None;
+        }
+        Some((txid, change_idx as u32, amount))
+    }
 }
 
 // ---------------------------------------------------------------------------

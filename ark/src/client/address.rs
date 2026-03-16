@@ -1,40 +1,32 @@
 //! Ark address derivation.
 
-use ark_core::{ArkAddress, BoardingOutput};
-use bitcoin::key::{Secp256k1, TweakedPublicKey};
+use ark_core::{BoardingOutput, Vtxo};
+use bitcoin::key::Secp256k1;
 use bitcoin::{Network, XOnlyPublicKey};
 
 /// Derive the Ark off-chain address for a given owner pubkey and ASP.
 ///
-/// The Ark address encodes the ASP's server pubkey and the VTXO's tweaked output key
-/// so that the ASP can identify which taptree to build.
+/// Uses `Vtxo::new_default().to_ark_address()` — identical to the reference client.
 ///
 /// `owner_pk_hex` and `asp_pk_hex` are 64-char hex x-only public keys.
-/// `exit_delay` is the CSV exit delay in blocks.
+/// `exit_delay` is the raw exit delay value (will be BIP68-encoded internally).
 pub fn ark_address(
     owner_pk_hex: &str,
     asp_pk_hex: &str,
     exit_delay: u32,
     network: Network,
 ) -> Result<String, String> {
+    let secp = Secp256k1::new();
+    let owner_pk = hex_to_xonly(owner_pk_hex)?;
     let asp_pk = hex_to_xonly(asp_pk_hex)?;
 
-    // Derive the VTXO tweaked output key using existing script primitives
-    let asp_bytes = hex_to_32(asp_pk_hex)?;
-    let owner_bytes = hex_to_32(owner_pk_hex)?;
-    let tree = crate::default_vtxo_tree(&asp_bytes, &owner_bytes, exit_delay);
-    let output_key = crate::vtxo_output_key(&tree)
-        .map_err(|e| format!("vtxo_output_key: {:?}", e))?;
+    let exit_seq = ark_core::server::parse_sequence_number(exit_delay as i64)
+        .map_err(|e| format!("parse_sequence_number: {e}"))?;
 
-    // output_key is 33-byte compressed; extract x-only (bytes 1..33)
-    let x_only = XOnlyPublicKey::from_slice(&output_key[1..33])
-        .map_err(|e| format!("invalid output key: {e}"))?;
+    let vtxo = Vtxo::new_default(&secp, asp_pk, owner_pk, exit_seq, network)
+        .map_err(|e| format!("Vtxo::new_default: {e}"))?;
 
-    // Treat as already-tweaked (it is the result of taproot tweaking)
-    let vtxo_tap_key = TweakedPublicKey::dangerous_assume_tweaked(x_only);
-
-    let addr = ArkAddress::new(network, asp_pk, vtxo_tap_key);
-    Ok(addr.encode())
+    Ok(vtxo.to_ark_address().encode())
 }
 
 /// Derive the boarding address for on-chain funding.
