@@ -35,6 +35,19 @@ impl BitcoinHistoryService {
         }
     }
 
+    /// List unspent outputs for a given electrum script hash.
+    pub async fn list_unspent_by_script_hash(&self, script_hash: &str) -> Result<Vec<UtxoInfo>, String> {
+        let utxos = self.electrum.list_unspent(script_hash).await?;
+        Ok(utxos
+            .into_iter()
+            .map(|u| UtxoInfo {
+                tx_hash: u.tx_hash,
+                vout: u.tx_pos,
+                amount_sats: u.value,
+            })
+            .collect())
+    }
+
     /// Fetch UTXOs for a user across all policies.
     /// Returns list of (tx_hash, vout, amount_sats) tuples.
     pub async fn get_utxos(

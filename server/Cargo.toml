@@ -27,6 +27,9 @@ sled = "0.34"
 
 # Bitcoin
 bitcoin = { version = "0.32", features = ["serde"] }
+
+# Ark protocol
+ark = { path = "../ark", features = ["client"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 # Streaming

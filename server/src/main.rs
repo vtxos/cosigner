@@ -91,21 +91,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create auth verifier
     let auth_verifier = Arc::new(auth::AuthVerifier::new());
 
+    // Connect to ASP (Ark Service Provider) if configured
+    let asp_client = if !cfg.asp_url.is_empty() {
+        tracing::info!("Connecting to ASP at {}", cfg.asp_url);
+        match ark::client::AspClient::connect(&cfg.asp_url).await {
+            Ok(client) => {
+                tracing::info!("Connected to ASP");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to connect to ASP: {e} (Ark RPCs will be unavailable)");
+                None
+            }
+        }
+    } else {
+        tracing::info!("ASP_URL not set, Ark RPCs disabled");
+        None
+    };
+
     // Create wallet service
-    let service = wallet_service::WalletService::new(
+    let service = std::sync::Arc::new(wallet_service::WalletService::new(
         manager,
         auth_verifier,
         persistence,
         bitcoin_rpc,
         bitcoin_history,
-    );
+        asp_client,
+    ));
+
+    // Load persisted Ark state and validate ASP key
+    service.load_ark_state().await;
+
+    // Spawn background VTXO stream sync if ASP is configured
+    if service.asp_client.is_some() {
+        let svc = service.clone();
+        tokio::spawn(async move {
+            svc.run_vtxo_stream().await;
+        });
+    }
 
     let addr = format!("0.0.0.0:{}", args.port).parse()?;
     tracing::info!("MPC Wallet Server listening on {}", addr);
 
     Server::builder()
         .add_service(
-            wallet_proto::mpc_wallet_server::MpcWalletServer::new(service),
+            wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(service),
         )
         .serve(addr)
         .await?;

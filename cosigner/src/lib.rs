@@ -1,6 +1,7 @@
 #[allow(warnings)]
 mod bindings;
 
+mod ark_ops;
 mod convert;
 mod dkg_ops;
 mod signing_ops;
@@ -208,6 +209,35 @@ impl GuestThresholdSession for ThresholdSessionState {
         sig_hex: String,
     ) -> Result<bool, ThresholdError> {
         auth_ops::verify_schnorr_signature(pk_hex, message, sig_hex)
+    }
+
+    // ----- Ark Protocol -----
+
+    fn ark_default_vtxo_script_pubkey(
+        &self,
+        server_pk_hex: String,
+        owner_pk_hex: String,
+        exit_delay: u32,
+    ) -> Result<String, ThresholdError> {
+        ark_ops::ark_default_vtxo_script_pubkey(server_pk_hex, owner_pk_hex, exit_delay)
+    }
+
+    fn ark_forfeit_spend_info(
+        &self,
+        server_pk_hex: String,
+        owner_pk_hex: String,
+        exit_delay: u32,
+    ) -> Result<String, ThresholdError> {
+        ark_ops::ark_forfeit_spend_info(server_pk_hex, owner_pk_hex, exit_delay)
+    }
+
+    fn ark_exit_spend_info(
+        &self,
+        server_pk_hex: String,
+        owner_pk_hex: String,
+        exit_delay: u32,
+    ) -> Result<String, ThresholdError> {
+        ark_ops::ark_exit_spend_info(server_pk_hex, owner_pk_hex, exit_delay)
     }
 
     // ----- Utils -----
