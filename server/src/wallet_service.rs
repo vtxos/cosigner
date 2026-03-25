@@ -302,16 +302,15 @@ impl WalletService {
                         let has_delegate = self.delegate_sessions.lock().await.contains_key(user_id);
                         let has_send = self.send_sessions.lock().await.contains_key(user_id);
                         if !has_settle && !has_delegate && !has_send {
-                            self.ark_tx_history.lock().await
-                                .entry(user_id.clone()).or_default()
+                            let mut history = self.ark_tx_history.lock().await;
+                            history.entry(user_id.clone()).or_default()
                                 .push(ArkTxEntry {
                                     tx_type: "receive".into(),
                                     amount_sats: new_vtxo.amount as i64,
                                     txid: outpoint.txid.clone(),
                                     timestamp: now_secs(),
                                 });
-                            // Persist history
-                            if let Some(entries) = self.ark_tx_history.lock().await.get(user_id) {
+                            if let Some(entries) = history.get(user_id) {
                                 self.save_user_ark_history(user_id, entries);
                             }
                         }
@@ -3205,10 +3204,15 @@ impl MpcWallet for WalletService {
             // Phase 2: Has session + signatures -> sign + submit to ASP
             (Some((mut session, change_exit_delay)), true) => {
                 let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    if s.len() != 64 {
+                        return Err(Status::invalid_argument(
+                            format!("signature must be 64 bytes, got {}", s.len())
+                        ));
+                    }
                     let mut arr = [0u8; 64];
                     arr.copy_from_slice(s);
-                    arr
-                }).collect();
+                    Ok(arr)
+                }).collect::<Result<Vec<_>, _>>()?;
 
                 session.sign_with_frost(signatures)
                     .map_err(|e| Status::internal(format!("sign_with_frost: {e}")))?;
@@ -3236,16 +3240,18 @@ impl MpcWallet for WalletService {
                 if let Some(vtxos) = store.get(&user_id_hex) {
                     self.save_user_vtxos(&user_id_hex, vtxos);
                 }
-                self.ark_tx_history.lock().await
-                    .entry(user_id_hex.clone()).or_default()
-                    .push(ArkTxEntry {
-                        tx_type: "send".into(),
-                        amount_sats: -(req.amount as i64),
-                        txid: ark_txid.clone(),
-                        timestamp: now_secs(),
-                    });
-                if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
-                    self.save_user_ark_history(&user_id_hex, entries);
+                {
+                    let mut history = self.ark_tx_history.lock().await;
+                    history.entry(user_id_hex.clone()).or_default()
+                        .push(ArkTxEntry {
+                            tx_type: "send".into(),
+                            amount_sats: -(req.amount as i64),
+                            txid: ark_txid.clone(),
+                            timestamp: now_secs(),
+                        });
+                    if let Some(entries) = history.get(&user_id_hex) {
+                        self.save_user_ark_history(&user_id_hex, entries);
+                    }
                 }
 
                 Ok(Response::new(SendVtxoResponse {
@@ -3363,10 +3369,15 @@ impl MpcWallet for WalletService {
             // Phase 2/3: Has session + signatures -> register intent or submit commitment sigs
             (Some((mut session, boarding_amount, exit_delay)), true) => {
                 let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    if s.len() != 64 {
+                        return Err(Status::invalid_argument(
+                            format!("signature must be 64 bytes, got {}", s.len())
+                        ));
+                    }
                     let mut arr = [0u8; 64];
                     arr.copy_from_slice(s);
-                    arr
-                }).collect();
+                    Ok(arr)
+                }).collect::<Result<Vec<_>, _>>()?;
 
                 let mut asp = asp_arc.lock().await;
 
@@ -3402,16 +3413,18 @@ impl MpcWallet for WalletService {
                                     if let Some(vtxos) = store.get(&user_id_hex) {
                                         self.save_user_vtxos(&user_id_hex, vtxos);
                                     }
-                                    self.ark_tx_history.lock().await
-                                        .entry(user_id_hex.clone()).or_default()
-                                        .push(ArkTxEntry {
-                                            tx_type: "board".into(),
-                                            amount_sats: boarding_amount as i64,
-                                            txid: vtxo_txid,
-                                            timestamp: now_secs(),
-                                        });
-                                    if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
-                                        self.save_user_ark_history(&user_id_hex, entries);
+                                    {
+                                        let mut history = self.ark_tx_history.lock().await;
+                                        history.entry(user_id_hex.clone()).or_default()
+                                            .push(ArkTxEntry {
+                                                tx_type: "board".into(),
+                                                amount_sats: boarding_amount as i64,
+                                                txid: vtxo_txid,
+                                                timestamp: now_secs(),
+                                            });
+                                        if let Some(entries) = history.get(&user_id_hex) {
+                                            self.save_user_ark_history(&user_id_hex, entries);
+                                        }
                                     }
                                     return Ok(Response::new(SettleResponse {
                                         status: settle_response::Status::Settled as i32,
@@ -3448,16 +3461,18 @@ impl MpcWallet for WalletService {
                                     if let Some(vtxos) = store.get(&user_id_hex) {
                                         self.save_user_vtxos(&user_id_hex, vtxos);
                                     }
-                                    self.ark_tx_history.lock().await
-                                        .entry(user_id_hex.clone()).or_default()
-                                        .push(ArkTxEntry {
-                                            tx_type: "board".into(),
-                                            amount_sats: boarding_amount as i64,
-                                            txid: vtxo_txid,
-                                            timestamp: now_secs(),
-                                        });
-                                    if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
-                                        self.save_user_ark_history(&user_id_hex, entries);
+                                    {
+                                        let mut history = self.ark_tx_history.lock().await;
+                                        history.entry(user_id_hex.clone()).or_default()
+                                            .push(ArkTxEntry {
+                                                tx_type: "board".into(),
+                                                amount_sats: boarding_amount as i64,
+                                                txid: vtxo_txid,
+                                                timestamp: now_secs(),
+                                            });
+                                        if let Some(entries) = history.get(&user_id_hex) {
+                                            self.save_user_ark_history(&user_id_hex, entries);
+                                        }
                                     }
                                     return Ok(Response::new(SettleResponse {
                                         status: settle_response::Status::Settled as i32,
@@ -3613,10 +3628,15 @@ impl MpcWallet for WalletService {
             // Phase 2: Has session + signatures -> sign + settle autonomously
             (Some(mut session), true) => {
                 let signatures: Vec<[u8; 64]> = req.signed_messages.iter().map(|s| {
+                    if s.len() != 64 {
+                        return Err(Status::invalid_argument(
+                            format!("signature must be 64 bytes, got {}", s.len())
+                        ));
+                    }
                     let mut arr = [0u8; 64];
                     arr.copy_from_slice(s);
-                    arr
-                }).collect();
+                    Ok(arr)
+                }).collect::<Result<Vec<_>, _>>()?;
 
                 session.sign_with_frost(signatures)
                     .map_err(|e| Status::internal(format!("sign_with_frost: {e}")))?;
@@ -3649,16 +3669,18 @@ impl MpcWallet for WalletService {
                 if let Some(vtxos) = store.get(&user_id_hex) {
                     self.save_user_vtxos(&user_id_hex, vtxos);
                 }
-                self.ark_tx_history.lock().await
-                    .entry(user_id_hex.clone()).or_default()
-                    .push(ArkTxEntry {
-                        tx_type: "settle".into(),
-                        amount_sats: total_amount as i64,
-                        txid: vtxo_txid,
-                        timestamp: now_secs(),
-                    });
-                if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
-                    self.save_user_ark_history(&user_id_hex, entries);
+                {
+                    let mut history = self.ark_tx_history.lock().await;
+                    history.entry(user_id_hex.clone()).or_default()
+                        .push(ArkTxEntry {
+                            tx_type: "settle".into(),
+                            amount_sats: total_amount as i64,
+                            txid: vtxo_txid,
+                            timestamp: now_secs(),
+                        });
+                    if let Some(entries) = history.get(&user_id_hex) {
+                        self.save_user_ark_history(&user_id_hex, entries);
+                    }
                 }
 
                 Ok(Response::new(SettleDelegateResponse {
@@ -3823,16 +3845,18 @@ impl MpcWallet for WalletService {
             self.save_user_vtxos(&user_id_hex, vtxos);
         }
         let sent_amount = spent_total.saturating_sub(change_amount);
-        self.ark_tx_history.lock().await
-            .entry(user_id_hex.clone()).or_default()
-            .push(ArkTxEntry {
-                tx_type: "send".into(),
-                amount_sats: -(sent_amount as i64),
-                txid: ark_txid.clone(),
-                timestamp: now_secs(),
-            });
-        if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
-            self.save_user_ark_history(&user_id_hex, entries);
+        {
+            let mut history = self.ark_tx_history.lock().await;
+            history.entry(user_id_hex.clone()).or_default()
+                .push(ArkTxEntry {
+                    tx_type: "send".into(),
+                    amount_sats: -(sent_amount as i64),
+                    txid: ark_txid.clone(),
+                    timestamp: now_secs(),
+                });
+            if let Some(entries) = history.get(&user_id_hex) {
+                self.save_user_ark_history(&user_id_hex, entries);
+            }
         }
 
         Ok(Response::new(SubmitArkSendResponse {
