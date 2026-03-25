@@ -11,6 +11,9 @@ pub struct ServerConfig {
     pub electrum_url: String,
     pub electrum_port: u16,
     pub data_dir: String,
+    /// ASP (Ark Service Provider) gRPC URL, e.g. "http://localhost:7070".
+    /// When empty, Ark RPCs return UNAVAILABLE.
+    pub asp_url: String,
 }
 
 impl ServerConfig {
@@ -31,6 +34,7 @@ impl ServerConfig {
                 let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 format!("{}/.mpc_wallet/server", home)
             }),
+            asp_url: env::var("ASP_URL").unwrap_or_default(),
         }
     }
 }

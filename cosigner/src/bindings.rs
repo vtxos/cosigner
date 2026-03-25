@@ -5066,6 +5066,438 @@ pub mod exports {
                 }
                 #[doc(hidden)]
                 #[allow(non_snake_case)]
+                pub unsafe fn _export_method_threshold_session_ark_default_vtxo_script_pubkey_cabi<
+                    T: GuestThresholdSession,
+                >(
+                    arg0: *mut u8,
+                    arg1: *mut u8,
+                    arg2: usize,
+                    arg3: *mut u8,
+                    arg4: usize,
+                    arg5: i32,
+                ) -> *mut u8 {
+                    #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+                    let len0 = arg2;
+                    let bytes0 = _rt::Vec::from_raw_parts(arg1.cast(), len0, len0);
+                    let len1 = arg4;
+                    let bytes1 = _rt::Vec::from_raw_parts(arg3.cast(), len1, len1);
+                    let result2 = T::ark_default_vtxo_script_pubkey(
+                        unsafe { ThresholdSessionBorrow::lift(arg0 as u32 as usize) }
+                            .get(),
+                        _rt::string_lift(bytes0),
+                        _rt::string_lift(bytes1),
+                        arg5 as u32,
+                    );
+                    let ptr3 = (&raw mut _RET_AREA.0).cast::<u8>();
+                    match result2 {
+                        Ok(e) => {
+                            *ptr3.add(0).cast::<u8>() = (0i32) as u8;
+                            let vec4 = (e.into_bytes()).into_boxed_slice();
+                            let ptr4 = vec4.as_ptr().cast::<u8>();
+                            let len4 = vec4.len();
+                            ::core::mem::forget(vec4);
+                            *ptr3
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len4;
+                            *ptr3
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>() = ptr4.cast_mut();
+                        }
+                        Err(e) => {
+                            *ptr3.add(0).cast::<u8>() = (1i32) as u8;
+                            match e {
+                                ThresholdError::InvalidInput(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (0i32) as u8;
+                                    let vec5 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr5 = vec5.as_ptr().cast::<u8>();
+                                    let len5 = vec5.len();
+                                    ::core::mem::forget(vec5);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len5;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr5.cast_mut();
+                                }
+                                ThresholdError::CryptoError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (1i32) as u8;
+                                    let vec6 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr6 = vec6.as_ptr().cast::<u8>();
+                                    let len6 = vec6.len();
+                                    ::core::mem::forget(vec6);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len6;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr6.cast_mut();
+                                }
+                                ThresholdError::SerializationError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (2i32) as u8;
+                                    let vec7 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr7 = vec7.as_ptr().cast::<u8>();
+                                    let len7 = vec7.len();
+                                    ::core::mem::forget(vec7);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len7;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr7.cast_mut();
+                                }
+                            }
+                        }
+                    };
+                    ptr3
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn __post_return_method_threshold_session_ark_default_vtxo_script_pubkey<
+                    T: GuestThresholdSession,
+                >(arg0: *mut u8) {
+                    let l0 = i32::from(*arg0.add(0).cast::<u8>());
+                    match l0 {
+                        0 => {
+                            let l1 = *arg0
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>();
+                            let l2 = *arg0
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>();
+                            _rt::cabi_dealloc(l1, l2, 1);
+                        }
+                        _ => {
+                            let l3 = i32::from(
+                                *arg0.add(::core::mem::size_of::<*const u8>()).cast::<u8>(),
+                            );
+                            match l3 {
+                                0 => {
+                                    let l4 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l5 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l4, l5, 1);
+                                }
+                                1 => {
+                                    let l6 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l7 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l6, l7, 1);
+                                }
+                                _ => {
+                                    let l8 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l9 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l8, l9, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn _export_method_threshold_session_ark_forfeit_spend_info_cabi<
+                    T: GuestThresholdSession,
+                >(
+                    arg0: *mut u8,
+                    arg1: *mut u8,
+                    arg2: usize,
+                    arg3: *mut u8,
+                    arg4: usize,
+                    arg5: i32,
+                ) -> *mut u8 {
+                    #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+                    let len0 = arg2;
+                    let bytes0 = _rt::Vec::from_raw_parts(arg1.cast(), len0, len0);
+                    let len1 = arg4;
+                    let bytes1 = _rt::Vec::from_raw_parts(arg3.cast(), len1, len1);
+                    let result2 = T::ark_forfeit_spend_info(
+                        unsafe { ThresholdSessionBorrow::lift(arg0 as u32 as usize) }
+                            .get(),
+                        _rt::string_lift(bytes0),
+                        _rt::string_lift(bytes1),
+                        arg5 as u32,
+                    );
+                    let ptr3 = (&raw mut _RET_AREA.0).cast::<u8>();
+                    match result2 {
+                        Ok(e) => {
+                            *ptr3.add(0).cast::<u8>() = (0i32) as u8;
+                            let vec4 = (e.into_bytes()).into_boxed_slice();
+                            let ptr4 = vec4.as_ptr().cast::<u8>();
+                            let len4 = vec4.len();
+                            ::core::mem::forget(vec4);
+                            *ptr3
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len4;
+                            *ptr3
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>() = ptr4.cast_mut();
+                        }
+                        Err(e) => {
+                            *ptr3.add(0).cast::<u8>() = (1i32) as u8;
+                            match e {
+                                ThresholdError::InvalidInput(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (0i32) as u8;
+                                    let vec5 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr5 = vec5.as_ptr().cast::<u8>();
+                                    let len5 = vec5.len();
+                                    ::core::mem::forget(vec5);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len5;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr5.cast_mut();
+                                }
+                                ThresholdError::CryptoError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (1i32) as u8;
+                                    let vec6 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr6 = vec6.as_ptr().cast::<u8>();
+                                    let len6 = vec6.len();
+                                    ::core::mem::forget(vec6);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len6;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr6.cast_mut();
+                                }
+                                ThresholdError::SerializationError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (2i32) as u8;
+                                    let vec7 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr7 = vec7.as_ptr().cast::<u8>();
+                                    let len7 = vec7.len();
+                                    ::core::mem::forget(vec7);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len7;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr7.cast_mut();
+                                }
+                            }
+                        }
+                    };
+                    ptr3
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn __post_return_method_threshold_session_ark_forfeit_spend_info<
+                    T: GuestThresholdSession,
+                >(arg0: *mut u8) {
+                    let l0 = i32::from(*arg0.add(0).cast::<u8>());
+                    match l0 {
+                        0 => {
+                            let l1 = *arg0
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>();
+                            let l2 = *arg0
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>();
+                            _rt::cabi_dealloc(l1, l2, 1);
+                        }
+                        _ => {
+                            let l3 = i32::from(
+                                *arg0.add(::core::mem::size_of::<*const u8>()).cast::<u8>(),
+                            );
+                            match l3 {
+                                0 => {
+                                    let l4 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l5 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l4, l5, 1);
+                                }
+                                1 => {
+                                    let l6 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l7 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l6, l7, 1);
+                                }
+                                _ => {
+                                    let l8 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l9 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l8, l9, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn _export_method_threshold_session_ark_exit_spend_info_cabi<
+                    T: GuestThresholdSession,
+                >(
+                    arg0: *mut u8,
+                    arg1: *mut u8,
+                    arg2: usize,
+                    arg3: *mut u8,
+                    arg4: usize,
+                    arg5: i32,
+                ) -> *mut u8 {
+                    #[cfg(target_arch = "wasm32")] _rt::run_ctors_once();
+                    let len0 = arg2;
+                    let bytes0 = _rt::Vec::from_raw_parts(arg1.cast(), len0, len0);
+                    let len1 = arg4;
+                    let bytes1 = _rt::Vec::from_raw_parts(arg3.cast(), len1, len1);
+                    let result2 = T::ark_exit_spend_info(
+                        unsafe { ThresholdSessionBorrow::lift(arg0 as u32 as usize) }
+                            .get(),
+                        _rt::string_lift(bytes0),
+                        _rt::string_lift(bytes1),
+                        arg5 as u32,
+                    );
+                    let ptr3 = (&raw mut _RET_AREA.0).cast::<u8>();
+                    match result2 {
+                        Ok(e) => {
+                            *ptr3.add(0).cast::<u8>() = (0i32) as u8;
+                            let vec4 = (e.into_bytes()).into_boxed_slice();
+                            let ptr4 = vec4.as_ptr().cast::<u8>();
+                            let len4 = vec4.len();
+                            ::core::mem::forget(vec4);
+                            *ptr3
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>() = len4;
+                            *ptr3
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>() = ptr4.cast_mut();
+                        }
+                        Err(e) => {
+                            *ptr3.add(0).cast::<u8>() = (1i32) as u8;
+                            match e {
+                                ThresholdError::InvalidInput(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (0i32) as u8;
+                                    let vec5 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr5 = vec5.as_ptr().cast::<u8>();
+                                    let len5 = vec5.len();
+                                    ::core::mem::forget(vec5);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len5;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr5.cast_mut();
+                                }
+                                ThresholdError::CryptoError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (1i32) as u8;
+                                    let vec6 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr6 = vec6.as_ptr().cast::<u8>();
+                                    let len6 = vec6.len();
+                                    ::core::mem::forget(vec6);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len6;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr6.cast_mut();
+                                }
+                                ThresholdError::SerializationError(e) => {
+                                    *ptr3
+                                        .add(::core::mem::size_of::<*const u8>())
+                                        .cast::<u8>() = (2i32) as u8;
+                                    let vec7 = (e.into_bytes()).into_boxed_slice();
+                                    let ptr7 = vec7.as_ptr().cast::<u8>();
+                                    let len7 = vec7.len();
+                                    ::core::mem::forget(vec7);
+                                    *ptr3
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>() = len7;
+                                    *ptr3
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>() = ptr7.cast_mut();
+                                }
+                            }
+                        }
+                    };
+                    ptr3
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                pub unsafe fn __post_return_method_threshold_session_ark_exit_spend_info<
+                    T: GuestThresholdSession,
+                >(arg0: *mut u8) {
+                    let l0 = i32::from(*arg0.add(0).cast::<u8>());
+                    match l0 {
+                        0 => {
+                            let l1 = *arg0
+                                .add(::core::mem::size_of::<*const u8>())
+                                .cast::<*mut u8>();
+                            let l2 = *arg0
+                                .add(2 * ::core::mem::size_of::<*const u8>())
+                                .cast::<usize>();
+                            _rt::cabi_dealloc(l1, l2, 1);
+                        }
+                        _ => {
+                            let l3 = i32::from(
+                                *arg0.add(::core::mem::size_of::<*const u8>()).cast::<u8>(),
+                            );
+                            match l3 {
+                                0 => {
+                                    let l4 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l5 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l4, l5, 1);
+                                }
+                                1 => {
+                                    let l6 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l7 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l6, l7, 1);
+                                }
+                                _ => {
+                                    let l8 = *arg0
+                                        .add(2 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<*mut u8>();
+                                    let l9 = *arg0
+                                        .add(3 * ::core::mem::size_of::<*const u8>())
+                                        .cast::<usize>();
+                                    _rt::cabi_dealloc(l8, l9, 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
                 pub unsafe fn _export_method_threshold_session_identifier_derive_cabi<
                     T: GuestThresholdSession,
                 >(arg0: *mut u8, arg1: *mut u8, arg2: usize) -> *mut u8 {
@@ -6499,6 +6931,31 @@ pub mod exports {
                         message: _rt::Vec<u8>,
                         sig_hex: _rt::String,
                     ) -> Result<bool, ThresholdError>;
+                    /// ----- Ark Protocol -----
+                    /// Compute the default VTXO script pubkey for the given keys and exit delay.
+                    /// Returns hex-encoded 34-byte script pubkey.
+                    fn ark_default_vtxo_script_pubkey(
+                        &self,
+                        server_pk_hex: _rt::String,
+                        owner_pk_hex: _rt::String,
+                        exit_delay: u32,
+                    ) -> Result<_rt::String, ThresholdError>;
+                    /// Get forfeit (cooperative) spend info for a default Ark VTXO.
+                    /// Returns JSON: {"script_hex": "...", "control_block_hex": "..."}
+                    fn ark_forfeit_spend_info(
+                        &self,
+                        server_pk_hex: _rt::String,
+                        owner_pk_hex: _rt::String,
+                        exit_delay: u32,
+                    ) -> Result<_rt::String, ThresholdError>;
+                    /// Get exit (unilateral) spend info for a default Ark VTXO.
+                    /// Returns JSON: {"script_hex": "...", "control_block_hex": "..."}
+                    fn ark_exit_spend_info(
+                        &self,
+                        server_pk_hex: _rt::String,
+                        owner_pk_hex: _rt::String,
+                        exit_delay: u32,
+                    ) -> Result<_rt::String, ThresholdError>;
                     /// ----- Utils -----
                     /// Derive an identifier from arbitrary bytes (SHA-256).
                     fn identifier_derive(
@@ -7479,6 +7936,51 @@ pub mod exports {
                         __post_return_method_threshold_session_verify_schnorr_signature::<<$ty
                         as $($path_to_types)*:: Guest >::ThresholdSession > (arg0) } }
                         #[unsafe (export_name =
+                        "component:threshold/types@0.1.0#[method]threshold-session.ark-default-vtxo-script-pubkey")]
+                        unsafe extern "C" fn
+                        export_method_threshold_session_ark_default_vtxo_script_pubkey(arg0
+                        : * mut u8, arg1 : * mut u8, arg2 : usize, arg3 : * mut u8, arg4
+                        : usize, arg5 : i32,) -> * mut u8 { unsafe { $($path_to_types)*::
+                        _export_method_threshold_session_ark_default_vtxo_script_pubkey_cabi::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0, arg1,
+                        arg2, arg3, arg4, arg5) } } #[unsafe (export_name =
+                        "cabi_post_component:threshold/types@0.1.0#[method]threshold-session.ark-default-vtxo-script-pubkey")]
+                        unsafe extern "C" fn
+                        _post_return_method_threshold_session_ark_default_vtxo_script_pubkey(arg0
+                        : * mut u8,) { unsafe { $($path_to_types)*::
+                        __post_return_method_threshold_session_ark_default_vtxo_script_pubkey::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0) } }
+                        #[unsafe (export_name =
+                        "component:threshold/types@0.1.0#[method]threshold-session.ark-forfeit-spend-info")]
+                        unsafe extern "C" fn
+                        export_method_threshold_session_ark_forfeit_spend_info(arg0 : *
+                        mut u8, arg1 : * mut u8, arg2 : usize, arg3 : * mut u8, arg4 :
+                        usize, arg5 : i32,) -> * mut u8 { unsafe { $($path_to_types)*::
+                        _export_method_threshold_session_ark_forfeit_spend_info_cabi::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0, arg1,
+                        arg2, arg3, arg4, arg5) } } #[unsafe (export_name =
+                        "cabi_post_component:threshold/types@0.1.0#[method]threshold-session.ark-forfeit-spend-info")]
+                        unsafe extern "C" fn
+                        _post_return_method_threshold_session_ark_forfeit_spend_info(arg0
+                        : * mut u8,) { unsafe { $($path_to_types)*::
+                        __post_return_method_threshold_session_ark_forfeit_spend_info::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0) } }
+                        #[unsafe (export_name =
+                        "component:threshold/types@0.1.0#[method]threshold-session.ark-exit-spend-info")]
+                        unsafe extern "C" fn
+                        export_method_threshold_session_ark_exit_spend_info(arg0 : * mut
+                        u8, arg1 : * mut u8, arg2 : usize, arg3 : * mut u8, arg4 : usize,
+                        arg5 : i32,) -> * mut u8 { unsafe { $($path_to_types)*::
+                        _export_method_threshold_session_ark_exit_spend_info_cabi::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0, arg1,
+                        arg2, arg3, arg4, arg5) } } #[unsafe (export_name =
+                        "cabi_post_component:threshold/types@0.1.0#[method]threshold-session.ark-exit-spend-info")]
+                        unsafe extern "C" fn
+                        _post_return_method_threshold_session_ark_exit_spend_info(arg0 :
+                        * mut u8,) { unsafe { $($path_to_types)*::
+                        __post_return_method_threshold_session_ark_exit_spend_info::<<$ty
+                        as $($path_to_types)*:: Guest >::ThresholdSession > (arg0) } }
+                        #[unsafe (export_name =
                         "component:threshold/types@0.1.0#[method]threshold-session.identifier-derive")]
                         unsafe extern "C" fn
                         export_method_threshold_session_identifier_derive(arg0 : * mut
@@ -7853,9 +8355,9 @@ pub(crate) use __export_threshold_world_impl as export;
 )]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7243] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xc57\x01A\x02\x01A\x02\
-\x01B\xd2\x01\x01q\x03\x0dinvalid-input\x01s\0\x0ccrypto-error\x01s\0\x13seriali\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 7461] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x9f9\x01A\x02\x01A\x02\
+\x01B\xd6\x01\x01q\x03\x0dinvalid-input\x01s\0\x0ccrypto-error\x01s\0\x13seriali\
 zation-error\x01s\0\x04\0\x0fthreshold-error\x03\0\0\x04\0\x0dround1-secret\x03\x01\
 \x04\0\x0dround2-secret\x03\x01\x04\0\x0dsigning-nonce\x03\x01\x04\0\x0bdkg-sess\
 ion\x03\x01\x04\0\x0fsigning-session\x03\x01\x04\0\x0frefresh-session\x03\x01\x04\
@@ -7966,18 +8468,21 @@ old-session.key-package-tweak\x01f\x01@\x03\x04self\xd5\0\x08pkp-jsons\x0bmerkle
 age-into-even-y\x01h\x01@\x02\x04self\xd5\0\x08pkp-jsons\0\xd0\0\x04\05[method]t\
 hreshold-session.pub-key-package-into-even-y\x01i\x01j\x01\x7f\x01\x01\x01@\x04\x04\
 self\xd5\0\x06pk-hexs\x07message\xcf\0\x07sig-hexs\0\xea\0\x04\02[method]thresho\
-ld-session.verify-schnorr-signature\x01k\x01@\x02\x04self\xd5\0\x07message\xcf\0\
-\0\xd0\0\x04\0+[method]threshold-session.identifier-derive\x01l\x01@\x02\x04self\
-\xd5\0\x07hex-strs\0\xd0\0\x04\00[method]threshold-session.identifier-from-bigin\
-t\x01m\x01@\x03\x04self\xd5\0\x05county\x04seed\xcf\0\0\xd0\0\x04\0/[method]thre\
-shold-session.generate-coefficients\x01n\x01@\x03\x04self\xd5\0\x06id-hexs\x11co\
-efficients-jsons\0\xd0\0\x04\0-[method]threshold-session.evaluate-polynomial\x01\
-o\x01@\x01\x04self\xd5\0\0\xd0\0\x04\0&[method]threshold-session.mod-n-random\x01\
-p\x01@\x02\x04self\xd5\0\x0ascalar-hexs\0\xd0\0\x04\0'[method]threshold-session.\
-elem-base-mul\x01q\x04\0\x1fcomponent:threshold/types@0.1.0\x05\0\x04\0)componen\
-t:threshold/threshold-world@0.1.0\x04\0\x0b\x15\x01\0\x0fthreshold-world\x03\0\0\
-\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.227.1\x10wit-bind\
-gen-rust\x060.41.0";
+ld-session.verify-schnorr-signature\x01k\x01@\x04\x04self\xd5\0\x0dserver-pk-hex\
+s\x0cowner-pk-hexs\x0aexit-delayy\0\xd0\0\x04\08[method]threshold-session.ark-de\
+fault-vtxo-script-pubkey\x01l\x04\00[method]threshold-session.ark-forfeit-spend-\
+info\x01l\x04\0-[method]threshold-session.ark-exit-spend-info\x01l\x01@\x02\x04s\
+elf\xd5\0\x07message\xcf\0\0\xd0\0\x04\0+[method]threshold-session.identifier-de\
+rive\x01m\x01@\x02\x04self\xd5\0\x07hex-strs\0\xd0\0\x04\00[method]threshold-ses\
+sion.identifier-from-bigint\x01n\x01@\x03\x04self\xd5\0\x05county\x04seed\xcf\0\0\
+\xd0\0\x04\0/[method]threshold-session.generate-coefficients\x01o\x01@\x03\x04se\
+lf\xd5\0\x06id-hexs\x11coefficients-jsons\0\xd0\0\x04\0-[method]threshold-sessio\
+n.evaluate-polynomial\x01p\x01@\x01\x04self\xd5\0\0\xd0\0\x04\0&[method]threshol\
+d-session.mod-n-random\x01q\x01@\x02\x04self\xd5\0\x0ascalar-hexs\0\xd0\0\x04\0'\
+[method]threshold-session.elem-base-mul\x01r\x04\0\x1fcomponent:threshold/types@\
+0.1.0\x05\0\x04\0)component:threshold/threshold-world@0.1.0\x04\0\x0b\x15\x01\0\x0f\
+threshold-world\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\
+\x070.227.1\x10wit-bindgen-rust\x060.41.0";
 #[inline(never)]
 #[doc(hidden)]
 pub fn __link_custom_section_describing_imports() {
