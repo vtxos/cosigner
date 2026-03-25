@@ -104,21 +104,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Create wallet service
-    let service = wallet_service::WalletService::new(
+    let service = std::sync::Arc::new(wallet_service::WalletService::new(
         manager,
         auth_verifier,
         persistence,
         bitcoin_rpc,
         bitcoin_history,
         asp_client,
-    );
+    ));
+
+    // Load persisted Ark state and validate ASP key
+    service.load_ark_state().await;
+
+    // Spawn background VTXO stream sync if ASP is configured
+    if service.asp_client.is_some() {
+        let svc = service.clone();
+        tokio::spawn(async move {
+            svc.run_vtxo_stream().await;
+        });
+    }
 
     let addr = format!("0.0.0.0:{}", args.port).parse()?;
     tracing::info!("MPC Wallet Server listening on {}", addr);
 
     Server::builder()
         .add_service(
-            wallet_proto::mpc_wallet_server::MpcWalletServer::new(service),
+            wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(service),
         )
         .serve(addr)
         .await?;

@@ -14,6 +14,6 @@ pub mod proto {
 }
 
 // Re-exports for convenience.
-pub use address::{ark_address, boarding_address, parse_network};
+pub use address::{ark_address, boarding_address, parse_network, vtxo_script_pubkey_hex};
 pub use asp_client::AspClient;
 pub use types::{ArkInfo, StoredVtxo, VtxoStatus};

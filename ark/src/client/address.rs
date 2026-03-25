@@ -48,12 +48,35 @@ pub fn boarding_address(
     let asp_pk = hex_to_xonly(asp_pk_hex)?;
 
     let exit_seq = ark_core::server::parse_sequence_number(exit_delay as i64)
-        .map_err(|e| format!("invalid exit_delay: {e}"))?;
+        .map_err(|e| format!("parse_sequence_number: {e}"))?;
 
     let boarding = BoardingOutput::new(&secp, asp_pk, owner_pk, exit_seq, network)
         .map_err(|e| format!("BoardingOutput::new: {e}"))?;
 
     Ok(boarding.address().to_string())
+}
+
+/// Derive the VTXO scriptPubKey hex for a given owner + ASP.
+///
+/// This is used to match incoming stream VTXOs to users.
+pub fn vtxo_script_pubkey_hex(
+    owner_pk_hex: &str,
+    asp_pk_hex: &str,
+    exit_delay: u32,
+    network: Network,
+) -> Result<String, String> {
+    let secp = Secp256k1::new();
+    let owner_pk = hex_to_xonly(owner_pk_hex)?;
+    let asp_pk = hex_to_xonly(asp_pk_hex)?;
+
+    let exit_seq = ark_core::server::parse_sequence_number(exit_delay as i64)
+        .map_err(|e| format!("parse_sequence_number: {e}"))?;
+
+    let vtxo = Vtxo::new_default(&secp, asp_pk, owner_pk, exit_seq, network)
+        .map_err(|e| format!("Vtxo::new_default: {e}"))?;
+
+    let spk = vtxo.script_pubkey();
+    Ok(spk.as_bytes().iter().map(|b| format!("{:02x}", b)).collect())
 }
 
 /// Map ASP network string to bitcoin::Network.

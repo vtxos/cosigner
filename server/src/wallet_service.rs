@@ -28,6 +28,18 @@ use crate::wasm_manager::{StepSync, WasmManager};
 const TOTAL_PARTICIPANTS: usize = 3;
 const THRESHOLD_COUNT: u32 = 2;
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArkTxEntry {
+    pub tx_type: String,   // "board", "send", "receive", "settle"
+    pub amount_sats: i64,  // positive for inflows, negative for outflows
+    pub txid: String,
+    pub timestamp: i64,    // seconds since epoch
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
 pub struct WalletService {
     pub wasm_manager: Arc<Mutex<WasmManager>>,
     pub auth_verifier: Arc<AuthVerifier>,
@@ -43,6 +55,11 @@ pub struct WalletService {
     pub send_sessions: tokio::sync::Mutex<HashMap<String, (ark::client::send::SendSession, u32)>>,
     /// Simple in-memory VTXO store: user_id -> list of (txid, vout, amount_sats, exit_delay).
     pub vtxo_store: tokio::sync::Mutex<HashMap<String, Vec<(String, u32, u64, u32)>>>,
+    /// Reverse lookup: VTXO scriptPubKey hex -> user_id_hex.
+    /// Populated when users call get_ark_address.
+    pub ark_script_to_user: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Ark transaction history: user_id_hex -> list of tx entries.
+    pub ark_tx_history: tokio::sync::Mutex<HashMap<String, Vec<ArkTxEntry>>>,
 }
 
 impl WalletService {
@@ -65,6 +82,285 @@ impl WalletService {
             delegate_sessions: tokio::sync::Mutex::new(HashMap::new()),
             send_sessions: tokio::sync::Mutex::new(HashMap::new()),
             vtxo_store: tokio::sync::Mutex::new(HashMap::new()),
+            ark_script_to_user: tokio::sync::Mutex::new(HashMap::new()),
+            ark_tx_history: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ark state persistence
+    // -----------------------------------------------------------------------
+
+    /// Load persisted Ark state (vtxo_store, ark_tx_history, ark_script_to_user)
+    /// and validate the ASP signer pubkey hasn't changed.
+    pub async fn load_ark_state(&self) {
+        if self.asp_client.is_none() {
+            tracing::info!("No ASP configured, skipping Ark state load");
+            return;
+        }
+
+        // Check ASP signer pubkey
+        let current_pubkey = {
+            let asp = self.asp_client.as_ref().unwrap();
+            let mut guard = asp.lock().await;
+            match guard.get_info().await {
+                Ok(info) => info.signer_pubkey.clone(),
+                Err(e) => {
+                    tracing::warn!("Failed to get ASP info for pubkey check: {e}");
+                    return;
+                }
+            }
+        };
+
+        let meta_tree = match self.persistence.tree("ark_meta") {
+            Ok(t) => t,
+            Err(e) => { tracing::warn!("Failed to open ark_meta tree: {e}"); return; }
+        };
+
+        let stored_pubkey = meta_tree.get("asp_signer_pubkey").unwrap_or(None);
+        if let Some(ref stored) = stored_pubkey {
+            if stored != &current_pubkey {
+                tracing::warn!(
+                    "ASP signer pubkey changed ({stored} -> {current_pubkey}), wiping Ark state"
+                );
+                self.wipe_ark_state();
+                let _ = meta_tree.put("asp_signer_pubkey", &current_pubkey);
+                return;
+            }
+        } else {
+            let _ = meta_tree.put("asp_signer_pubkey", &current_pubkey);
+        }
+
+        // Load vtxo_store
+        if let Ok(tree) = self.persistence.tree("vtxo_store") {
+            if let Ok(all) = tree.all() {
+                let mut store = self.vtxo_store.lock().await;
+                for (user_id, json) in all {
+                    if let Ok(vtxos) = serde_json::from_str::<Vec<(String, u32, u64, u32)>>(&json) {
+                        tracing::info!("Loaded {} VTXOs for user {user_id}", vtxos.len());
+                        store.insert(user_id, vtxos);
+                    }
+                }
+            }
+        }
+
+        // Load ark_tx_history
+        if let Ok(tree) = self.persistence.tree("ark_tx_history") {
+            if let Ok(all) = tree.all() {
+                let mut history = self.ark_tx_history.lock().await;
+                for (user_id, json) in all {
+                    if let Ok(entries) = serde_json::from_str::<Vec<ArkTxEntry>>(&json) {
+                        tracing::info!("Loaded {} Ark tx entries for user {user_id}", entries.len());
+                        history.insert(user_id, entries);
+                    }
+                }
+            }
+        }
+
+        // Load ark_script_to_user
+        if let Ok(tree) = self.persistence.tree("ark_script_to_user") {
+            if let Ok(all) = tree.all() {
+                let mut map = self.ark_script_to_user.lock().await;
+                tracing::info!("Loaded {} script-to-user mappings", all.len());
+                for (script, user_id) in all {
+                    map.insert(script, user_id);
+                }
+            }
+        }
+
+        tracing::info!("Ark state loaded from persistence");
+    }
+
+    fn wipe_ark_state(&self) {
+        for tree_name in &["vtxo_store", "ark_tx_history", "ark_script_to_user", "ark_meta"] {
+            if let Ok(tree) = self.persistence.tree(tree_name) {
+                if let Ok(all) = tree.all() {
+                    for key in all.keys() {
+                        let _ = tree.delete(key);
+                    }
+                }
+            }
+        }
+        tracing::info!("Ark state wiped");
+    }
+
+    fn save_user_vtxos(&self, user_id_hex: &str, vtxos: &[(String, u32, u64, u32)]) {
+        if let Ok(tree) = self.persistence.tree("vtxo_store") {
+            if let Ok(json) = serde_json::to_string(vtxos) {
+                let _ = tree.put(user_id_hex, &json);
+            }
+        }
+    }
+
+    fn save_user_ark_history(&self, user_id_hex: &str, entries: &[ArkTxEntry]) {
+        if let Ok(tree) = self.persistence.tree("ark_tx_history") {
+            if let Ok(json) = serde_json::to_string(entries) {
+                let _ = tree.put(user_id_hex, &json);
+            }
+        }
+    }
+
+    fn save_script_to_user(&self, script: &str, user_id_hex: &str) {
+        if let Ok(tree) = self.persistence.tree("ark_script_to_user") {
+            let _ = tree.put(script, user_id_hex);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // VTXO stream sync
+    // -----------------------------------------------------------------------
+
+    /// Long-running task that subscribes to arkd's GetTransactionsStream
+    /// and keeps vtxo_store up to date when VTXOs move during rounds.
+    pub async fn run_vtxo_stream(&self) {
+        tracing::info!("VTXO stream task started");
+        loop {
+            tracing::info!("VTXO stream: attempting connection...");
+            match self.connect_and_stream().await {
+                Ok(()) => tracing::info!("VTXO stream ended, reconnecting..."),
+                Err(e) => tracing::warn!("VTXO stream error: {e}, reconnecting in 5s..."),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    async fn connect_and_stream(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Get ASP URL from the existing client's channel, then open a dedicated
+        // connection for streaming so we don't hold the shared mutex.
+        let asp_arc = self.asp_client.as_ref().ok_or("ASP not configured")?;
+        let asp_url = {
+            let asp = asp_arc.lock().await;
+            // Get info to verify ASP is reachable (also caches info)
+            drop(asp);
+            // Use the ASP_URL env var directly for the dedicated stream connection
+            std::env::var("ASP_URL").map_err(|_| "ASP_URL env var not set")?
+        };
+
+        tracing::info!("VTXO stream: connecting to ASP at {asp_url}");
+        let mut stream_client = ark::client::AspClient::connect(&asp_url).await?;
+        tracing::info!("VTXO stream: ASP connected, opening transaction stream...");
+        let mut stream = stream_client.get_transactions_stream().await?;
+        tracing::info!("VTXO stream: connected to arkd, listening for events");
+
+        while let Some(event) = stream.message().await? {
+            if let Some(data) = event.data {
+                use ark::client::proto::get_transactions_stream_response::Data;
+                match data {
+                    Data::CommitmentTx(notif) | Data::ArkTx(notif) => {
+                        self.process_tx_notification(&notif).await;
+                    }
+                    Data::Heartbeat(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_tx_notification(&self, notif: &ark::client::proto::TxNotification) {
+        let script_map = self.ark_script_to_user.lock().await;
+        let mut store = self.vtxo_store.lock().await;
+        let mut affected_users = std::collections::HashSet::new();
+
+        // Remove spent VTXOs
+        for spent in &notif.spent_vtxos {
+            if let Some(user_id) = script_map.get(&spent.script) {
+                if let Some(outpoint) = &spent.outpoint {
+                    if let Some(user_vtxos) = store.get_mut(user_id) {
+                        user_vtxos.retain(|(txid, vout, _, _)| {
+                            !(txid == &outpoint.txid && *vout == outpoint.vout)
+                        });
+                        affected_users.insert(user_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Add new spendable VTXOs
+        for new_vtxo in &notif.spendable_vtxos {
+            if let Some(user_id) = script_map.get(&new_vtxo.script) {
+                if let Some(outpoint) = &new_vtxo.outpoint {
+                    // Avoid duplicates
+                    let entry = store.entry(user_id.clone()).or_default();
+                    let already_exists = entry.iter().any(|(t, v, _, _)| {
+                        t == &outpoint.txid && *v == outpoint.vout
+                    });
+                    if !already_exists {
+                        tracing::info!(
+                            "[{user_id}] VTXO stream: new spendable {}:{} amount={}",
+                            outpoint.txid, outpoint.vout, new_vtxo.amount
+                        );
+                        entry.push((
+                            outpoint.txid.clone(),
+                            outpoint.vout,
+                            new_vtxo.amount,
+                            0, // exit_delay — client gets this from ArkInfo
+                        ));
+                        affected_users.insert(user_id.clone());
+                        // Log "receive" only if no active settle/send session for this user
+                        // (avoids duplicate entries when boarding or sending to self).
+                        let has_settle = self.settle_sessions.lock().await.contains_key(user_id);
+                        let has_delegate = self.delegate_sessions.lock().await.contains_key(user_id);
+                        let has_send = self.send_sessions.lock().await.contains_key(user_id);
+                        if !has_settle && !has_delegate && !has_send {
+                            self.ark_tx_history.lock().await
+                                .entry(user_id.clone()).or_default()
+                                .push(ArkTxEntry {
+                                    tx_type: "receive".into(),
+                                    amount_sats: new_vtxo.amount as i64,
+                                    txid: outpoint.txid.clone(),
+                                    timestamp: now_secs(),
+                                });
+                            // Persist history
+                            if let Some(entries) = self.ark_tx_history.lock().await.get(user_id) {
+                                self.save_user_ark_history(user_id, entries);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Persist vtxo_store for affected users
+        for user_id in &affected_users {
+            if let Some(vtxos) = store.get(user_id) {
+                self.save_user_vtxos(user_id, vtxos);
+            }
+        }
+    }
+
+    /// Register a user's VTXO scriptPubKey for stream matching.
+    async fn register_user_vtxo_script(&self, user_id_hex: &str, owner_pk_hex: &str) {
+        let asp = match self.asp_client.as_ref() {
+            Some(a) => a,
+            None => return,
+        };
+        let info = {
+            let mut guard = asp.lock().await;
+            match &guard.info {
+                Some(i) => i.clone(),
+                None => match guard.get_info().await {
+                    Ok(i) => i,
+                    Err(_) => return,
+                },
+            }
+        };
+
+        // Register for both exit delays (boarding + unilateral)
+        for exit_delay in [info.unilateral_exit_delay as u32, info.boarding_exit_delay as u32] {
+            let network = match ark::client::parse_network(&info.network) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if let Ok(script_hex) = ark::client::vtxo_script_pubkey_hex(
+                owner_pk_hex,
+                &info.signer_pubkey,
+                exit_delay,
+                network,
+            ) {
+                let mut script_map = self.ark_script_to_user.lock().await;
+                script_map.insert(script_hex.clone(), user_id_hex.to_string());
+                self.save_script_to_user(&script_hex, user_id_hex);
+            }
         }
     }
 
@@ -343,6 +639,41 @@ impl WalletService {
     ) -> Result<i64, Status> {
         if full_tx.is_empty() {
             return Ok(0);
+        }
+
+        // PSBT format (Ark off-chain sends pass serialized PSBT as fullTransaction).
+        // PSBT magic: 0x70736274ff ("psbt" + 0xff)
+        if full_tx.len() > 5 && full_tx[..5] == [0x70, 0x73, 0x62, 0x74, 0xff] {
+            if let Ok(psbt) = bitcoin::Psbt::deserialize(full_tx) {
+                // Net spend = sum(inputs) - sum(outputs going back to user).
+                // Ark tx structure: [recipient_out(s)..., change_out, anchor(0)]
+                // Input total from witness_utxo = user's VTXO value.
+                // Change output = second-to-last output (if >= 3 outputs).
+                // Net spend = input_total - change_amount (anchor is 0).
+                let input_total: u64 = psbt.inputs.iter()
+                    .filter_map(|i| i.witness_utxo.as_ref())
+                    .map(|utxo| utxo.value.to_sat())
+                    .sum();
+                let outputs = &psbt.unsigned_tx.output;
+                let change_amount = if outputs.len() >= 3 {
+                    // Second-to-last output is change back to user
+                    outputs[outputs.len() - 2].value.to_sat()
+                } else {
+                    0
+                };
+                let net_spend = input_total.saturating_sub(change_amount);
+                tracing::info!("PSBT policy eval: inputs={input_total}, change={change_amount}, net_spend={net_spend}");
+                return Ok(net_spend as i64);
+            }
+        }
+
+        // Legacy: explicit amount via "ARK_AMOUNT:<sats>" prefix.
+        if full_tx.starts_with(b"ARK_AMOUNT:") {
+            let amount_str = std::str::from_utf8(&full_tx[11..])
+                .map_err(|e| Status::internal(format!("invalid ARK_AMOUNT: {e}")))?;
+            let amount: i64 = amount_str.parse()
+                .map_err(|e| Status::internal(format!("invalid ARK_AMOUNT value: {e}")))?;
+            return Ok(amount);
         }
 
         let user = mgr
@@ -1075,38 +1406,36 @@ impl MpcWallet for WalletService {
             let mut mgr = self.wasm_manager.lock().unwrap();
             self.load_policy_state(&mut mgr, &user_id_hex)?;
 
-            let user = mgr
-                .get_or_create_user(&user_id_hex)
-                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
-
-            let policy_state = user
-                .policy_state
-                .as_ref()
-                .ok_or_else(|| Status::not_found("no policy state"))?
-                .clone();
-
-            let user_identifier_hex = policy_state
-                .user_signing_identifier_hex
-                .clone()
-                .unwrap_or_else(|| {
+            let (policy_state, user_identifier_hex) = {
+                let user = mgr
+                    .get_or_create_user(&user_id_hex)
+                    .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
+                let ps = user
+                    .policy_state
+                    .as_ref()
+                    .ok_or_else(|| Status::not_found("no policy state"))?
+                    .clone();
+                let uid = ps.user_signing_identifier_hex.clone().unwrap_or_else(|| {
                     crypto_ops::identifier_derive(user, &req.user_id).unwrap_or_default()
                 });
+                (ps, uid)
+            };
+            // user borrow dropped here — mgr is free again
 
             let mut server_kp_json = policy_state.normal_policy.key_package_json.clone();
             let pkp_json = policy_state.normal_policy.public_key_package_json.clone();
 
-            // Policy evaluation
+            // Policy evaluation: server independently evaluates from fullTransaction
+            let ft_len = req.full_transaction.len();
+            let ft_is_psbt = ft_len > 5 && req.full_transaction[..5] == [0x70, 0x73, 0x62, 0x74, 0xff];
+            tracing::info!("[{user_id_hex}] SignStep1: fullTransaction len={ft_len}, is_psbt={ft_is_psbt}, script_path={}", req.script_path_spend);
             let spent_amount = self
                 .calculate_spent_amount(&mut mgr, &req.full_transaction, &pkp_json, &user_id_hex)
                 .unwrap_or(0);
-
-            let user = mgr
-                .get_or_create_user(&user_id_hex)
-                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
-            let policy_state = user.policy_state.as_ref().unwrap();
-
+            tracing::info!("[{user_id_hex}] SignStep1: spent_amount={spent_amount}");
             let selected_policy_id =
-                Self::evaluate_policy_for_amount(policy_state, spent_amount);
+                Self::evaluate_policy_for_amount(&policy_state, spent_amount);
+            tracing::info!("[{user_id_hex}] SignStep1: selected_policy_id={:?}", selected_policy_id);
 
             if let Some(ref policy_id) = selected_policy_id {
                 if let Some(pp) = policy_state.protected_policies.get(policy_id) {
@@ -1118,6 +1447,11 @@ impl MpcWallet for WalletService {
             } else {
                 tracing::info!("[{user_id_hex}] SignStep1: Using Normal Policy");
             }
+
+            // Re-acquire user ref from mgr (previous borrow was dropped for policy eval)
+            let user = mgr
+                .get_or_create_user(&user_id_hex)
+                .map_err(|e| Status::internal(format!("WASM init error: {e}")))?;
 
             // Reset any stale signing session from a previous (possibly failed) attempt.
             // This mirrors the Dart server's `session.reset()` in signStep2's catch block,
@@ -2540,6 +2874,8 @@ impl MpcWallet for WalletService {
             boarding_exit_delay: info.boarding_exit_delay,
             vtxo_min_amount: info.vtxo_min_amount,
             dust: info.dust,
+            checkpoint_tapscript: info.checkpoint_tapscript,
+            forfeit_address: info.forfeit_address,
         }))
     }
 
@@ -2565,6 +2901,15 @@ impl MpcWallet for WalletService {
 
         // Get the user's group x-only pubkey from policy state
         let owner_pk_hex = self.get_user_xonly_pubkey(&user_id_hex)?;
+        // Compute scriptPubKey for debugging
+        if let Ok(spk_hex) = ark::client::vtxo_script_pubkey_hex(
+            &owner_pk_hex, &info.signer_pubkey, info.unilateral_exit_delay as u32,
+            ark::client::parse_network(&info.network).unwrap_or(bitcoin::Network::Regtest),
+        ) {
+            tracing::info!("[{user_id_hex}] GetArkAddress: owner_pk={owner_pk_hex}, exit_delay={}, script_pubkey={spk_hex}", info.unilateral_exit_delay);
+        } else {
+            tracing::info!("[{user_id_hex}] GetArkAddress: owner_pk={owner_pk_hex}, exit_delay={}", info.unilateral_exit_delay);
+        }
 
         let network = ark::client::parse_network(&info.network)
             .map_err(|e| Status::internal(e))?;
@@ -2576,6 +2921,9 @@ impl MpcWallet for WalletService {
             exit_delay,
             network,
         ).map_err(|e| Status::internal(format!("ark_address: {e}")))?;
+
+        // Register script for VTXO stream matching
+        self.register_user_vtxo_script(&user_id_hex, &owner_pk_hex).await;
 
         Ok(Response::new(GetArkAddressResponse {
             ark_address: ark_addr,
@@ -2619,13 +2967,60 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    async fn check_boarding_balance(
+        &self,
+        request: Request<CheckBoardingBalanceRequest>,
+    ) -> Result<Response<CheckBoardingBalanceResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_CHECK_BOARDING_BALANCE)?;
+
+        let asp = self.require_asp()?;
+        let mut asp_guard = asp.lock().await;
+        let info = match &asp_guard.info {
+            Some(i) => i.clone(),
+            None => asp_guard.get_info().await
+                .map_err(|e| Status::internal(format!("ASP get_info: {e}")))?,
+        };
+        drop(asp_guard);
+
+        let owner_pk_hex = self.get_user_xonly_pubkey(&user_id_hex)?;
+        let network = ark::client::parse_network(&info.network)
+            .map_err(|e| Status::internal(e))?;
+        let exit_delay = info.boarding_exit_delay as u32;
+        let boarding_addr = ark::client::boarding_address(
+            &owner_pk_hex, &info.signer_pubkey, exit_delay, network,
+        ).map_err(|e| Status::internal(format!("boarding_address: {e}")))?;
+
+        let addr: bitcoin::Address<bitcoin::address::NetworkUnchecked> = boarding_addr.parse()
+            .map_err(|e| Status::internal(format!("parse addr: {e}")))?;
+        let addr = addr.require_network(network)
+            .map_err(|e| Status::internal(format!("network mismatch: {e}")))?;
+        let script_hex = hex::encode(addr.script_pubkey().as_bytes());
+        let script_hash = crate::bitcoin::tx_parser::derive_script_hash(&script_hex)
+            .map_err(|e| Status::internal(format!("script_hash: {e}")))?;
+
+        let history = self.bitcoin_history.lock().await;
+        let utxos = history.list_unspent_by_script_hash(&script_hash).await
+            .map_err(|e| Status::internal(format!("list_unspent: {e}")))?;
+        drop(history);
+
+        let balance: u64 = utxos.iter().map(|u| u.amount_sats as u64).sum();
+        let utxo_count = utxos.len() as u32;
+        tracing::info!("[{user_id_hex}] CheckBoardingBalance: {utxo_count} UTXOs, balance={balance}");
+
+        Ok(Response::new(CheckBoardingBalanceResponse {
+            balance,
+            utxo_count,
+        }))
+    }
+
     async fn list_vtxos(
         &self,
         request: Request<ListVtxosRequest>,
     ) -> Result<Response<ListVtxosResponse>, Status> {
         let req = request.into_inner();
         let user_id_hex = Self::user_id_hex(&req.user_id);
-        tracing::info!("[{user_id_hex}] ListVtxos");
         self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_LIST_VTXOS)?;
 
         self.require_asp()?;
@@ -2635,8 +3030,9 @@ impl MpcWallet for WalletService {
         let mut vtxos = Vec::new();
         let mut total_balance: u64 = 0;
         if let Some(entries) = user_vtxos {
-            for (txid, vout, amount, _exit_delay) in entries.iter() {
+            for (txid, vout, amount, exit_delay) in entries.iter() {
                 total_balance += amount;
+                tracing::info!("[{user_id_hex}] ListVtxos: vtxo {txid}:{vout} amount={amount} exit_delay={exit_delay}");
                 vtxos.push(VtxoInfo {
                     txid: txid.clone(),
                     vout: *vout,
@@ -2645,14 +3041,37 @@ impl MpcWallet for WalletService {
                     expires_at: 0,
                     status: "confirmed".to_string(),
                     is_preconfirmed: false,
+                    exit_delay: *exit_delay,
                 });
             }
         }
+        tracing::info!("[{user_id_hex}] ListVtxos: returning {} vtxos, balance={total_balance}", vtxos.len());
 
         Ok(Response::new(ListVtxosResponse {
             vtxos,
             total_balance,
         }))
+    }
+
+    async fn list_ark_transactions(
+        &self,
+        request: Request<ListArkTransactionsRequest>,
+    ) -> Result<Response<ListArkTransactionsResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_LIST_ARK_TXS)?;
+
+        let history = self.ark_tx_history.lock().await;
+        let transactions = history.get(&user_id_hex)
+            .map(|entries| entries.iter().map(|e| ArkTransactionSummary {
+                tx_type: e.tx_type.clone(),
+                amount_sats: e.amount_sats,
+                txid: e.txid.clone(),
+                timestamp: e.timestamp,
+            }).collect())
+            .unwrap_or_default();
+
+        Ok(Response::new(ListArkTransactionsResponse { transactions }))
     }
 
     async fn send_vtxo(
@@ -2676,8 +3095,8 @@ impl MpcWallet for WalletService {
         drop(sessions);
 
         match (existing, has_signatures) {
-            // Phase 1: No session -> build transactions, return sighashes
-            (None, false) => {
+            // Phase 1: No session (or stale session) -> build transactions, return sighashes
+            (None, false) | (Some(_), false) => {
                 let (owner_pk_hex, _dkg_secret_hex) = self.get_user_ark_keys(&user_id_hex)?;
 
                 let mut asp = asp_arc.lock().await;
@@ -2748,6 +3167,28 @@ impl MpcWallet for WalletService {
                     &info,
                 ).map_err(|e| Status::internal(format!("SendSession::build: {e}")))?;
 
+                // Evaluate spending policy for this amount
+                let send_policy_id = {
+                    let mut mgr = self.wasm_manager.lock().unwrap();
+                    self.load_policy_state(&mut mgr, &user_id_hex).ok();
+                    let policy_id = if let Ok(user) = mgr.get_or_create_user(&user_id_hex) {
+                        if let Some(ps) = user.policy_state.as_ref() {
+                            Self::evaluate_policy_for_amount(ps, req.amount as i64)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    policy_id.unwrap_or_default()
+                };
+
+                if !send_policy_id.is_empty() {
+                    tracing::info!(
+                        "[{user_id_hex}] SendVtxo: policy triggered: {send_policy_id}"
+                    );
+                }
+
                 let mut sessions = self.send_sessions.lock().await;
                 sessions.insert(user_id_hex, (session, change_exit_delay));
 
@@ -2757,6 +3198,7 @@ impl MpcWallet for WalletService {
                     script_path_spend: true,
                     ark_txid: String::new(),
                     error_message: String::new(),
+                    policy_id: send_policy_id,
                 }))
             }
 
@@ -2790,6 +3232,21 @@ impl MpcWallet for WalletService {
                 tracing::info!(
                     "[{user_id_hex}] SendVtxo: sent, ark_txid={ark_txid}"
                 );
+                // Persist vtxo_store
+                if let Some(vtxos) = store.get(&user_id_hex) {
+                    self.save_user_vtxos(&user_id_hex, vtxos);
+                }
+                self.ark_tx_history.lock().await
+                    .entry(user_id_hex.clone()).or_default()
+                    .push(ArkTxEntry {
+                        tx_type: "send".into(),
+                        amount_sats: -(req.amount as i64),
+                        txid: ark_txid.clone(),
+                        timestamp: now_secs(),
+                    });
+                if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
+                    self.save_user_ark_history(&user_id_hex, entries);
+                }
 
                 Ok(Response::new(SendVtxoResponse {
                     status: send_vtxo_response::Status::Settled as i32,
@@ -2797,14 +3254,8 @@ impl MpcWallet for WalletService {
                     script_path_spend: false,
                     ark_txid,
                     error_message: String::new(),
+                    policy_id: String::new(),
                 }))
-            }
-
-            // Session exists but no signatures -> error
-            (Some((session, ed)), false) => {
-                let mut sessions = self.send_sessions.lock().await;
-                sessions.insert(user_id_hex, (session, ed));
-                Err(Status::failed_precondition("send session exists; provide signatures"))
             }
 
             // No session but has signatures -> error
@@ -2944,10 +3395,24 @@ impl MpcWallet for WalletService {
                                     let (vtxo_txid, vtxo_vout) = vtxo_outpoint
                                         .unwrap_or_else(|| (commitment_txid.clone(), 0));
                                     let mut store = self.vtxo_store.lock().await;
-                                    store.entry(user_id_hex.clone())
-                                        .or_default()
-                                        .push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
+                                    let entry = store.entry(user_id_hex.clone()).or_default();
+                                    entry.retain(|(t, v, _, _)| !(t == &vtxo_txid && *v == vtxo_vout));
+                                    entry.push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
                                     tracing::info!("[{user_id_hex}] Settle: VTXO recorded vtxo_txid={vtxo_txid}:{vtxo_vout} amount={boarding_amount}");
+                                    if let Some(vtxos) = store.get(&user_id_hex) {
+                                        self.save_user_vtxos(&user_id_hex, vtxos);
+                                    }
+                                    self.ark_tx_history.lock().await
+                                        .entry(user_id_hex.clone()).or_default()
+                                        .push(ArkTxEntry {
+                                            tx_type: "board".into(),
+                                            amount_sats: boarding_amount as i64,
+                                            txid: vtxo_txid,
+                                            timestamp: now_secs(),
+                                        });
+                                    if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
+                                        self.save_user_ark_history(&user_id_hex, entries);
+                                    }
                                     return Ok(Response::new(SettleResponse {
                                         status: settle_response::Status::Settled as i32,
                                         messages_to_sign: vec![],
@@ -2976,10 +3441,24 @@ impl MpcWallet for WalletService {
                                     let (vtxo_txid, vtxo_vout) = vtxo_outpoint
                                         .unwrap_or_else(|| (commitment_txid.clone(), 0));
                                     let mut store = self.vtxo_store.lock().await;
-                                    store.entry(user_id_hex.clone())
-                                        .or_default()
-                                        .push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
+                                    let entry = store.entry(user_id_hex.clone()).or_default();
+                                    entry.retain(|(t, v, _, _)| !(t == &vtxo_txid && *v == vtxo_vout));
+                                    entry.push((vtxo_txid.clone(), vtxo_vout, boarding_amount, exit_delay));
                                     tracing::info!("[{user_id_hex}] Settle: VTXO recorded vtxo_txid={vtxo_txid}:{vtxo_vout} amount={boarding_amount}");
+                                    if let Some(vtxos) = store.get(&user_id_hex) {
+                                        self.save_user_vtxos(&user_id_hex, vtxos);
+                                    }
+                                    self.ark_tx_history.lock().await
+                                        .entry(user_id_hex.clone()).or_default()
+                                        .push(ArkTxEntry {
+                                            tx_type: "board".into(),
+                                            amount_sats: boarding_amount as i64,
+                                            txid: vtxo_txid,
+                                            timestamp: now_secs(),
+                                        });
+                                    if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
+                                        self.save_user_ark_history(&user_id_hex, entries);
+                                    }
                                     return Ok(Response::new(SettleResponse {
                                         status: settle_response::Status::Settled as i32,
                                         messages_to_sign: vec![],
@@ -3167,6 +3646,20 @@ impl MpcWallet for WalletService {
                 tracing::info!(
                     "[{user_id_hex}] SettleDelegate: settled, new VTXO txid={vtxo_txid}:{vtxo_vout} amount={total_amount}"
                 );
+                if let Some(vtxos) = store.get(&user_id_hex) {
+                    self.save_user_vtxos(&user_id_hex, vtxos);
+                }
+                self.ark_tx_history.lock().await
+                    .entry(user_id_hex.clone()).or_default()
+                    .push(ArkTxEntry {
+                        tx_type: "settle".into(),
+                        amount_sats: total_amount as i64,
+                        txid: vtxo_txid,
+                        timestamp: now_secs(),
+                    });
+                if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
+                    self.save_user_ark_history(&user_id_hex, entries);
+                }
 
                 Ok(Response::new(SettleDelegateResponse {
                     status: settle_delegate_response::Status::Settled as i32,
@@ -3189,5 +3682,164 @@ impl MpcWallet for WalletService {
                 Err(Status::failed_precondition("no active delegate session"))
             }
         }
+    }
+
+    async fn submit_ark_send(
+        &self,
+        request: Request<SubmitArkSendRequest>,
+    ) -> Result<Response<SubmitArkSendResponse>, Status> {
+        let req = request.into_inner();
+        let user_id_hex = Self::user_id_hex(&req.user_id);
+        tracing::info!("[{user_id_hex}] SubmitArkSend");
+        self.verify_auth(&req.user_id, &req.signature, req.timestamp_ms, OP_SEND_VTXO)?;
+
+        let asp_arc = self.require_asp()?.clone();
+
+        // Decode client's signed ark tx (base64 PSBT)
+        use bitcoin::base64::{self, Engine};
+        let signed_ark_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&req.signed_ark_tx_b64)
+            .map_err(|e| Status::invalid_argument(format!("invalid ark tx base64: {e}")))?;
+        let signed_ark_psbt = bitcoin::Psbt::deserialize(&signed_ark_bytes)
+            .map_err(|e| Status::invalid_argument(format!("invalid ark tx PSBT: {e}")))?;
+
+        // Log PSBT inputs for debugging
+        for (i, input) in signed_ark_psbt.unsigned_tx.input.iter().enumerate() {
+            tracing::info!(
+                "[{user_id_hex}] SubmitArkSend: PSBT input[{i}] = {}:{}",
+                input.previous_output.txid, input.previous_output.vout
+            );
+        }
+
+        // Keep client-signed checkpoints for both ASP submission and counter-signing.
+        // The reference SDK sends checkpoints WITH owner signatures to submit_tx.
+        let mut client_signed_checkpoints = Vec::new();
+        let mut signed_checkpoint_b64s = Vec::new();
+        for cp_b64 in &req.signed_checkpoint_txs_b64 {
+            let cp_bytes = base64::engine::general_purpose::STANDARD
+                .decode(cp_b64)
+                .map_err(|e| Status::invalid_argument(format!("invalid checkpoint base64: {e}")))?;
+            let cp = bitcoin::Psbt::deserialize(&cp_bytes)
+                .map_err(|e| Status::invalid_argument(format!("invalid checkpoint PSBT: {e}")))?;
+            client_signed_checkpoints.push(cp);
+            // Send checkpoints as-is (with owner FROST sigs), matching reference SDK
+            signed_checkpoint_b64s.push(cp_b64.clone());
+        }
+
+        // Encode signed ark tx as base64
+        let signed_ark_b64 = base64::engine::general_purpose::STANDARD
+            .encode(&signed_ark_psbt.serialize());
+
+        // Submit to ASP
+        let mut asp = asp_arc.lock().await;
+        tracing::info!("[{user_id_hex}] SubmitArkSend: calling asp.submit_tx");
+        let response = asp.submit_tx(signed_ark_b64, signed_checkpoint_b64s).await
+            .map_err(|e| {
+                tracing::error!("[{user_id_hex}] SubmitArkSend: asp.submit_tx failed: {e}");
+                Status::internal(format!("submit_tx: {e}"))
+            })?;
+
+        let ark_txid = response.ark_txid;
+
+        // Counter-sign: merge client FROST sigs onto ASP-returned checkpoints
+        let mut final_checkpoints = Vec::new();
+        for asp_cp_b64 in &response.signed_checkpoint_txs {
+            let asp_cp_bytes = base64::engine::general_purpose::STANDARD
+                .decode(asp_cp_b64)
+                .map_err(|e| Status::internal(format!("invalid ASP checkpoint: {e}")))?;
+            let mut asp_cp = bitcoin::Psbt::deserialize(&asp_cp_bytes)
+                .map_err(|e| Status::internal(format!("invalid ASP checkpoint PSBT: {e}")))?;
+
+            // Find matching client checkpoint by txid
+            let cp_txid = asp_cp.unsigned_tx.compute_txid();
+            if let Some(client_cp) = client_signed_checkpoints.iter()
+                .find(|cp| cp.unsigned_tx.compute_txid() == cp_txid)
+            {
+                // Restore witness_script if stripped by ASP
+                if let Some(ws) = &client_cp.inputs[0].witness_script {
+                    asp_cp.inputs[0].witness_script = Some(ws.clone());
+                }
+                // Restore tap_scripts if stripped
+                if asp_cp.inputs[0].tap_scripts.is_empty() {
+                    asp_cp.inputs[0].tap_scripts = client_cp.inputs[0].tap_scripts.clone();
+                }
+                // Copy client FROST sigs onto ASP-signed checkpoint
+                for ((pk, lh), sig) in &client_cp.inputs[0].tap_script_sigs {
+                    asp_cp.inputs[0].tap_script_sigs.insert((*pk, *lh), sig.clone());
+                }
+            }
+
+            let final_bytes = asp_cp.serialize();
+            final_checkpoints.push(
+                base64::engine::general_purpose::STANDARD.encode(&final_bytes)
+            );
+        }
+
+        // Finalize
+        asp.finalize_tx(ark_txid.clone(), final_checkpoints).await
+            .map_err(|e| Status::internal(format!("finalize_tx: {e}")))?;
+
+        // Compute change VTXO from ark tx
+        let outputs = &signed_ark_psbt.unsigned_tx.output;
+        let (change_txid, change_vout, change_amount) = if outputs.len() >= 3 {
+            let txid = signed_ark_psbt.unsigned_tx.compute_txid().to_string();
+            let idx = (outputs.len() - 2) as u32;
+            let amt = outputs[idx as usize].value.to_sat();
+            (txid, idx, amt)
+        } else {
+            (String::new(), 0, 0)
+        };
+
+        // Update vtxo_store: remove spent, add change
+        let mut store = self.vtxo_store.lock().await;
+        // Compute spent total before removing
+        let spent_total: u64 = store.get(&user_id_hex)
+            .map(|vtxos| vtxos.iter()
+                .filter(|(txid, vout, _, _)| req.spent_outpoints.contains(&format!("{txid}:{vout}")))
+                .map(|(_, _, amount, _)| amount)
+                .sum())
+            .unwrap_or(0);
+        if let Some(user_vtxos) = store.get_mut(&user_id_hex) {
+            user_vtxos.retain(|(txid, vout, _, _)| {
+                let outpoint = format!("{}:{}", txid, vout);
+                !req.spent_outpoints.contains(&outpoint)
+            });
+        }
+        if change_amount > 0 {
+            let exit_delay = {
+                let info = asp.get_info().await
+                    .map_err(|e| Status::internal(format!("get_info: {e}")))?;
+                info.unilateral_exit_delay as u32
+            };
+            store.entry(user_id_hex.clone()).or_default()
+                .push((change_txid.clone(), change_vout, change_amount, exit_delay));
+        }
+
+        tracing::info!(
+            "[{user_id_hex}] SubmitArkSend: ark_txid={ark_txid}, change=({change_txid}, {change_vout}, {change_amount})"
+        );
+        // Persist vtxo_store
+        if let Some(vtxos) = store.get(&user_id_hex) {
+            self.save_user_vtxos(&user_id_hex, vtxos);
+        }
+        let sent_amount = spent_total.saturating_sub(change_amount);
+        self.ark_tx_history.lock().await
+            .entry(user_id_hex.clone()).or_default()
+            .push(ArkTxEntry {
+                tx_type: "send".into(),
+                amount_sats: -(sent_amount as i64),
+                txid: ark_txid.clone(),
+                timestamp: now_secs(),
+            });
+        if let Some(entries) = self.ark_tx_history.lock().await.get(&user_id_hex) {
+            self.save_user_ark_history(&user_id_hex, entries);
+        }
+
+        Ok(Response::new(SubmitArkSendResponse {
+            ark_txid,
+            change_txid,
+            change_vout,
+            change_amount,
+        }))
     }
 }

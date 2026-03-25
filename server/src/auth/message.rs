@@ -26,6 +26,8 @@ pub const OP_SEND_VTXO: &str = "SEND_VTXO";
 pub const OP_REDEEM_VTXO: &str = "REDEEM_VTXO";
 pub const OP_SETTLE: &str = "SETTLE";
 pub const OP_SETTLE_DELEGATE: &str = "SETTLE_DELEGATE";
+pub const OP_LIST_ARK_TXS: &str = "LIST_ARK_TXS";
+pub const OP_CHECK_BOARDING_BALANCE: &str = "CHECK_BOARDING_BALANCE";
 
 const RECOVERY_PREFIX: &str = "MPC_WALLET_RECOVERY_V1";
 
