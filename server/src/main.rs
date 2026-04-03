@@ -50,10 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config from environment
     let cfg = config::ServerConfig::from_environment();
     tracing::info!(
-        "Config: bitcoin_rpc={}, electrum={}:{}",
+        "Config: bitcoin_rpc={}, electrum={}:{}, network={}",
         cfg.bitcoin_rpc_url,
         cfg.electrum_url,
-        cfg.electrum_port
+        cfg.electrum_port,
+        cfg.bitcoin_network
     );
 
     // Initialize persistence

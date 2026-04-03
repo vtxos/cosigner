@@ -2636,8 +2636,10 @@ impl MpcWallet for WalletService {
         tracing::info!("[{user_id_hex}] BroadcastTransaction");
 
         let tx_id = self
-            .bitcoin_rpc
-            .send_raw_transaction(&req.tx_hex)
+            .bitcoin_history
+            .lock()
+            .await
+            .broadcast_transaction(&req.tx_hex)
             .await
             .map_err(|e| Status::internal(format!("broadcast error: {e}")))?;
 

@@ -167,6 +167,17 @@ impl ElectrumClient {
             .ok_or_else(|| "unexpected transaction response".to_string())
     }
 
+    /// Broadcast a raw transaction via Electrum. Returns the txid.
+    pub async fn broadcast_transaction(&self, tx_hex: &str) -> Result<String, String> {
+        let result = self
+            .request("blockchain.transaction.broadcast", &[json!(tx_hex)])
+            .await?;
+        result
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "unexpected broadcast response".to_string())
+    }
+
     /// Get block header hex at a given height.
     pub async fn get_block_header(&self, height: u32) -> Result<String, String> {
         let result = self
