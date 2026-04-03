@@ -14,6 +14,9 @@ pub struct ServerConfig {
     /// ASP (Ark Service Provider) gRPC URL, e.g. "http://localhost:7070".
     /// When empty, Ark RPCs return UNAVAILABLE.
     pub asp_url: String,
+    /// Bitcoin network name (e.g. "regtest", "signet", "testnet", "mainnet").
+    /// Used for logging; the authoritative network comes from the ASP's GetArkInfo.
+    pub bitcoin_network: String,
 }
 
 impl ServerConfig {
@@ -35,6 +38,8 @@ impl ServerConfig {
                 format!("{}/.mpc_wallet/server", home)
             }),
             asp_url: env::var("ASP_URL").unwrap_or_default(),
+            bitcoin_network: env::var("BITCOIN_NETWORK")
+                .unwrap_or_else(|_| "regtest".to_string()),
         }
     }
 }

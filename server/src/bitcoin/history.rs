@@ -19,6 +19,11 @@ impl BitcoinHistoryService {
         }
     }
 
+    /// Broadcast a raw transaction via the Electrum server.
+    pub async fn broadcast_transaction(&self, tx_hex: &str) -> Result<String, String> {
+        self.electrum.broadcast_transaction(tx_hex).await
+    }
+
     /// Connect to Electrum with retry loop.
     pub async fn init(&self) -> Result<(), String> {
         loop {
