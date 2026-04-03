@@ -57,11 +57,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.bitcoin_network
     );
 
-    // Initialize persistence
-    let data_dir = std::path::Path::new(&cfg.data_dir);
-    std::fs::create_dir_all(data_dir)?;
-    let persistence = Arc::new(persistence::PersistenceStore::open(data_dir)?);
-    tracing::info!("Persistence initialized at: {}", cfg.data_dir);
+    // Initialize persistence backend
+    let persistence: Arc<dyn persistence::KvStore> = match cfg.persistence_backend.as_str() {
+        #[cfg(feature = "enclave-backend")]
+        "enclave" => {
+            if cfg.enclave_store_url.is_empty() {
+                panic!("ENCLAVE_STORE_URL must be set when using enclave persistence backend");
+            }
+            tracing::info!("Persistence: enclave at {}", cfg.enclave_store_url);
+            Arc::new(persistence::EnclaveStore::new(cfg.enclave_store_url.clone()))
+        }
+        #[cfg(feature = "sled-backend")]
+        _ => {
+            let data_dir = std::path::Path::new(&cfg.data_dir);
+            std::fs::create_dir_all(data_dir)?;
+            tracing::info!("Persistence: Sled at {}", cfg.data_dir);
+            Arc::new(persistence::SledStore::open(data_dir)?)
+        }
+        #[cfg(not(feature = "sled-backend"))]
+        other => {
+            panic!("Unknown persistence backend: {other}");
+        }
+    };
 
     // Load WASM component
     tracing::info!("Loading WASM component from: {}", args.wasm);

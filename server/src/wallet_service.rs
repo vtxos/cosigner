@@ -16,7 +16,7 @@ use crate::auth::message::*;
 use crate::auth::AuthVerifier;
 use crate::bitcoin::{BitcoinHistoryService, BitcoinRpcClient};
 use crate::crypto_ops;
-use crate::persistence::PersistenceStore;
+use crate::persistence::KvStore;
 use crate::policy::engine::PolicyEngine;
 use crate::policy::{
     NormalPolicy, PolicyState, ProtectedPolicy, SpendingEntry,
@@ -43,7 +43,7 @@ fn now_secs() -> i64 {
 pub struct WalletService {
     pub wasm_manager: Arc<Mutex<WasmManager>>,
     pub auth_verifier: Arc<AuthVerifier>,
-    pub persistence: Arc<PersistenceStore>,
+    pub persistence: Arc<dyn KvStore>,
     pub bitcoin_rpc: Arc<BitcoinRpcClient>,
     pub bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
     pub asp_client: Option<Arc<tokio::sync::Mutex<ark::client::AspClient>>>,
@@ -66,7 +66,7 @@ impl WalletService {
     pub fn new(
         wasm_manager: Arc<Mutex<WasmManager>>,
         auth_verifier: Arc<AuthVerifier>,
-        persistence: Arc<PersistenceStore>,
+        persistence: Arc<dyn KvStore>,
         bitcoin_rpc: Arc<BitcoinRpcClient>,
         bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
         asp_client: Option<ark::client::AspClient>,
@@ -112,59 +112,51 @@ impl WalletService {
             }
         };
 
-        let meta_tree = match self.persistence.tree("ark_meta") {
-            Ok(t) => t,
-            Err(e) => { tracing::warn!("Failed to open ark_meta tree: {e}"); return; }
+        let stored_pubkey = match self.persistence.get("ark_meta", "asp_signer_pubkey") {
+            Ok(v) => v,
+            Err(e) => { tracing::warn!("Failed to read ark_meta: {e}"); return; }
         };
-
-        let stored_pubkey = meta_tree.get("asp_signer_pubkey").unwrap_or(None);
         if let Some(ref stored) = stored_pubkey {
             if stored != &current_pubkey {
                 tracing::warn!(
                     "ASP signer pubkey changed ({stored} -> {current_pubkey}), wiping Ark state"
                 );
                 self.wipe_ark_state();
-                let _ = meta_tree.put("asp_signer_pubkey", &current_pubkey);
+                let _ = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey);
                 return;
             }
         } else {
-            let _ = meta_tree.put("asp_signer_pubkey", &current_pubkey);
+            let _ = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey);
         }
 
         // Load vtxo_store
-        if let Ok(tree) = self.persistence.tree("vtxo_store") {
-            if let Ok(all) = tree.all() {
-                let mut store = self.vtxo_store.lock().await;
-                for (user_id, json) in all {
-                    if let Ok(vtxos) = serde_json::from_str::<Vec<(String, u32, u64, u32)>>(&json) {
-                        tracing::info!("Loaded {} VTXOs for user {user_id}", vtxos.len());
-                        store.insert(user_id, vtxos);
-                    }
+        if let Ok(all) = self.persistence.get_all("vtxo_store") {
+            let mut store = self.vtxo_store.lock().await;
+            for (user_id, json) in all {
+                if let Ok(vtxos) = serde_json::from_str::<Vec<(String, u32, u64, u32)>>(&json) {
+                    tracing::info!("Loaded {} VTXOs for user {user_id}", vtxos.len());
+                    store.insert(user_id, vtxos);
                 }
             }
         }
 
         // Load ark_tx_history
-        if let Ok(tree) = self.persistence.tree("ark_tx_history") {
-            if let Ok(all) = tree.all() {
-                let mut history = self.ark_tx_history.lock().await;
-                for (user_id, json) in all {
-                    if let Ok(entries) = serde_json::from_str::<Vec<ArkTxEntry>>(&json) {
-                        tracing::info!("Loaded {} Ark tx entries for user {user_id}", entries.len());
-                        history.insert(user_id, entries);
-                    }
+        if let Ok(all) = self.persistence.get_all("ark_tx_history") {
+            let mut history = self.ark_tx_history.lock().await;
+            for (user_id, json) in all {
+                if let Ok(entries) = serde_json::from_str::<Vec<ArkTxEntry>>(&json) {
+                    tracing::info!("Loaded {} Ark tx entries for user {user_id}", entries.len());
+                    history.insert(user_id, entries);
                 }
             }
         }
 
         // Load ark_script_to_user
-        if let Ok(tree) = self.persistence.tree("ark_script_to_user") {
-            if let Ok(all) = tree.all() {
-                let mut map = self.ark_script_to_user.lock().await;
-                tracing::info!("Loaded {} script-to-user mappings", all.len());
-                for (script, user_id) in all {
-                    map.insert(script, user_id);
-                }
+        if let Ok(all) = self.persistence.get_all("ark_script_to_user") {
+            let mut map = self.ark_script_to_user.lock().await;
+            tracing::info!("Loaded {} script-to-user mappings", all.len());
+            for (script, user_id) in all {
+                map.insert(script, user_id);
             }
         }
 
@@ -173,37 +165,25 @@ impl WalletService {
 
     fn wipe_ark_state(&self) {
         for tree_name in &["vtxo_store", "ark_tx_history", "ark_script_to_user", "ark_meta"] {
-            if let Ok(tree) = self.persistence.tree(tree_name) {
-                if let Ok(all) = tree.all() {
-                    for key in all.keys() {
-                        let _ = tree.delete(key);
-                    }
-                }
-            }
+            let _ = self.persistence.clear(tree_name);
         }
         tracing::info!("Ark state wiped");
     }
 
     fn save_user_vtxos(&self, user_id_hex: &str, vtxos: &[(String, u32, u64, u32)]) {
-        if let Ok(tree) = self.persistence.tree("vtxo_store") {
-            if let Ok(json) = serde_json::to_string(vtxos) {
-                let _ = tree.put(user_id_hex, &json);
-            }
+        if let Ok(json) = serde_json::to_string(vtxos) {
+            let _ = self.persistence.put("vtxo_store", user_id_hex, &json);
         }
     }
 
     fn save_user_ark_history(&self, user_id_hex: &str, entries: &[ArkTxEntry]) {
-        if let Ok(tree) = self.persistence.tree("ark_tx_history") {
-            if let Ok(json) = serde_json::to_string(entries) {
-                let _ = tree.put(user_id_hex, &json);
-            }
+        if let Ok(json) = serde_json::to_string(entries) {
+            let _ = self.persistence.put("ark_tx_history", user_id_hex, &json);
         }
     }
 
     fn save_script_to_user(&self, script: &str, user_id_hex: &str) {
-        if let Ok(tree) = self.persistence.tree("ark_script_to_user") {
-            let _ = tree.put(script, user_id_hex);
-        }
+        let _ = self.persistence.put("ark_script_to_user", script, user_id_hex);
     }
 
     // -----------------------------------------------------------------------
@@ -469,10 +449,7 @@ impl WalletService {
         }
 
         // Try loading from persistence
-        let tree = self.persistence.tree("policies").map_err(|e| {
-            Status::internal(format!("persistence error: {e}"))
-        })?;
-        if let Ok(Some(json_str)) = tree.get(user_id_hex) {
+        if let Ok(Some(json_str)) = self.persistence.get("policies", user_id_hex) {
             match serde_json::from_str::<PolicyState>(&json_str) {
                 Ok(ps) => {
                     user.policy_state = Some(ps);
@@ -505,20 +482,14 @@ impl WalletService {
             }
         }
 
-        // Try loading all policies from persistence
-        let tree = self.persistence.tree("policies").map_err(|e| {
-            Status::internal(format!("persistence error: {e}"))
-        })?;
-        if let Ok(all) = tree.all() {
-            for (key, json_str) in all {
+        // Look up via secondary index
+        if let Ok(Some(user_id)) = self.persistence.get("policy_recovery_idx", recovery_id_hex) {
+            if let Ok(Some(json_str)) = self.persistence.get("policies", &user_id) {
                 if let Ok(ps) = serde_json::from_str::<PolicyState>(&json_str) {
-                    if ps.recovery_id == recovery_id_hex {
-                        // Load into memory
-                        if let Ok(user) = mgr.get_or_create_user(&key) {
-                            user.policy_state = Some(ps.clone());
-                        }
-                        return Ok(Some(ps));
+                    if let Ok(user) = mgr.get_or_create_user(&user_id) {
+                        user.policy_state = Some(ps.clone());
                     }
+                    return Ok(Some(ps));
                 }
             }
         }
@@ -526,15 +497,16 @@ impl WalletService {
         Ok(None)
     }
 
-    /// Save policy state to persistence.
+    /// Save policy state to persistence (with recovery_id secondary index).
     fn persist_policy(&self, user_id_hex: &str, policy: &PolicyState) -> Result<(), Status> {
         let json = serde_json::to_string(policy)
             .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
-        let tree = self.persistence.tree("policies").map_err(|e| {
-            Status::internal(format!("persistence error: {e}"))
-        })?;
-        tree.put(user_id_hex, &json)
+        self.persistence.put("policies", user_id_hex, &json)
             .map_err(|e| Status::internal(format!("persistence write error: {e}")))?;
+        // Maintain secondary index: recovery_id -> user_id
+        if !policy.recovery_id.is_empty() {
+            let _ = self.persistence.put("policy_recovery_idx", &policy.recovery_id, user_id_hex);
+        }
         Ok(())
     }
 
@@ -1330,15 +1302,14 @@ impl MpcWallet for WalletService {
                     }
                 }
                 if preserved_history.is_empty() {
-                    if let Ok(tree) = self.persistence.tree("policies") {
-                        if let Ok(all) = tree.all() {
-                            for (key, v) in &all {
-                                if let Ok(ps) = serde_json::from_str::<PolicyState>(v) {
-                                    if ps.recovery_id == recovery_id {
-                                        preserved_history = ps.spending_history.clone();
-                                        let _ = tree.delete(key);
-                                        break;
-                                    }
+                    // Look up old policy via recovery index
+                    if let Ok(Some(old_user_id)) = self.persistence.get("policy_recovery_idx", &recovery_id) {
+                        if let Ok(Some(json_str)) = self.persistence.get("policies", &old_user_id) {
+                            if let Ok(ps) = serde_json::from_str::<PolicyState>(&json_str) {
+                                if ps.recovery_id == recovery_id {
+                                    preserved_history = ps.spending_history.clone();
+                                    let _ = self.persistence.delete("policies", &old_user_id);
+                                    let _ = self.persistence.delete("policy_recovery_idx", &recovery_id);
                                 }
                             }
                         }

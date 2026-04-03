@@ -17,6 +17,10 @@ pub struct ServerConfig {
     /// Bitcoin network name (e.g. "regtest", "signet", "testnet", "mainnet").
     /// Used for logging; the authoritative network comes from the ASP's GetArkInfo.
     pub bitcoin_network: String,
+    /// Persistence backend: "sled" (local) or "enclave" (HTTP KV store).
+    pub persistence_backend: String,
+    /// Enclave KV store base URL (only used when persistence_backend = "enclave").
+    pub enclave_store_url: String,
 }
 
 impl ServerConfig {
@@ -40,6 +44,9 @@ impl ServerConfig {
             asp_url: env::var("ASP_URL").unwrap_or_default(),
             bitcoin_network: env::var("BITCOIN_NETWORK")
                 .unwrap_or_else(|_| "regtest".to_string()),
+            persistence_backend: env::var("PERSISTENCE_BACKEND")
+                .unwrap_or_else(|_| "sled".to_string()),
+            enclave_store_url: env::var("ENCLAVE_STORE_URL").unwrap_or_default(),
         }
     }
 }
