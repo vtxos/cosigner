@@ -23,12 +23,10 @@ pub mod wallet_proto {
     about = "MPC Wallet Server with per-user WASM crypto isolation"
 )]
 struct Args {
-    /// Path to the threshold WASM component
-    #[arg(
-        long,
-        default_value = "../cosigner/target/wasm32-wasip1/release/cosigner.wasm"
-    )]
-    wasm: String,
+    /// Path to the cosigner WASM component.
+    /// Falls back to COSIGNER_WASM_PATH env var, then the local build path.
+    #[arg(long)]
+    wasm: Option<String>,
 
     /// gRPC listen port
     #[arg(long, default_value = "50051")]
@@ -58,31 +56,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize persistence backend
-    let persistence: Arc<dyn persistence::KvStore> = match cfg.persistence_backend.as_str() {
-        #[cfg(feature = "enclave-backend")]
-        "enclave" => {
-            if cfg.enclave_store_url.is_empty() {
-                panic!("ENCLAVE_STORE_URL must be set when using enclave persistence backend");
+    let (persistence, secret_store): (Arc<dyn persistence::KvStore>, Arc<dyn persistence::SecretStore>) =
+        match cfg.persistence_backend.as_str() {
+            #[cfg(feature = "enclave-backend")]
+            "enclave" => {
+                tracing::info!("Persistence: enclave supervisor at {}", cfg.supervisor_url);
+                let store = Arc::new(persistence::EnclaveStore::new(
+                    cfg.supervisor_url.clone(),
+                    cfg.enclave_mgmt_token.clone(),
+                ));
+                (store.clone(), store)
             }
-            tracing::info!("Persistence: enclave at {}", cfg.enclave_store_url);
-            Arc::new(persistence::EnclaveStore::new(cfg.enclave_store_url.clone()))
-        }
-        #[cfg(feature = "sled-backend")]
-        _ => {
-            let data_dir = std::path::Path::new(&cfg.data_dir);
-            std::fs::create_dir_all(data_dir)?;
-            tracing::info!("Persistence: Sled at {}", cfg.data_dir);
-            Arc::new(persistence::SledStore::open(data_dir)?)
-        }
-        #[cfg(not(feature = "sled-backend"))]
-        other => {
-            panic!("Unknown persistence backend: {other}");
-        }
-    };
+            #[cfg(feature = "sled-backend")]
+            _ => {
+                let data_dir = std::path::Path::new(&cfg.data_dir);
+                std::fs::create_dir_all(data_dir)?;
+                tracing::info!("Persistence: Sled at {}", cfg.data_dir);
+                let store = Arc::new(persistence::SledStore::open(data_dir)?);
+                (store.clone(), store)
+            }
+            #[cfg(not(feature = "sled-backend"))]
+            other => {
+                panic!("Unknown persistence backend: {other}");
+            }
+        };
 
-    // Load WASM component
-    tracing::info!("Loading WASM component from: {}", args.wasm);
-    let manager = wasm_manager::WasmManager::new(&args.wasm)?;
+    // Load WASM component: CLI --wasm > COSIGNER_WASM_PATH env > default
+    let wasm_source = args.wasm.unwrap_or(cfg.cosigner_wasm_path.clone());
+    let wasm_path = if wasm_source.starts_with("http://") || wasm_source.starts_with("https://") {
+        tracing::info!("Downloading WASM component from: {}", wasm_source);
+        let wasm_dir = std::path::Path::new(&cfg.data_dir).join("wasm");
+        std::fs::create_dir_all(&wasm_dir)?;
+        let local_path = wasm_dir.join("cosigner.wasm");
+        let bytes = reqwest::get(&wasm_source)
+            .await?
+            .error_for_status()
+            .map_err(|e| format!("Failed to download WASM: {e}"))?
+            .bytes()
+            .await?;
+        std::fs::write(&local_path, &bytes)?;
+        tracing::info!("Downloaded {} bytes to {}", bytes.len(), local_path.display());
+        local_path.to_string_lossy().into_owned()
+    } else {
+        wasm_source
+    };
+    tracing::info!("Loading WASM component from: {}", wasm_path);
+    let manager = wasm_manager::WasmManager::new(&wasm_path)?;
 
     // Initialize Bitcoin services
     let bitcoin_rpc = Arc::new(bitcoin::BitcoinRpcClient::new(
@@ -132,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager,
         auth_verifier,
         persistence,
+        secret_store,
         bitcoin_rpc,
         bitcoin_history,
         asp_client,

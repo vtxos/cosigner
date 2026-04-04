@@ -38,3 +38,19 @@ pub trait KvStore: Send + Sync + 'static {
     /// Delete all keys in a named tree.
     fn clear(&self, tree: &str) -> Result<(), PersistenceError>;
 }
+
+/// Trait for storing sensitive secrets separately from general KV data.
+///
+/// In the enclave, this maps to the supervisor's `/v1/secrets/` API which
+/// provides stricter access controls. For local dev (Sled), secrets are
+/// stored in a dedicated `_secrets` tree.
+pub trait SecretStore: Send + Sync + 'static {
+    /// Get a secret value by name.
+    fn get_secret(&self, name: &str) -> Result<Option<String>, PersistenceError>;
+
+    /// Store a secret value.
+    fn put_secret(&self, name: &str, value: &str) -> Result<(), PersistenceError>;
+
+    /// Delete a secret.
+    fn delete_secret(&self, name: &str) -> Result<(), PersistenceError>;
+}

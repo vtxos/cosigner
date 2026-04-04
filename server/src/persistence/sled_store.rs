@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::traits::{KvStore, PersistenceError};
+use super::traits::{KvStore, PersistenceError, SecretStore};
 
 /// Sled-based key-value persistence store for local development and testing.
 pub struct SledStore {
@@ -54,5 +54,19 @@ impl KvStore for SledStore {
         let tree = self.db.open_tree(tree).map_err(|e| PersistenceError::Backend(e.to_string()))?;
         tree.clear().map_err(|e| PersistenceError::Backend(e.to_string()))?;
         Ok(())
+    }
+}
+
+impl SecretStore for SledStore {
+    fn get_secret(&self, name: &str) -> Result<Option<String>, PersistenceError> {
+        self.get("_secrets", name)
+    }
+
+    fn put_secret(&self, name: &str, value: &str) -> Result<(), PersistenceError> {
+        self.put("_secrets", name, value)
+    }
+
+    fn delete_secret(&self, name: &str) -> Result<(), PersistenceError> {
+        self.delete("_secrets", name)
     }
 }

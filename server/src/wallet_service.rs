@@ -16,7 +16,7 @@ use crate::auth::message::*;
 use crate::auth::AuthVerifier;
 use crate::bitcoin::{BitcoinHistoryService, BitcoinRpcClient};
 use crate::crypto_ops;
-use crate::persistence::KvStore;
+use crate::persistence::{KvStore, SecretStore};
 use crate::policy::engine::PolicyEngine;
 use crate::policy::{
     NormalPolicy, PolicyState, ProtectedPolicy, SpendingEntry,
@@ -44,6 +44,7 @@ pub struct WalletService {
     pub wasm_manager: Arc<Mutex<WasmManager>>,
     pub auth_verifier: Arc<AuthVerifier>,
     pub persistence: Arc<dyn KvStore>,
+    pub secret_store: Arc<dyn SecretStore>,
     pub bitcoin_rpc: Arc<BitcoinRpcClient>,
     pub bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
     pub asp_client: Option<Arc<tokio::sync::Mutex<ark::client::AspClient>>>,
@@ -67,6 +68,7 @@ impl WalletService {
         wasm_manager: Arc<Mutex<WasmManager>>,
         auth_verifier: Arc<AuthVerifier>,
         persistence: Arc<dyn KvStore>,
+        secret_store: Arc<dyn SecretStore>,
         bitcoin_rpc: Arc<BitcoinRpcClient>,
         bitcoin_history: Arc<tokio::sync::Mutex<BitcoinHistoryService>>,
         asp_client: Option<ark::client::AspClient>,
@@ -75,6 +77,7 @@ impl WalletService {
             wasm_manager,
             auth_verifier,
             persistence,
+            secret_store,
             bitcoin_rpc,
             bitcoin_history,
             asp_client: asp_client.map(|c| Arc::new(tokio::sync::Mutex::new(c))),
@@ -451,7 +454,13 @@ impl WalletService {
         // Try loading from persistence
         if let Ok(Some(json_str)) = self.persistence.get("policies", user_id_hex) {
             match serde_json::from_str::<PolicyState>(&json_str) {
-                Ok(ps) => {
+                Ok(mut ps) => {
+                    // Load DKG secret from SecretStore (skipped in JSON)
+                    if let Ok(Some(secret)) = self.secret_store.get_secret(
+                        &format!("dkg_secret/{user_id_hex}"),
+                    ) {
+                        ps.server_dkg_secret_hex = Some(secret);
+                    }
                     user.policy_state = Some(ps);
                     tracing::info!("[{user_id_hex}] Loaded policy from persistence");
                     return Ok(());
@@ -485,7 +494,13 @@ impl WalletService {
         // Look up via secondary index
         if let Ok(Some(user_id)) = self.persistence.get("policy_recovery_idx", recovery_id_hex) {
             if let Ok(Some(json_str)) = self.persistence.get("policies", &user_id) {
-                if let Ok(ps) = serde_json::from_str::<PolicyState>(&json_str) {
+                if let Ok(mut ps) = serde_json::from_str::<PolicyState>(&json_str) {
+                    // Load DKG secret from SecretStore
+                    if let Ok(Some(secret)) = self.secret_store.get_secret(
+                        &format!("dkg_secret/{user_id}"),
+                    ) {
+                        ps.server_dkg_secret_hex = Some(secret);
+                    }
                     if let Ok(user) = mgr.get_or_create_user(&user_id) {
                         user.policy_state = Some(ps.clone());
                     }
@@ -498,6 +513,7 @@ impl WalletService {
     }
 
     /// Save policy state to persistence (with recovery_id secondary index).
+    /// DKG secret is stored separately via SecretStore.
     fn persist_policy(&self, user_id_hex: &str, policy: &PolicyState) -> Result<(), Status> {
         let json = serde_json::to_string(policy)
             .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
@@ -506,6 +522,13 @@ impl WalletService {
         // Maintain secondary index: recovery_id -> user_id
         if !policy.recovery_id.is_empty() {
             let _ = self.persistence.put("policy_recovery_idx", &policy.recovery_id, user_id_hex);
+        }
+        // Store DKG secret separately via SecretStore
+        if let Some(ref secret) = policy.server_dkg_secret_hex {
+            let _ = self.secret_store.put_secret(
+                &format!("dkg_secret/{user_id_hex}"),
+                secret,
+            );
         }
         Ok(())
     }
@@ -1310,6 +1333,7 @@ impl MpcWallet for WalletService {
                                     preserved_history = ps.spending_history.clone();
                                     let _ = self.persistence.delete("policies", &old_user_id);
                                     let _ = self.persistence.delete("policy_recovery_idx", &recovery_id);
+                                    let _ = self.secret_store.delete_secret(&format!("dkg_secret/{old_user_id}"));
                                 }
                             }
                         }

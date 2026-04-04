@@ -19,8 +19,12 @@ pub struct ServerConfig {
     pub bitcoin_network: String,
     /// Persistence backend: "sled" (local) or "enclave" (HTTP KV store).
     pub persistence_backend: String,
-    /// Enclave KV store base URL (only used when persistence_backend = "enclave").
-    pub enclave_store_url: String,
+    /// Enclave supervisor base URL (only used when persistence_backend = "enclave").
+    pub supervisor_url: String,
+    /// Enclave management token for supervisor API auth.
+    pub enclave_mgmt_token: String,
+    /// Path to the cosigner WASM component file.
+    pub cosigner_wasm_path: String,
 }
 
 impl ServerConfig {
@@ -46,7 +50,11 @@ impl ServerConfig {
                 .unwrap_or_else(|_| "regtest".to_string()),
             persistence_backend: env::var("PERSISTENCE_BACKEND")
                 .unwrap_or_else(|_| "sled".to_string()),
-            enclave_store_url: env::var("ENCLAVE_STORE_URL").unwrap_or_default(),
+            supervisor_url: env::var("SUPERVISOR_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:7073".to_string()),
+            enclave_mgmt_token: env::var("ENCLAVE_MGMT_TOKEN").unwrap_or_default(),
+            cosigner_wasm_path: env::var("COSIGNER_WASM_PATH")
+                .unwrap_or_else(|_| "../cosigner/target/wasm32-wasip1/release/cosigner.wasm".to_string()),
         }
     }
 }
