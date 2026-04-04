@@ -14,11 +14,13 @@ pub struct AspClient {
 }
 
 impl AspClient {
-    /// Connect to an ASP at the given URL (e.g. "http://localhost:7070").
+    /// Connect to an ASP at the given URL (e.g. "http://localhost:7070" or "https://asp.example.com").
     pub async fn connect(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let channel = Channel::from_shared(url.to_string())?
-            .connect()
-            .await?;
+        let mut endpoint = Channel::from_shared(url.to_string())?;
+        if url.starts_with("https://") {
+            endpoint = endpoint.tls_config(tonic::transport::ClientTlsConfig::new().with_webpki_roots())?;
+        }
+        let channel = endpoint.connect().await?;
         Ok(Self {
             inner: ArkServiceClient::new(channel),
             info: None,

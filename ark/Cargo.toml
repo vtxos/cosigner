@@ -13,7 +13,7 @@ threshold = { path = "../threshold" }
 ark-core = { version = "0.8", optional = true }
 bitcoin = { version = "0.32", features = ["serde"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
-tonic = { version = "0.12", optional = true }
+tonic = { version = "0.12", optional = true, features = ["tls-webpki-roots"] }
 prost = { version = "0.13", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

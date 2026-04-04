@@ -613,6 +613,11 @@ impl SettleSession {
         asp: &mut AspClient,
         event: proto::TreeSigningStartedEvent,
     ) -> Result<(), String> {
+        // Use batch_id from BatchStarted if available, otherwise fall back to
+        // the TreeSigningStarted event id (public ASPs may skip BatchStarted).
+        if self.batch_id.is_none() {
+            self.batch_id = Some(event.id.clone());
+        }
         let batch_id = self.batch_id.as_ref().ok_or("no batch_id set")?.clone();
 
         // Decode the unsigned commitment PSBT.
@@ -1470,7 +1475,7 @@ fn parse_network(network: &str) -> Result<Network, String> {
     match network {
         "bitcoin" | "mainnet" => Ok(Network::Bitcoin),
         "testnet" | "testnet3" => Ok(Network::Testnet),
-        "signet" => Ok(Network::Signet),
+        "signet" | "mutinynet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
         _ => Err(format!("unknown network: {network}")),
     }
