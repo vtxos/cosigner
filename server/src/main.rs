@@ -4,6 +4,7 @@ mod config;
 mod crypto_ops;
 mod persistence;
 mod policy;
+mod rest_api;
 mod wallet_service;
 mod wasm_manager;
 
@@ -28,9 +29,13 @@ struct Args {
     #[arg(long)]
     wasm: Option<String>,
 
-    /// gRPC listen port
-    #[arg(long, default_value = "50051")]
-    port: u16,
+    /// gRPC listen port (legacy, optional). If not set, gRPC is disabled.
+    #[arg(long)]
+    grpc_port: Option<u16>,
+
+    /// REST/JSON listen port (HTTP/1.1). Defaults to PORT env var or 7074.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -168,15 +173,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let addr = format!("0.0.0.0:{}", args.port).parse()?;
-    tracing::info!("MPC Wallet Server listening on {}", addr);
+    // Start legacy gRPC server if --grpc-port is set
+    if let Some(grpc_port) = args.grpc_port {
+        let grpc_addr = format!("0.0.0.0:{grpc_port}").parse()?;
+        tracing::info!("gRPC server listening on {grpc_addr}");
+        let grpc_service = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Server::builder()
+                .accept_http1(true)
+                .add_service(tonic_web::enable(
+                    wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(grpc_service),
+                ))
+                .serve(grpc_addr)
+                .await
+            {
+                tracing::error!("gRPC server error: {e}");
+            }
+        });
+    }
 
-    Server::builder()
-        .add_service(
-            wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(service),
-        )
-        .serve(addr)
-        .await?;
+    // REST API (primary)
+    let rest_port = args.port.unwrap_or_else(|| {
+        std::env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7074)
+    });
+    let rest_app = axum::Router::new()
+        .nest("/api", rest_api::routes(service.clone()))
+        .layer(tower_http::cors::CorsLayer::permissive());
+    let rest_addr = format!("0.0.0.0:{rest_port}");
+    tracing::info!("MPC Wallet Server listening on {rest_addr} (REST/HTTP1.1)");
+    let listener = tokio::net::TcpListener::bind(&rest_addr).await?;
+    axum::serve(listener, rest_app).await?;
 
     Ok(())
 }
