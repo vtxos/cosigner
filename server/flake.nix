@@ -59,7 +59,13 @@
             hash = appCfg.nix_hash;
           };
 
+          cargoRoot = "server";
+          buildAndTestSubdir = "server";
+
           cargoHash = if appCfg.nix_vendor_hash == "" then "" else appCfg.nix_vendor_hash;
+
+          nativeBuildInputs = with pkgs; [ pkg-config protobuf ];
+          buildInputs = with pkgs; [ openssl ];
 
           doCheck = false;
 
