@@ -4,6 +4,7 @@ mod config;
 mod crypto_ops;
 mod persistence;
 mod policy;
+mod rest_api;
 mod wallet_service;
 mod wasm_manager;
 
@@ -23,16 +24,18 @@ pub mod wallet_proto {
     about = "MPC Wallet Server with per-user WASM crypto isolation"
 )]
 struct Args {
-    /// Path to the threshold WASM component
-    #[arg(
-        long,
-        default_value = "../cosigner/target/wasm32-wasip1/release/cosigner.wasm"
-    )]
-    wasm: String,
+    /// Path to the cosigner WASM component.
+    /// Falls back to COSIGNER_WASM_PATH env var, then the local build path.
+    #[arg(long)]
+    wasm: Option<String>,
 
-    /// gRPC listen port
-    #[arg(long, default_value = "50051")]
-    port: u16,
+    /// gRPC listen port (legacy, optional). If not set, gRPC is disabled.
+    #[arg(long)]
+    grpc_port: Option<u16>,
+
+    /// REST/JSON listen port (HTTP/1.1). Defaults to PORT env var or 7074.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[tokio::main]
@@ -50,21 +53,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load config from environment
     let cfg = config::ServerConfig::from_environment();
     tracing::info!(
-        "Config: bitcoin_rpc={}, electrum={}:{}",
+        "Config: bitcoin_rpc={}, electrum={}:{}, network={}",
         cfg.bitcoin_rpc_url,
         cfg.electrum_url,
-        cfg.electrum_port
+        cfg.electrum_port,
+        cfg.bitcoin_network
     );
 
-    // Initialize persistence
-    let data_dir = std::path::Path::new(&cfg.data_dir);
-    std::fs::create_dir_all(data_dir)?;
-    let persistence = Arc::new(persistence::PersistenceStore::open(data_dir)?);
-    tracing::info!("Persistence initialized at: {}", cfg.data_dir);
+    // Initialize persistence backend
+    let (persistence, secret_store): (Arc<dyn persistence::KvStore>, Arc<dyn persistence::SecretStore>) =
+        match cfg.persistence_backend.as_str() {
+            #[cfg(feature = "enclave-backend")]
+            "enclave" => {
+                tracing::info!("Persistence: enclave supervisor at {}", cfg.supervisor_url);
+                let store = Arc::new(persistence::EnclaveStore::new(
+                    cfg.supervisor_url.clone(),
+                    cfg.enclave_mgmt_token.clone(),
+                ));
+                (store.clone(), store)
+            }
+            #[cfg(feature = "sled-backend")]
+            _ => {
+                let data_dir = std::path::Path::new(&cfg.data_dir);
+                std::fs::create_dir_all(data_dir)?;
+                tracing::info!("Persistence: Sled at {}", cfg.data_dir);
+                let store = Arc::new(persistence::SledStore::open(data_dir)?);
+                (store.clone(), store)
+            }
+            #[cfg(not(feature = "sled-backend"))]
+            other => {
+                panic!("Unknown persistence backend: {other}");
+            }
+        };
 
-    // Load WASM component
-    tracing::info!("Loading WASM component from: {}", args.wasm);
-    let manager = wasm_manager::WasmManager::new(&args.wasm)?;
+    // Load WASM component: CLI --wasm > COSIGNER_WASM_PATH env > default
+    let wasm_source = args.wasm.unwrap_or(cfg.cosigner_wasm_path.clone());
+    let wasm_path = if wasm_source.starts_with("http://") || wasm_source.starts_with("https://") {
+        tracing::info!("Downloading WASM component from: {}", wasm_source);
+        let wasm_dir = std::path::Path::new(&cfg.data_dir).join("wasm");
+        std::fs::create_dir_all(&wasm_dir)?;
+        let local_path = wasm_dir.join("cosigner.wasm");
+        let bytes = reqwest::get(&wasm_source)
+            .await?
+            .error_for_status()
+            .map_err(|e| format!("Failed to download WASM: {e}"))?
+            .bytes()
+            .await?;
+        std::fs::write(&local_path, &bytes)?;
+        tracing::info!("Downloaded {} bytes to {}", bytes.len(), local_path.display());
+        local_path.to_string_lossy().into_owned()
+    } else {
+        wasm_source
+    };
+    tracing::info!("Loading WASM component from: {}", wasm_path);
+    let manager = wasm_manager::WasmManager::new(&wasm_path)?;
 
     // Initialize Bitcoin services
     let bitcoin_rpc = Arc::new(bitcoin::BitcoinRpcClient::new(
@@ -114,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager,
         auth_verifier,
         persistence,
+        secret_store,
         bitcoin_rpc,
         bitcoin_history,
         asp_client,
@@ -130,15 +173,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let addr = format!("0.0.0.0:{}", args.port).parse()?;
-    tracing::info!("MPC Wallet Server listening on {}", addr);
+    // Start legacy gRPC server if --grpc-port is set
+    if let Some(grpc_port) = args.grpc_port {
+        let grpc_addr = format!("0.0.0.0:{grpc_port}").parse()?;
+        tracing::info!("gRPC server listening on {grpc_addr}");
+        let grpc_service = service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = Server::builder()
+                .accept_http1(true)
+                .add_service(tonic_web::enable(
+                    wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(grpc_service),
+                ))
+                .serve(grpc_addr)
+                .await
+            {
+                tracing::error!("gRPC server error: {e}");
+            }
+        });
+    }
 
-    Server::builder()
-        .add_service(
-            wallet_proto::mpc_wallet_server::MpcWalletServer::from_arc(service),
-        )
-        .serve(addr)
-        .await?;
+    // REST API (primary)
+    let rest_port = args.port.unwrap_or_else(|| {
+        std::env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7074)
+    });
+    let rest_app = axum::Router::new()
+        .nest("/api", rest_api::routes(service.clone()))
+        .layer(tower_http::cors::CorsLayer::permissive());
+    let rest_addr = format!("0.0.0.0:{rest_port}");
+    tracing::info!("MPC Wallet Server listening on {rest_addr} (REST/HTTP1.1)");
+    let listener = tokio::net::TcpListener::bind(&rest_addr).await?;
+    axum::serve(listener, rest_app).await?;
 
     Ok(())
 }

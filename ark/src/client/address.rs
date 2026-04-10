@@ -84,7 +84,7 @@ pub fn parse_network(network: &str) -> Result<Network, String> {
     match network {
         "bitcoin" | "mainnet" => Ok(Network::Bitcoin),
         "testnet" | "testnet3" => Ok(Network::Testnet),
-        "signet" => Ok(Network::Signet),
+        "signet" | "mutinynet" => Ok(Network::Signet),
         "regtest" => Ok(Network::Regtest),
         _ => Err(format!("unknown network: {network}")),
     }

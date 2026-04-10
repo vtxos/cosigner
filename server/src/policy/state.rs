@@ -11,7 +11,8 @@ pub struct PolicyState {
     /// when the wallet is a passive receiver).
     pub user_signing_identifier_hex: Option<String>,
     /// Server's original DKG secret (hex-encoded 32-byte scalar).
-    /// Persisted for wallet restore.
+    /// Persisted separately via SecretStore (not included in storage JSON).
+    #[serde(skip)]
     pub server_dkg_secret_hex: Option<String>,
     /// Normal (default) spending policy.
     pub normal_policy: NormalPolicy,
