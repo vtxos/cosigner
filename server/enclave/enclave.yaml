@@ -7,16 +7,15 @@ region: us-east-1                # AWS region
 account: "043673801220"                      # AWS account ID (required)
 prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name})
 instance_type: m6i.xlarge        # EC2 instance type
-nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
 # SDK coordinates for the enclave supervisor binary.
 # The supervisor handles attestation, secrets, PCR extension, and signing
 # middleware automatically. Your app is a plain HTTP server with zero SDK imports.
 sdk:
-  rev: "v0.0.64"
-  hash: "sha256-b+TF+Nz2sOXUd35DRR/5ynr+0ccARfNPs3dEkp+1avo="
-  vendor_hash: "sha256-nj/KWLaYuxV67ytwoX5YnnWlGzsTKrm8TL7EpLPAC40="
+  rev: "v0.0.68"
+  hash: "sha256-/5YoFEHiKJ01XrzGTTlco+EXZzYFTlsLq2cD5DuaMd4="
+  vendor_hash: "sha256-txUyJGwLZWTMfYZXhruNnEKhC13LKqu1XsT6xlhzJxs="
 
 app:
   language: "rust"               # App language: go, nodejs, dotnet, rust
@@ -32,7 +31,12 @@ app:
   nix_vendor_hash: "sha256-DYo9etpmdBOCoGbW3+HxoUXYOE00qBVcOb+AeYAwAP0="            # Go vendor hash (required)
   nix_sub_packages:              # Go sub-packages to build
     - "."
+  nix_subdir: "server"                 # Subdirectory for monorepo (e.g. "server")
   binary_name: ""                # Output binary name (defaults to 'name')
+
+  # Extra nixpkgs attrs added to the build sandbox.
+  nix_build_inputs: ["openssl"]
+  nix_native_build_inputs: ["pkg-config", "protobuf"]
 
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}
