@@ -125,11 +125,15 @@ impl WalletService {
                     "ASP signer pubkey changed ({stored} -> {current_pubkey}), wiping Ark state"
                 );
                 self.wipe_ark_state();
-                let _ = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey);
+                if let Err(e) = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey) {
+                    tracing::warn!("persist ark_meta/asp_signer_pubkey failed: {e}");
+                }
                 return;
             }
         } else {
-            let _ = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey);
+            if let Err(e) = self.persistence.put("ark_meta", "asp_signer_pubkey", &current_pubkey) {
+                tracing::warn!("persist ark_meta/asp_signer_pubkey failed: {e}");
+            }
         }
 
         // Load vtxo_store
@@ -168,25 +172,33 @@ impl WalletService {
 
     fn wipe_ark_state(&self) {
         for tree_name in &["vtxo_store", "ark_tx_history", "ark_script_to_user", "ark_meta"] {
-            let _ = self.persistence.clear(tree_name);
+            if let Err(e) = self.persistence.clear(tree_name) {
+                tracing::warn!("clear {tree_name} failed: {e}");
+            }
         }
         tracing::info!("Ark state wiped");
     }
 
     fn save_user_vtxos(&self, user_id_hex: &str, vtxos: &[(String, u32, u64, u32)]) {
         if let Ok(json) = serde_json::to_string(vtxos) {
-            let _ = self.persistence.put("vtxo_store", user_id_hex, &json);
+            if let Err(e) = self.persistence.put("vtxo_store", user_id_hex, &json) {
+                tracing::warn!("persist vtxo_store/{user_id_hex} failed: {e}");
+            }
         }
     }
 
     fn save_user_ark_history(&self, user_id_hex: &str, entries: &[ArkTxEntry]) {
         if let Ok(json) = serde_json::to_string(entries) {
-            let _ = self.persistence.put("ark_tx_history", user_id_hex, &json);
+            if let Err(e) = self.persistence.put("ark_tx_history", user_id_hex, &json) {
+                tracing::warn!("persist ark_tx_history/{user_id_hex} failed: {e}");
+            }
         }
     }
 
     fn save_script_to_user(&self, script: &str, user_id_hex: &str) {
-        let _ = self.persistence.put("ark_script_to_user", script, user_id_hex);
+        if let Err(e) = self.persistence.put("ark_script_to_user", script, user_id_hex) {
+            tracing::warn!("persist ark_script_to_user/{script} failed: {e}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -438,6 +450,7 @@ impl WalletService {
     }
 
     /// Load policy state from UserInstance or persistence.
+    #[tracing::instrument(skip(self, mgr), fields(user_id = %user_id_hex))]
     fn load_policy_state(
         &self,
         mgr: &mut WasmManager,
@@ -477,6 +490,7 @@ impl WalletService {
     }
 
     /// Find a policy by recovery_id across all users.
+    #[tracing::instrument(skip(self, mgr), fields(recovery_id = %recovery_id_hex))]
     fn find_policy_by_recovery_id(
         &self,
         mgr: &mut WasmManager,
@@ -514,6 +528,7 @@ impl WalletService {
 
     /// Save policy state to persistence (with recovery_id secondary index).
     /// DKG secret is stored separately via SecretStore.
+    #[tracing::instrument(skip(self, policy), fields(user_id = %user_id_hex))]
     fn persist_policy(&self, user_id_hex: &str, policy: &PolicyState) -> Result<(), Status> {
         let json = serde_json::to_string(policy)
             .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
@@ -521,14 +536,18 @@ impl WalletService {
             .map_err(|e| Status::internal(format!("persistence write error: {e}")))?;
         // Maintain secondary index: recovery_id -> user_id
         if !policy.recovery_id.is_empty() {
-            let _ = self.persistence.put("policy_recovery_idx", &policy.recovery_id, user_id_hex);
+            if let Err(e) = self.persistence.put("policy_recovery_idx", &policy.recovery_id, user_id_hex) {
+                tracing::warn!("persist policy_recovery_idx/{} failed: {e}", policy.recovery_id);
+            }
         }
         // Store DKG secret separately via SecretStore
         if let Some(ref secret) = policy.server_dkg_secret_hex {
-            let _ = self.secret_store.put_secret(
+            if let Err(e) = self.secret_store.put_secret(
                 &format!("dkg_secret/{user_id_hex}"),
                 secret,
-            );
+            ) {
+                tracing::error!("persist dkg_secret/{user_id_hex} failed: {e} — wallet may not be restorable");
+            }
         }
         Ok(())
     }
@@ -1331,9 +1350,15 @@ impl MpcWallet for WalletService {
                             if let Ok(ps) = serde_json::from_str::<PolicyState>(&json_str) {
                                 if ps.recovery_id == recovery_id {
                                     preserved_history = ps.spending_history.clone();
-                                    let _ = self.persistence.delete("policies", &old_user_id);
-                                    let _ = self.persistence.delete("policy_recovery_idx", &recovery_id);
-                                    let _ = self.secret_store.delete_secret(&format!("dkg_secret/{old_user_id}"));
+                                    if let Err(e) = self.persistence.delete("policies", &old_user_id) {
+                                        tracing::warn!("delete policies/{old_user_id} failed: {e}");
+                                    }
+                                    if let Err(e) = self.persistence.delete("policy_recovery_idx", &recovery_id) {
+                                        tracing::warn!("delete policy_recovery_idx/{recovery_id} failed: {e}");
+                                    }
+                                    if let Err(e) = self.secret_store.delete_secret(&format!("dkg_secret/{old_user_id}")) {
+                                        tracing::warn!("delete dkg_secret/{old_user_id} failed: {e}");
+                                    }
                                 }
                             }
                         }
