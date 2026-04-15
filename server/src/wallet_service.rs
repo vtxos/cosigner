@@ -528,12 +528,16 @@ impl WalletService {
 
     /// Save policy state to persistence (with recovery_id secondary index).
     /// DKG secret is stored separately via SecretStore.
-    #[tracing::instrument(skip(self, policy), fields(user_id = %user_id_hex))]
+    #[tracing::instrument(skip(self, policy), fields(user_id = %user_id_hex, policy_bytes), err)]
     fn persist_policy(&self, user_id_hex: &str, policy: &PolicyState) -> Result<(), Status> {
         let json = serde_json::to_string(policy)
             .map_err(|e| Status::internal(format!("serialization error: {e}")))?;
+        tracing::Span::current().record("policy_bytes", json.len());
         self.persistence.put("policies", user_id_hex, &json)
-            .map_err(|e| Status::internal(format!("persistence write error: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, user_id = %user_id_hex, "persistence put policies failed");
+                Status::internal(format!("persistence write error: {e}"))
+            })?;
         // Maintain secondary index: recovery_id -> user_id
         if !policy.recovery_id.is_empty() {
             if let Err(e) = self.persistence.put("policy_recovery_idx", &policy.recovery_id, user_id_hex) {
@@ -761,6 +765,7 @@ impl MpcWallet for WalletService {
     // DKG
     // -----------------------------------------------------------------------
 
+    #[tracing::instrument(skip_all, name = "svc::dkg_step1", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn dkg_step1(
         &self,
         request: Request<DkgStep1Request>,
@@ -974,6 +979,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::dkg_step2", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn dkg_step2(
         &self,
         request: Request<DkgStep2Request>,
@@ -1093,6 +1099,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::dkg_step3", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn dkg_step3(
         &self,
         request: Request<DkgStep3Request>,
@@ -1406,6 +1413,7 @@ impl MpcWallet for WalletService {
     // Signing
     // -----------------------------------------------------------------------
 
+    #[tracing::instrument(skip_all, name = "svc::sign_step1", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn sign_step1(
         &self,
         request: Request<SignStep1Request>,
@@ -1656,6 +1664,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::sign_step2", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn sign_step2(
         &self,
         request: Request<SignStep2Request>,
@@ -1886,6 +1895,7 @@ impl MpcWallet for WalletService {
     // Refresh
     // -----------------------------------------------------------------------
 
+    #[tracing::instrument(skip_all, name = "svc::refresh_step1", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn refresh_step1(
         &self,
         request: Request<RefreshStep1Request>,
@@ -2094,6 +2104,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::refresh_step2", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn refresh_step2(
         &self,
         request: Request<RefreshStep2Request>,
@@ -2214,6 +2225,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::refresh_step3", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn refresh_step3(
         &self,
         request: Request<RefreshStep3Request>,
@@ -2462,6 +2474,7 @@ impl MpcWallet for WalletService {
         ))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::get_policy_id", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn get_policy_id(
         &self,
         request: Request<GetPolicyIdRequest>,
@@ -2507,6 +2520,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(GetPolicyIdResponse { policy_id }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::update_policy", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn update_policy(
         &self,
         request: Request<UpdatePolicyRequest>,
@@ -2587,6 +2601,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(UpdatePolicyResponse { success: true }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::delete_policy", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn delete_policy(
         &self,
         request: Request<DeletePolicyRequest>,
@@ -2646,6 +2661,7 @@ impl MpcWallet for WalletService {
     // Bitcoin
     // -----------------------------------------------------------------------
 
+    #[tracing::instrument(skip_all, name = "svc::broadcast_transaction", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn broadcast_transaction(
         &self,
         request: Request<BroadcastTransactionRequest>,
@@ -2668,6 +2684,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(BroadcastTransactionResponse { tx_id }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::fetch_history", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn fetch_history(
         &self,
         request: Request<FetchHistoryRequest>,
@@ -2753,6 +2770,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::fetch_recent_transactions", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn fetch_recent_transactions(
         &self,
         request: Request<FetchRecentTransactionsRequest>,
@@ -2873,6 +2891,7 @@ impl MpcWallet for WalletService {
     // Ark
     // -----------------------------------------------------------------------
 
+    #[tracing::instrument(skip_all, name = "svc::get_ark_info", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn get_ark_info(
         &self,
         request: Request<GetArkInfoRequest>,
@@ -2900,6 +2919,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::get_ark_address", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn get_ark_address(
         &self,
         request: Request<GetArkAddressRequest>,
@@ -2951,6 +2971,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::get_boarding_address", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn get_boarding_address(
         &self,
         request: Request<GetBoardingAddressRequest>,
@@ -2988,6 +3009,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::check_boarding_balance", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn check_boarding_balance(
         &self,
         request: Request<CheckBoardingBalanceRequest>,
@@ -3036,6 +3058,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::list_vtxos", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn list_vtxos(
         &self,
         request: Request<ListVtxosRequest>,
@@ -3074,6 +3097,7 @@ impl MpcWallet for WalletService {
         }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::list_ark_transactions", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn list_ark_transactions(
         &self,
         request: Request<ListArkTransactionsRequest>,
@@ -3095,6 +3119,7 @@ impl MpcWallet for WalletService {
         Ok(Response::new(ListArkTransactionsResponse { transactions }))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::send_vtxo", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn send_vtxo(
         &self,
         request: Request<SendVtxoRequest>,
@@ -3293,6 +3318,7 @@ impl MpcWallet for WalletService {
         }
     }
 
+    #[tracing::instrument(skip_all, name = "svc::redeem_vtxo", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn redeem_vtxo(
         &self,
         request: Request<RedeemVtxoRequest>,
@@ -3306,6 +3332,7 @@ impl MpcWallet for WalletService {
         Err(Status::unimplemented("RedeemVtxo not yet implemented"))
     }
 
+    #[tracing::instrument(skip_all, name = "svc::settle", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn settle(
         &self,
         request: Request<SettleRequest>,
@@ -3549,6 +3576,7 @@ impl MpcWallet for WalletService {
         }
     }
 
+    #[tracing::instrument(skip_all, name = "svc::settle_delegate", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn settle_delegate(
         &self,
         request: Request<SettleDelegateRequest>,
@@ -3728,6 +3756,7 @@ impl MpcWallet for WalletService {
         }
     }
 
+    #[tracing::instrument(skip_all, name = "svc::submit_ark_send", fields(user_id = %hex::encode(&request.get_ref().user_id)), err)]
     async fn submit_ark_send(
         &self,
         request: Request<SubmitArkSendRequest>,
