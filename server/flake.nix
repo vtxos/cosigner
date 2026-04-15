@@ -65,6 +65,9 @@
 
           doCheck = false;
 
+          buildNoDefaultFeatures = true;
+          buildFeatures = [ "enclave-backend" ];
+
           nativeBuildInputs = [ eifPkgs.pkg-config eifPkgs.protobuf ];
           buildInputs = [ eifPkgs.openssl ];
 
@@ -188,6 +191,9 @@
           };
           cargoHash = "";
           doCheck = false;
+
+          buildNoDefaultFeatures = true;
+          buildFeatures = [ "enclave-backend" ];
 
           nativeBuildInputs = [ eifPkgs.pkg-config eifPkgs.protobuf ];
           buildInputs = [ eifPkgs.openssl ];
