@@ -470,7 +470,7 @@ impl WalletService {
                 Ok(mut ps) => {
                     // Load DKG secret from SecretStore (skipped in JSON)
                     if let Ok(Some(secret)) = self.secret_store.get_secret(
-                        &format!("dkg_secret/{user_id_hex}"),
+                        &format!("dkg-secret.{user_id_hex}"),
                     ) {
                         ps.server_dkg_secret_hex = Some(secret);
                     }
@@ -511,7 +511,7 @@ impl WalletService {
                 if let Ok(mut ps) = serde_json::from_str::<PolicyState>(&json_str) {
                     // Load DKG secret from SecretStore
                     if let Ok(Some(secret)) = self.secret_store.get_secret(
-                        &format!("dkg_secret/{user_id}"),
+                        &format!("dkg-secret.{user_id}"),
                     ) {
                         ps.server_dkg_secret_hex = Some(secret);
                     }
@@ -547,10 +547,10 @@ impl WalletService {
         // Store DKG secret separately via SecretStore
         if let Some(ref secret) = policy.server_dkg_secret_hex {
             if let Err(e) = self.secret_store.put_secret(
-                &format!("dkg_secret/{user_id_hex}"),
+                &format!("dkg-secret.{user_id_hex}"),
                 secret,
             ) {
-                tracing::error!("persist dkg_secret/{user_id_hex} failed: {e} — wallet may not be restorable");
+                tracing::error!("persist dkg-secret.{user_id_hex} failed: {e} — wallet may not be restorable");
             }
         }
         Ok(())
@@ -1363,8 +1363,8 @@ impl MpcWallet for WalletService {
                                     if let Err(e) = self.persistence.delete("policy_recovery_idx", &recovery_id) {
                                         tracing::warn!("delete policy_recovery_idx/{recovery_id} failed: {e}");
                                     }
-                                    if let Err(e) = self.secret_store.delete_secret(&format!("dkg_secret/{old_user_id}")) {
-                                        tracing::warn!("delete dkg_secret/{old_user_id} failed: {e}");
+                                    if let Err(e) = self.secret_store.delete_secret(&format!("dkg-secret.{old_user_id}")) {
+                                        tracing::warn!("delete dkg-secret.{old_user_id} failed: {e}");
                                     }
                                 }
                             }

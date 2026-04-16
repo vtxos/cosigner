@@ -144,8 +144,12 @@ impl KvStore for EnclaveStore {
                 ));
             }
 
-            let keys: Vec<String> = resp.json().await
+            // Supervisor returns {"keys": ["key1", "key2", ...]}.
+            #[derive(serde::Deserialize)]
+            struct ListResponse { keys: Vec<String> }
+            let list: ListResponse = resp.json().await
                 .map_err(|e| PersistenceError::Backend(format!("enclave list parse: {e}")))?;
+            let keys = list.keys;
 
             let mut result = HashMap::new();
             let (ah, av) = ("Authorization", format!("Bearer {}", self.mgmt_token));
@@ -189,8 +193,11 @@ impl KvStore for EnclaveStore {
                 ));
             }
 
-            let keys: Vec<String> = resp.json().await
+            #[derive(serde::Deserialize)]
+            struct ListResponse { keys: Vec<String> }
+            let list: ListResponse = resp.json().await
                 .map_err(|e| PersistenceError::Backend(format!("enclave clear parse: {e}")))?;
+            let keys = list.keys;
 
             let (ah, av) = ("Authorization", format!("Bearer {}", self.mgmt_token));
             for full_key in keys {
