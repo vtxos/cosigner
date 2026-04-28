@@ -9,13 +9,10 @@ prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name
 instance_type: m6i.xlarge        # EC2 instance type
 migration_cooldown: "1m"         # Cooldown before migration proceeds
 
-# SDK coordinates for the enclave supervisor binary.
-# The supervisor handles attestation, secrets, PCR extension, and signing
-# middleware automatically. Your app is a plain HTTP server with zero SDK imports.
-sdk:
-  rev: "v0.0.68"
-  hash: "sha256-/5YoFEHiKJ01XrzGTTlco+EXZzYFTlsLq2cD5DuaMd4="
-  vendor_hash: "sha256-txUyJGwLZWTMfYZXhruNnEKhC13LKqu1XsT6xlhzJxs="
+runtime:
+  rev: "v0.0.71"
+  hash: "sha256-4WQaXyPCVg0ysUHqhnHTBVTPlhNFlPplJqtzVp1ZHV4="
+  vendor_hash: "sha256-2ZX9x2voIwVkUsmrZvhJssAQqnCh8/HLwopL5HpiaOg="
 
 app:
   language: "rust"               # App language: go, nodejs, dotnet, rust
@@ -26,8 +23,8 @@ app:
   # Secrets are passed as environment variables. No SDK imports needed.
   nix_owner: "BitspendPayment"                  # GitHub owner (required)
   nix_repo: "MPCWallet"                   # GitHub repo name (required)
-  nix_rev: "4db41fedf7bc39b7a8a687c628cc0bcf2ea94b4e"                    # Git commit SHA (required)
-  nix_hash: "sha256-EOYkZwcJ4YWvR5f+M4OuPzvZL00apj7DKtkUC4OZP8k="                   # Nix source hash: nix-prefetch-url --unpack (required)
+  nix_rev: "837f13fceb0c4d8cbc80ab62b19eef3e8eb1ab85"                    # Git commit SHA (required)
+  nix_hash: "sha256-0FDKZejHW02Kn4IByuMlbIAwXkDAOAVchnV1o8/z6eo="                   # Nix source hash: nix-prefetch-url --unpack (required)
   nix_vendor_hash: "sha256-QPBa326MlMDIxvxC4Zp8PMgW9hi31pdH0MRwv8+j7uc="            # Go vendor hash (required)
   nix_sub_packages:              # Go sub-packages to build
     - "."
