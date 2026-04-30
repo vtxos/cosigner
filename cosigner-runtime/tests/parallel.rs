@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use server::shared::SharedServices;
-use server::cosigner::registry::CosignerRegistry;
-use server::cosigner::CosignerCommand;
-use server::wallet_proto;
+use cosigner_runtime::shared::SharedServices;
+use cosigner_runtime::cosigner::registry::CosignerRegistry;
+use cosigner_runtime::cosigner::CosignerCommand;
+use cosigner_runtime::wallet_proto;
 
 fn wasm_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -23,8 +23,8 @@ fn wasm_path() -> PathBuf {
 }
 
 fn build_shared() -> Arc<SharedServices> {
-    use server::bitcoin::{BitcoinHistoryService, BitcoinRpcClient, ElectrumClient};
-    use server::persistence::{KvStore, SecretStore, SledStore};
+    use cosigner_runtime::bitcoin::{BitcoinHistoryService, BitcoinRpcClient, ElectrumClient};
+    use cosigner_runtime::persistence::{KvStore, SecretStore, SledStore};
 
     let temp = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(SledStore::open(temp.path()).expect("sled open"));

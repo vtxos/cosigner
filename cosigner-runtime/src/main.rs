@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 
-use server::{bitcoin, config, cosigner, persistence, rest_api, shared, telemetry, vtxo_stream};
+use cosigner_runtime::{
+    bitcoin, config, cosigner, persistence, rest_api, shared, telemetry, vtxo_stream,
+};
 
 #[derive(Parser)]
 #[command(

@@ -1,10 +1,10 @@
 [package]
-name = "server"
+name = "cosigner-runtime"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "server"
+name = "cosigner-runtime"
 path = "src/main.rs"
 
 [features]
