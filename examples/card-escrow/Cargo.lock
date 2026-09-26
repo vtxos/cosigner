@@ -404,16 +404,15 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "cosigner",
+ "escrow-service",
  "futures-util",
  "hex",
- "k256",
  "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
  "threshold",
  "tokio",
- "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]
@@ -635,6 +634,26 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "escrow-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "cosigner",
+ "hex",
+ "k256",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "threshold",
+ "tokio",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
