@@ -20,8 +20,9 @@
 //! - **A 200 proves nothing.** Every condition must carry at least one predicate; a response that
 //!   satisfies none of them is a denial, not an absence of denial.
 //! - **Evidence is bound to what it is justifying.** A predicate can require the response to name
-//!   the reference the release claimed and the amount it would pay, so a genuine receipt for some
-//!   other payment does not authorise this one.
+//!   the reference the release claimed, and every condition must also hold the response to
+//!   something agreed when the escrow was sealed — who was paid, for which deal, that it completed
+//!   — so a genuine receipt for some other payment does not authorise this one.
 //!
 //! # Why fetching is separate from deciding
 //!
@@ -113,12 +114,11 @@ pub enum Predicate {
     ///
     /// **This is the binding.** Without it a real receipt for somebody else's payment satisfies
     /// everything else, and the evidence proves a payment happened rather than that *this* one did.
-    MatchesReference { at: String },
-    /// The number at `at` equals the sats this release would pay.
     ///
-    /// The other half of the binding: evidence for the right payment, of the wrong size, is
-    /// evidence for a different release.
-    MatchesAmount { at: String },
+    /// On its own it proves little: where the path already names the payment, the provider hands
+    /// back what was asked for and this holds by construction. It guards against a lookup that
+    /// resolves to some other object, and it is never enough alone — see [`HttpGet::validate`].
+    MatchesReference { at: String },
     /// The fiat amount at `at`, converted at a FIXED rate, is exactly the sats this release pays.
     ///
     /// The binding for a release denominated in one currency against a payment denominated in
@@ -154,9 +154,20 @@ impl Predicate {
             | Predicate::AtLeast { at, .. }
             | Predicate::AtMost { at, .. }
             | Predicate::MatchesReference { at }
-            | Predicate::MatchesAmount { at }
             | Predicate::AmountAtFixedRate { at, .. } => at,
         }
+    }
+
+    /// Whether this holds the evidence to a value sealed with the escrow, rather than only to what
+    /// the release in hand claims. Only these say anything the service did not choose.
+    fn checks_an_agreed_value(&self) -> bool {
+        matches!(
+            self,
+            Predicate::Equals { .. }
+                | Predicate::OneOf { .. }
+                | Predicate::AtLeast { .. }
+                | Predicate::AtMost { .. }
+        )
     }
 
     pub fn describe(&self) -> String {
@@ -168,7 +179,6 @@ impl Predicate {
             Predicate::MatchesReference { at } => {
                 format!("{at} is the payment this release claims")
             }
-            Predicate::MatchesAmount { at } => format!("{at} is the amount this release pays"),
             Predicate::AmountAtFixedRate {
                 at, sats_per_unit, ..
             } => format!(
@@ -234,14 +244,6 @@ impl Predicate {
                     "{at} is {s:?}, which is not the payment this release claims"
                 )),
                 None => Err(format!("{at} is not text")),
-            },
-            Predicate::MatchesAmount { .. } => match found.as_i64() {
-                Some(n) if n == release.sats as i64 => Ok(()),
-                Some(n) => Err(format!(
-                    "{at} is {n}, and this release pays {}",
-                    release.sats
-                )),
-                None => Err(format!("{at} is not a whole number")),
             },
             Predicate::AmountAtFixedRate {
                 minor_units_per_unit,
@@ -410,6 +412,20 @@ impl HttpGet {
         }
         for predicate in &self.expect {
             predicate.validate()?;
+        }
+        // What the release supplies cannot be all the evidence is checked against. The cosigner
+        // fetches the payment the release named, so "its id is the one named" holds for every
+        // payment there is, and a condition checking only that would release for any receipt.
+        // At least one predicate must hold the answer to something agreed when this was sealed.
+        //
+        // Checked here, when an escrow is set up, and never on a sealed one: a policy is read back
+        // without being validated again, so this cannot strand an escrow already committed to.
+        if !self.expect.iter().any(Predicate::checks_an_agreed_value) {
+            return Err(
+                "a condition must check the evidence against something agreed now — who is paid, \
+                 for which deal, that it completed — not only against what a release will claim"
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -704,7 +720,10 @@ mod tests {
                     value: "COMPLETION".into(),
                 },
                 Predicate::MatchesReference { at: "token".into() },
-                Predicate::MatchesAmount { at: "amount_sats".into() },
+                Predicate::AtLeast {
+                    at: "amount_sats".into(),
+                    value: 50_000,
+                },
             ],
             on_unavailable: OnUnavailable::Deny,
         }
@@ -740,14 +759,14 @@ mod tests {
         assert!(err.contains("not the payment this release claims"), "{err}");
     }
 
-    /// The other half: the right payment, the wrong size.
+    /// The other half: the right payment, too small.
     #[test]
     fn evidence_of_a_smaller_payment_does_not_authorise_a_larger_release() {
         let body = json!({"state": "COMPLETION", "token": "tx_abc123", "amount_sats": 500});
         let err = condition()
             .evaluate(&fetched(body), Some(&release()))
             .unwrap_err();
-        assert!(err.contains("this release pays 50000"), "{err}");
+        assert!(err.contains("under 50000"), "{err}");
     }
 
     #[test]
@@ -866,6 +885,32 @@ mod tests {
         c.expect.clear();
         let err = c.validate().unwrap_err();
         assert!(err.contains("any answer as proof"), "{err}");
+    }
+
+    /// "Is this the payment the release named" holds for every payment there is — the cosigner
+    /// fetches the very one the release names — so a condition asking only that would release for
+    /// any receipt at all.
+    #[test]
+    fn a_condition_checking_only_what_the_release_claims_is_refused_at_the_door() {
+        let mut c = condition();
+        c.expect = vec![Predicate::MatchesReference { at: "token".into() }];
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("something agreed now"), "{err}");
+
+        // A conversion is bound to the release as well: the rate is sealed, the sats are not.
+        c.expect.push(Predicate::AmountAtFixedRate {
+            at: "amount".into(),
+            minor_units_per_unit: 100,
+            sats_per_unit: 1_000,
+        });
+        assert!(c.validate().is_err());
+
+        // One check against a sealed value is what makes it evidence.
+        c.expect.push(Predicate::Equals {
+            at: "state".into(),
+            value: "COMPLETION".into(),
+        });
+        assert_eq!(c.validate(), Ok(()));
     }
 
     #[test]
