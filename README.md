@@ -15,19 +15,18 @@ The wallet uses the crates and protos through a submodule. Services depend on th
 
 ## Build and test
 
-You need Rust (the toolchain is pinned in `rust-toolchain.toml`) and `protoc`.
-
 ```bash
-make test                               # every crate, on the host
-make wasi-sdk                           # the C toolchain for secp256k1-sys, under ~/wasi-sdk
-make cosigner-wasm                      # cosigner/target/wasm32-wasip2/release/cosigner.wasm
+make test             # every crate, on the host: Rust (rust-toolchain.toml) and protoc
+make cosigner-wasm    # the component, built by Nix: result/bin/cosigner.wasm, and its sha256
 ```
+
+`cosigner.wasm` is what the enclave measures into PCR16, so it is built reproducibly. [`flake.nix`](flake.nix) builds it with everything that reaches its bytes pinned by `flake.lock`: Rust (from `rust-toolchain.toml`), protoc for the build scripts, and the clang that compiles libsecp256k1's C to WebAssembly. The build directory is mapped out of the binary, so a sandboxed Nix and one without a sandbox produce the same file.
 
 `cosigner/wit/deps` vendors the runtime's capability interfaces (tasks, notify, streams, telemetry). This repository runs nothing against the runtime: the cosigner's whole flow, and so its fit with the runtime, is proven by the wallet's e2e, on the dev enclave image infra builds from a release.
 
 ## Releases
 
-Pushing a `v*` tag publishes `cosigner.wasm` and `SHA256SUMS`. A tag with a hyphen, such as `v0.2.0-rc.1`, is a prerelease.
+Pushing a `v*` tag publishes `cosigner.wasm`, built by Nix, and `SHA256SUMS`. To check a release, rebuild it from its tag and compare: `nix build github:vtxos/cosigner/<tag>#cosigner && sha256sum result/bin/cosigner.wasm`. A tag with a hyphen, such as `v0.2.0-rc.1`, is a prerelease.
 
 The component is published bare. A deployment writes its own settings into it (`guest-env.py`, or `--guest-env` in a dev enclave), and the enclave then measures the configured file into PCR16. The release sha256 therefore identifies the code, not any one deployment's PCR16.
 

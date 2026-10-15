@@ -14,9 +14,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The crates' tests on the host, then the component exactly as a release builds it: the pinned
-  # wasi-sdk, and the toolchain rust-toolchain.toml names.
-  build:
+  # The crates' tests, on the host. They do not reach the released bytes, so the host's protoc is
+  # good enough here.
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,4 +32,13 @@ jobs:
             crates/enclave-client -> target
             crates/escrow-service -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: make wasi-sdk test cosigner-wasm
+      - run: make test
+
+  # The component exactly as a release builds it, with nothing from the runner in it but Nix. Its
+  # sha256 is printed so a run can be compared with a release, or with a build of your own.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: make cosigner-wasm

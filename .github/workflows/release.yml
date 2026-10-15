@@ -1,5 +1,6 @@
-# A tag is a release: cosigner.wasm and its SHA256SUMS, attached to a GitHub release named after
-# the tag. A tag with a hyphen (v0.2.0-rc.1) is a prerelease, for a consumer to try before it pins.
+# A tag is a release: cosigner.wasm, built by Nix (flake.nix), and its SHA256SUMS, attached to a
+# GitHub release named after the tag. Anyone can rebuild it from the tag and compare. A tag with a
+# hyphen (v0.2.0-rc.1) is a prerelease, for a consumer to try before it pins.
 #
 # Published bare. A deployment's settings are written into the component when it is deployed
 # (deploy/qemu-nitro/guest-env.py, or dev-enclave.sh --guest-env), which refuses a component that
@@ -22,18 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show
-      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: make wasi-sdk cosigner-wasm
+      - uses: DeterminateSystems/nix-installer-action@main
+      - run: make cosigner-wasm
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir out
-          cp cosigner/target/wasm32-wasip2/release/cosigner.wasm out/
+          cp result/bin/cosigner.wasm out/
           (cd out && sha256sum cosigner.wasm > SHA256SUMS)
           pre=""; [[ "$GITHUB_REF_NAME" == *-* ]] && pre=--prerelease
           gh release create "$GITHUB_REF_NAME" $pre --title "$GITHUB_REF_NAME" --notes "cosigner.wasm, bare.
           sha256 \`$(cut -d' ' -f1 out/SHA256SUMS)\`
-          Built with $(rustc --version)."
+
+          Rebuild it and compare: \`nix build github:vtxos/cosigner/$GITHUB_REF_NAME#cosigner && sha256sum result/bin/cosigner.wasm\`"
           gh release upload "$GITHUB_REF_NAME" out/cosigner.wasm out/SHA256SUMS
