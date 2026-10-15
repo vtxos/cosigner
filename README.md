@@ -38,6 +38,5 @@ Pushing a `v*` tag publishes `cosigner.wasm` and `SHA256SUMS`. A tag with a hyph
 The component is published bare. A deployment writes its own settings into it (`guest-env.py`, or `--guest-env` in a dev enclave), and the enclave then measures the configured file into PCR16. The release sha256 therefore identifies the code, not any one deployment's PCR16.
 
 Consumers pin a release by name and sha256:
-- enclave-runtime's CI, which serves it in process and boots it under QEMU
 - the dev enclave image that infra builds for the wallet's e2e
 - the production release
