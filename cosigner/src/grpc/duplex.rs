@@ -105,13 +105,16 @@ enum Phase {
 }
 
 /// The response body: a handler, the request body, and the framing between them.
+/// The ceremony a stream runs, polled as the response body is.
+type Handler = Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>;
+
 pub struct SessionBody<Req, Resp> {
     /// The request body, held for the life of the response. This is the whole trick, and it is
     /// specified behaviour rather than a trick — see the module docs.
     inbound: UnsyncBoxBody<Bytes, Error>,
     deframer: Deframer,
     shared: Arc<Mutex<Shared<Req, Resp>>>,
-    handler: Option<Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>>,
+    handler: Option<Handler>,
     phase: Phase,
     status: Status,
 }

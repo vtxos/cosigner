@@ -1,0 +1,36 @@
+[package]
+name = "fake-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A small host for cosigner.wasm: the runtime's part played by fakes, for tests of the component a release ships."
+
+# Its own workspace, kept out of the cosigner's: wasmtime is a host dependency and must never be
+# in what the wasm build resolves. Its lock was seeded from the cosigner's, whose secp256k1 beta is
+# yanked and would not resolve afresh.
+[workspace]
+
+[dependencies]
+# The runtime's own versions, so the component is linked as the runtime links it.
+wasmtime = { version = "=44.0.0", features = ["component-model", "async", "runtime", "cranelift", "std"] }
+wasmtime-wasi = "=44.0.0"
+wasmtime-wasi-http = { version = "=44.0.0", default-features = false, features = ["p2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+hyper = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+anyhow = "1"
+prost = "0.13"
+serde_json = "1"
+tempfile = "3"
+
+[dev-dependencies]
+# The wallet's side of the conversation: the wire types, and the threshold maths it signs with.
+cosigner = { path = "../cosigner" }
+ark = { path = "../crates/ark", features = ["signing"] }
+threshold = { path = "../crates/threshold", features = ["std"] }
+bitcoin = "0.32"
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"

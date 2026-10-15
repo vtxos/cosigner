@@ -14,28 +14,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The crates' tests, on the host. They do not reach the released bytes, so the host's protoc is
-  # good enough here.
+  # The crates' tests, on the host, and clippy. They do not reach the released bytes, so the host's
+  # protoc is good enough here.
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # rust-toolchain.toml is the toolchain; this installs it.
-      - run: rustup show
+      - run: rustup show && rustup component add clippy
       # The cosigner's and ark's build scripts generate protobuf code.
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            cosigner -> target
+            . -> target
+            crates/ark -> target
             crates/threshold -> target
             crates/enclave-client -> target
             crates/escrow-service -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: make test
+      - run: make lint
 
   # The component exactly as a release builds it, with nothing from the runner in it but Nix. Its
-  # sha256 is printed so a run can be compared with a release, or with a build of your own.
+  # sha256 is printed so a run can be compared with a release, or with a build of your own. Then
+  # that same file, run by the fake host through a wallet's life: DKG, a signature, the delegate's
+  # renewal, and the refresh the cosigner runs by itself against a fake ASP.
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -46,3 +50,10 @@ jobs:
         with:
           name: cosigner.wasm
           path: result/bin/cosigner.wasm
+      - run: rustup show && rustup component add clippy
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fake-host -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: make test-wasm COSIGNER_WASM=$PWD/result/bin/cosigner.wasm

@@ -63,6 +63,8 @@ impl Deframer {
     }
 
     /// The next complete message, if one has fully arrived.
+    // Not an iterator: it drains what has been pushed, and `None` means "not yet", not "never".
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Bytes>, Malformed> {
         if self.buffer.len() < 5 {
             return Ok(None);

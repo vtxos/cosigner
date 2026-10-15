@@ -16,6 +16,8 @@ impl SseFramer {
     }
 
     /// The next complete event's payload, if one has arrived.
+    // Not an iterator: it drains what has been pushed, and `None` means "not yet", not "never".
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<String> {
         loop {
             let text = std::str::from_utf8(&self.buf).ok()?;

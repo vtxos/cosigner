@@ -38,9 +38,11 @@
         # Rust, the protos its build scripts compile, and the WIT its bindings come from.
         src = lib.cleanSourceWith {
           src = ./.;
+          # fake-host/ tests the component and is no part of it.
           filter = path: type:
-            lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
-            || craneLib.filterCargoSources path type;
+            !(lib.hasInfix "/fake-host" path)
+            && (lib.hasSuffix ".proto" path || lib.hasSuffix ".wit" path
+              || craneLib.filterCargoSources path type);
           name = "cosigner-source";
         };
         cargoToml = ./cosigner/Cargo.toml;

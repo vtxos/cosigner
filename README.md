@@ -24,6 +24,32 @@ make cosigner-wasm    # the component, built by Nix: result/bin/cosigner.wasm, a
 
 `cosigner/wit/deps` vendors the runtime's capability interfaces (tasks, notify, streams, telemetry). This repository runs nothing against the runtime: the cosigner's whole flow, and so its fit with the runtime, is proven by the wallet's e2e, on the dev enclave image infra builds from a release.
 
+## Testing
+
+```bash
+make test        # every crate's own tests, on the host
+make lint        # clippy on the cosigner, warnings denied
+make test-wasm   # the built cosigner.wasm, in the fake host
+```
+
+[`fake-host/`](fake-host/) is a small wasmtime host that runs the component a release ships, rather than a native build of its library. It links the component the way the runtime does: WASI, `wasi:http` in both directions, and the runtime's tasks, notify, streams and telemetry. Each call gets a fresh instance over one tenant directory, so anything that has to survive between calls must go through the cosigner's seal.
+
+The fakes behave like the runtime in the ways that matter:
+
+- **Tasks** are queued, and `run_due` runs them as the runtime's scheduler would. Each run is a fresh instance calling `run-task`.
+- **The runtime's rule for background work is enforced.** Only a request may arm a task, enrol a device or open a stream. A background run may only wake its owner.
+- **The ASP** is answered in process. The component's HTTP calls to it never leave the host, and every call is recorded. Any other outgoing request is denied.
+
+[`fake-host/tests/flow.rs`](fake-host/tests/flow.rs) plays the wallet over the cosigner's gRPC service:
+
+1. DKG, which also enrols a device.
+2. Registering, counting and forgetting devices.
+3. A signature, checked as BIP-340 under the group key.
+4. Renewing the delegate, which arms the cosigner's watch.
+5. In the background, the cosigner refreshing the funds on its own. It registers the sealed delegate's intent with the ASP, follows the batch to `Settled`, and wakes its owner.
+
+The tests also cover two failure paths. An ASP that refuses the intent leaves the owner woken with `settle-due`, and the refresh then succeeds on a later run. A background run that asks for anything more than a wake is refused.
+
 ## Releases
 
 Pushing a `v*` tag publishes `cosigner.wasm`, built by Nix, and `SHA256SUMS`. To check a release, rebuild it from its tag and compare: `nix build github:vtxos/cosigner/<tag>#cosigner && sha256sum result/bin/cosigner.wasm`. A tag with a hyphen, such as `v0.2.0-rc.1`, is a prerelease.
