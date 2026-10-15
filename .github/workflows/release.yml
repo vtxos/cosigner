@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup show
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: make enclave-bundle wasi-sdk cosigner-wasm
+      - run: make wasi-sdk cosigner-wasm
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -32,9 +32,8 @@ jobs:
           mkdir out
           cp cosigner/target/wasm32-wasip2/release/cosigner.wasm out/
           (cd out && sha256sum cosigner.wasm > SHA256SUMS)
-          runtime="$(. .enclave/image.env; echo "$ENCLAVE_RUNTIME_REV")"
           pre=""; [[ "$GITHUB_REF_NAME" == *-* ]] && pre=--prerelease
           gh release create "$GITHUB_REF_NAME" $pre --title "$GITHUB_REF_NAME" --notes "cosigner.wasm, bare.
           sha256 \`$(cut -d' ' -f1 out/SHA256SUMS)\`
-          Built with $(rustc --version) against enclave-runtime \`$runtime\`'s WIT."
+          Built with $(rustc --version)."
           gh release upload "$GITHUB_REF_NAME" out/cosigner.wasm out/SHA256SUMS

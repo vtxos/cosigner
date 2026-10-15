@@ -1,6 +1,0 @@
-# The runtime this cosigner is built for: a dev enclave release of vtxos/enclave-runtime. Its wit/
-# is what scripts/wit-drift.sh checks cosigner/wit/deps against, and its scripts/wasi-sdk.sh is the
-# wasi-sdk pin the component builds with. `make enclave-bundle` fetches it into .enclave/ and
-# refuses a tarball whose sha256 is not this one. Shell syntax; sourced by make.
-RELEASE=dev-enclave-dev-c4a0b96
-SHA256=32567c86f5dc1b85652e4c6c5d1cf7ee41fdb4472793808ec1160405140cc255

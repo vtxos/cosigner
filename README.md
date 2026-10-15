@@ -1,6 +1,6 @@
 # cosigner
 
-The vtxos cosigner: a `wasm32-wasip2` component that [enclave-runtime](https://github.com/vtxos/enclave-runtime) serves inside a Nitro enclave, one instance per tenant, with no listener of its own. Each release publishes one `cosigner.wasm`, and everything that runs the cosigner downloads that file instead of building it.
+The vtxos cosigner: a `wasm32-wasip2` component that [enclave-runtime](https://github.com/vtxos/runtime) serves inside a Nitro enclave, one instance per tenant, with no listener of its own. Each release publishes one `cosigner.wasm`, and everything that runs the cosigner downloads that file instead of building it.
 
 | Path | Contents |
 |---|---|
@@ -19,17 +19,11 @@ You need Rust (the toolchain is pinned in `rust-toolchain.toml`) and `protoc`.
 
 ```bash
 make test                               # every crate, on the host
-make enclave-bundle wasi-sdk            # the pinned runtime, and the wasi-sdk it builds with
+make wasi-sdk                           # the C toolchain for secp256k1-sys, under ~/wasi-sdk
 make cosigner-wasm                      # cosigner/target/wasm32-wasip2/release/cosigner.wasm
 ```
 
-`make cosigner-wasm` first checks that the WIT vendored in `cosigner/wit/deps` is byte-identical to the WIT of the runtime pinned in [`enclave-bundle.lock`](enclave-bundle.lock).
-
-To serve a local build in a dev enclave:
-
-```bash
-~/enclave-runtime/deploy/qemu-nitro/dev-enclave.sh --guest cosigner/target/wasm32-wasip2/release/cosigner.wasm
-```
+`cosigner/wit/deps` vendors the runtime's capability interfaces (tasks, notify, streams, telemetry). This repository runs nothing against the runtime: the cosigner's whole flow, and so its fit with the runtime, is proven by the wallet's e2e, on the dev enclave image infra builds from a release.
 
 ## Releases
 

@@ -8,8 +8,8 @@
 //! Hand-copying an interface is the thing WIT exists to prevent. This reads the vendored `.wit`
 //! and asserts every function in it has a counterpart on the trait with the same arity, so a
 //! signature that changes upstream fails here rather than surfacing as a trap in a component that
-//! looked fine. `scripts/wit-drift.sh` checks the other half: that the vendored copy still equals
-//! enclave-runtime's canonical one.
+//! looked fine. Whether the vendored copy still matches the runtime's is the wallet's e2e to show,
+//! on a real runtime.
 
 use std::collections::BTreeMap;
 use std::fs;

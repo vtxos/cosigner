@@ -14,8 +14,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The crates' tests on the host, then the component exactly as a release builds it: WIT checked
-  # against the pinned runtime, wasi-sdk from that runtime, the toolchain rust-toolchain.toml names.
+  # The crates' tests on the host, then the component exactly as a release builds it: the pinned
+  # wasi-sdk, and the toolchain rust-toolchain.toml names.
   build:
     runs-on: ubuntu-latest
     steps:
@@ -32,4 +32,4 @@ jobs:
             crates/enclave-client -> target
             crates/escrow-service -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: make enclave-bundle wasi-sdk test cosigner-wasm
+      - run: make wasi-sdk test cosigner-wasm

@@ -1,9 +1,9 @@
 // What the cosigner needs from the runtime it runs inside.
 //
-// Its own world, rather than an edited copy of `enclave:tasks`'s: the vendored `tasks.wit` and
-// `notify.wit` under `deps/` are byte-for-byte copies of the canonical ones in
-// `~/enclave-runtime/wit/`, and `scripts/wit-drift.sh` checks that they stay that way. A guest that
-// wants two capabilities composes them here instead of editing either.
+// Its own world, rather than an edited copy of `enclave:tasks`'s: the WIT under `deps/` is copied
+// byte for byte from the runtime's `wit/`, and the wallet's e2e, on a real runtime, is what shows
+// the two still fit. A guest that wants two capabilities composes them here instead of editing
+// either.
 //
 // Not yet generated from. The crate now builds as a wasm32-wasip2 component — `make cosigner-wasm`
 // — serving gRPC over `wasi:http/incoming-handler`, which removed the reason this could not be
