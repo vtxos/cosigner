@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A superseded push's run is not worth finishing.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The crates' tests on the host, then the component exactly as a release builds it: WIT checked
+  # against the pinned runtime, wasi-sdk from that runtime, the toolchain rust-toolchain.toml names.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml is the toolchain; this installs it.
+      - run: rustup show
+      # The cosigner's and ark's build scripts generate protobuf code.
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            cosigner -> target
+            crates/threshold -> target
+            crates/enclave-client -> target
+            crates/escrow-service -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: make enclave-bundle wasi-sdk test cosigner-wasm

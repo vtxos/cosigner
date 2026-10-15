@@ -11,7 +11,7 @@
 // `src/host.rs` still mirrors these signatures behind a trait and `tests/wit_test.rs` checks the
 // mirror against this file. Wiring `wit_bindgen::generate!` over this world replaces the trait's
 // `Detached` impl and is the last step.
-package merlin:cosigner@0.1.0;
+package vtxos:cosigner@0.1.0;
 
 world cosigner {
     // `run-task`, plus the queue to arm it with. The cosigner uses this for one thing: a settle

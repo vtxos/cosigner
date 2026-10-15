@@ -1,4 +1,4 @@
-//! A settlement service's side of a Merlin escrow: what it holds, what it claims, and what it waits
+//! A settlement service's side of a vtxos escrow: what it holds, what it claims, and what it waits
 //! for.
 //!
 //! # What this service is

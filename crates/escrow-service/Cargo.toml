@@ -3,7 +3,7 @@ name = "escrow-service"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "A settlement service's side of a Merlin escrow: its half of the key, its claims, and turning an approval into an Ark payment."
+description = "A settlement service's side of a vtxos escrow: its half of the key, its claims, and turning an approval into an Ark payment."
 
 [dependencies]
 # The wire, the policy and the release shapes are the cosigner's, imported rather than restated.

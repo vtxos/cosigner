@@ -16,7 +16,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 sdk="${WASI_SDK:-$HOME/wasi-sdk}"
 if [[ ! -x "$sdk/bin/clang" ]]; then
     echo "no wasi-sdk at $sdk" >&2
-    echo "install it with enclave-runtime's scripts/wasi-sdk.sh, or set WASI_SDK" >&2
+    echo "install it with make wasi-sdk, or set WASI_SDK" >&2
     exit 1
 fi
 
@@ -25,7 +25,7 @@ export AR_wasm32_wasip2="$sdk/bin/ar"
 export CFLAGS_wasm32_wasip2="--sysroot=$sdk/share/wasi-sysroot"
 
 cd cosigner
-cargo build --release --target wasm32-wasip2 "$@"
+cargo build --locked --release --target wasm32-wasip2 "$@"
 
 out="$PWD/target/wasm32-wasip2/release/cosigner.wasm"
 [[ -f "$out" ]] || { echo "no component at $out" >&2; exit 1; }

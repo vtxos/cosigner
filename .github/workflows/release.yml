@@ -1,0 +1,40 @@
+# A tag is a release: cosigner.wasm and its SHA256SUMS, attached to a GitHub release named after
+# the tag. A tag with a hyphen (v0.2.0-rc.1) is a prerelease, for a consumer to try before it pins.
+#
+# Published bare. A deployment's settings are written into the component when it is deployed
+# (deploy/qemu-nitro/guest-env.py, or dev-enclave.sh --guest-env), which refuses a component that
+# already carries some, and PCR16 is measured after that — so the sha256 here identifies the code,
+# not any one deployment's PCR16.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: make enclave-bundle wasi-sdk cosigner-wasm
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir out
+          cp cosigner/target/wasm32-wasip2/release/cosigner.wasm out/
+          (cd out && sha256sum cosigner.wasm > SHA256SUMS)
+          runtime="$(. .enclave/image.env; echo "$ENCLAVE_RUNTIME_REV")"
+          pre=""; [[ "$GITHUB_REF_NAME" == *-* ]] && pre=--prerelease
+          gh release create "$GITHUB_REF_NAME" $pre --title "$GITHUB_REF_NAME" --notes "cosigner.wasm, bare.
+          sha256 \`$(cut -d' ' -f1 out/SHA256SUMS)\`
+          Built with $(rustc --version) against enclave-runtime \`$runtime\`'s WIT."
+          gh release upload "$GITHUB_REF_NAME" out/cosigner.wasm out/SHA256SUMS

@@ -4,7 +4,7 @@
 //! `POST /escrow/send` per message — and a URL can be reached by anybody. Believing it on sight is
 //! how a forged "not completed yet" once made a payout platform fund a payment nobody had sealed,
 //! and how a customer running a cosigner of their own could have been paired as though it were
-//! Merlin's. So the runtime attaches an attestation document to each request, binding the wire id
+//! ours. So the runtime attaches an attestation document to each request, binding the wire id
 //! and the exact bytes to the measured image (see [`enclave_client::verify_stream`]), and nothing
 //! here is taken without one that checks out against a pinned enclave.
 //!
