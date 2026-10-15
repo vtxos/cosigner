@@ -67,8 +67,3 @@ wit-bindgen = "0.46"
 # in `build.rs`: what lands in the crate is prost messages and no transport.
 [build-dependencies]
 tonic-build = "0.12"
-
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1

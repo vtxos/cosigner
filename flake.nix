@@ -44,7 +44,7 @@
           name = "cosigner-source";
         };
         cargoToml = ./cosigner/Cargo.toml;
-        cargoLock = ./cosigner/Cargo.lock;
+        cargoLock = ./Cargo.lock;
         cargoExtraArgs = "--locked --bin cosigner";
         CARGO_BUILD_TARGET = "wasm32-wasip2";
         strictDeps = true;
@@ -53,14 +53,6 @@
         PROTOC = "${pkgs.protobuf}/bin/protoc";
         CC_wasm32_wasip2 = "${clang}/bin/clang";
         AR_wasm32_wasip2 = "${pkgs.llvmPackages.bintools-unwrapped}/bin/llvm-ar";
-        # The crate is in a subdirectory, with its path dependencies beside it: build from there.
-        # The dependency-only build's stand-in source carries the lock only at its root, so it goes
-        # beside the manifest too.
-        postUnpack = ''
-          cd $sourceRoot/cosigner
-          sourceRoot="."
-        '';
-        extraDummyScript = "cp ${./cosigner/Cargo.lock} $out/cosigner/Cargo.lock";
         # Where the build ran must not reach the binary: a sandboxed Nix builds in /build, one
         # without a sandbox in a temporary directory, and the path dependencies' sources and the C
         # compiler's __FILE__ would carry whichever it was.

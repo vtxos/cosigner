@@ -1,0 +1,16 @@
+# The cosigner's workspace, at the repository's root rather than in cosigner/, so that the path
+# dependencies it builds with (crates/ark, crates/threshold) sit inside it. Cargo hashes a path
+# dependency inside the workspace by its relative path and one outside it by its absolute path,
+# and that hash names every symbol: two checkouts in two directories built two cosigner.wasm.
+#
+# The other crates are their own workspaces, with their own lock files, as before.
+[workspace]
+members = ["cosigner"]
+exclude = ["crates/ark", "crates/threshold", "crates/enclave-client", "crates/escrow-service"]
+resolver = "2"
+
+# Size, for the component the enclave loads. Profiles are read from the workspace root only.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
